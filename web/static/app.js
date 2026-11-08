@@ -168,6 +168,8 @@ const EV = {
   'ns.down.failed': ['Downlink failed', 't-err'],
   'as.down.queued': ['Downlink queued', 't-down'],
   'as.webhook.failed': ['Webhook failed', 't-err'],
+  'rule.fired': ['Rule fired', 't-down'],
+  'rule.failed': ['Rule failed', 't-err'],
 };
 function evType(name) { const [label, cls] = EV[name] || [name, 't-gw']; return h('span', { class: 'ev-type ' + cls }, h('i'), label); }
 
@@ -479,13 +481,26 @@ const App = {
     this.sidebar = h('nav', { class: 'sidebar' },
       h('div', { class: 'nav' },
         navItem('#/', 'home', 'Overview'),
+        h('div', { class: 'nav-section' }, 'Live'),
+        navItem('#/status', 'live', 'Realtime status'),
+        navItem('#/live', 'eye', 'Live data'),
         h('div', { class: 'nav-section' }, 'Network'),
+        navItem('#/nodes', 'device', 'Nodes'),
         navItem('#/applications', 'app', 'Node groups'),
         navItem('#/gateways', 'gateway', 'Gateways'),
-        navItem('#/live', 'live', 'Live data'),
-        h('div', { class: 'nav-section' }, 'Tools'),
+        h('div', { class: 'nav-section' }, 'Data'),
+        navItem('#/decoders', 'wand', 'Decoder Studio'),
         navItem('#/lab', 'code', 'Decoder lab'),
-        navItem('#/concentrator', 'chip', 'Concentrator'),
+        navItem('#/rules', 'link', 'Automation'),
+        navItem('#/settings/integrations', 'send', 'MQTT & Home Assistant'),
+        h('div', { class: 'nav-section' }, 'Radio'),
+        navItem('#/radio', 'chip', 'Radio config'),
+        navItem('#/tx', 'send', 'TX test'),
+        navItem('#/remote', 'key', 'Remote config'),
+        h('div', { class: 'nav-section' }, 'System'),
+        navItem('#/logs', 'inbox', 'Logs'),
+        navItem('#/hardware', 'chip', 'GPIO & hardware'),
+        navItem('#/pinout', 'link', 'Pinout'),
         navItem('#/settings', 'gear', 'Settings')));
     this.sidebar.addEventListener('click', (e) => { if (e.target.closest('a')) this.sidebar.classList.remove('open'); });
     this.main = h('main', { class: 'main' });

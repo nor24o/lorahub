@@ -37,6 +37,8 @@ type Config struct {
 		ConfigPath     string `yaml:"config_path"`
 		RestartCommand string `yaml:"restart_command"`
 		StatusAddr     string `yaml:"status_addr"`
+		Service        string `yaml:"service"`
+		GPIOAllowed    []int  `yaml:"gpio_allowed"`
 	} `yaml:"concentrator"`
 }
 
@@ -54,6 +56,7 @@ func Default() *Config {
 	c.Concentrator.ConfigPath = "/etc/lora/config.json"
 	c.Concentrator.RestartCommand = "systemctl restart raw-lora"
 	c.Concentrator.StatusAddr = "127.0.0.1:5557"
+	c.Concentrator.Service = "raw-lora"
 	return c
 }
 
@@ -121,6 +124,7 @@ type Settings struct {
 // DefaultSettings returns the default runtime settings.
 func DefaultSettings() Settings {
 	s := Settings{
+		AutoCreateGroups:     true,
 		DedupWindowMs:        250,
 		AutoRegisterGateways: true,
 		DropCRCErrors:        true,

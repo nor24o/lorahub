@@ -48,22 +48,25 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 ## Status / open items
 - Verified only in a cloud sandbox with the simulator + headless browser; **not yet run
   on the real Bobcat** (check downlink timing, raw_lora_app port 5556, sync word `private`).
-- Not ported from the old Python bridge: edge automation rules, import of old
-  `/etc/lora/decoders.json` and `nodes.db`.
+- Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
 
-## NEXT TASK (requested by owner)
-Run from the owner's PC (same LAN as the devices):
-1. SSH into the reference device at **192.168.1.17** (user `root`; owner provides the
-   password — do NOT commit it). Explore its web interface and features: pages, tabs,
-   fields, settings, how decoding/forwarding/MQTT/node management work, its config files
-   and services.
-2. Write down every feature/interface element LoRaHub is missing compared to it, agree the
-   list with the owner, then implement them in LoRaHub (keep the NODE_ID|SERIAL model,
-   no LoRaWAN UI).
-3. Build ARM64 (`make arm64` or GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build) and deploy
-   to the Bobcat at **192.168.1.15** (root): copy binary to /usr/local/bin/lorahub and
-   `systemctl restart lorahub` (first install: deploy/install.sh). Verify in the browser.
-4. Commit and push to github.com/nor24o/lorahub.
-Note: the owner's PC is Windows; files cloned there may get CRLF line endings (.gitattributes
-now forces LF). On the Bobcat fix with: sed -i 's/\r$//' deploy/*.sh
+## Data pipeline (added after surveying the Dragino reference at 192.168.1.17)
+- Gather: unknown NODE_IDs auto-create groups and appear on `#/nodes` for adoption. A prefix
+  scheme with data before byte 6 (or `serial: none`) identifies a node by NODE_ID alone, so
+  `NODE|TYPE|SEQ|data` packets do not create one node per sequence number.
+- Decode: `internal/formatter/schemes.go`, ordered schemes, first match that decodes wins; JSON
+  compatible with `/etc/lora/decoders.json`, imported on first start. A decoder set on a node or
+  group has priority. UI: `web/static/hub.js` (Nodes, Decoder Studio, Automation, Messages tab).
+- Output: `lorahub/{group}/{serial}/up` (full) and retained flat `/state`; commands on `/set`
+  (ON, OFF or hex). Home Assistant discovery is per node: adopted + ha_enabled only
+  (`internal/integration/homeassistant.go`). Rules: `internal/processor/rules.go`.
+
+## Addon pages (web/static/addons.js, internal/api/addons.go, remote.go)
+Realtime status, Radio config, TX test, Remote config (SSH with a key in data_dir/remote_id_rsa),
+Logs, GPIO and hardware, Pinout. GPIO output is limited to `concentrator.gpio_allowed` in lorahub.yml.
+
+## Deploying
+Windows PC has Go 1.27 in `C:/Program Files/Go/bin`. Key login works on .15 and .17 (.17 needs
+`-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa`). Copy
+`dist/lorahub-linux-arm64` to `/usr/local/bin/lorahub`, then `systemctl restart lorahub`.

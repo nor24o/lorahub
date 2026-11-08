@@ -17,6 +17,7 @@ import (
 	"github.com/nor24o/lorahub/internal/band"
 	"github.com/nor24o/lorahub/internal/config"
 	"github.com/nor24o/lorahub/internal/events"
+	"github.com/nor24o/lorahub/internal/formatter"
 	"github.com/nor24o/lorahub/internal/ingest"
 	"github.com/nor24o/lorahub/internal/lorawan"
 	"github.com/nor24o/lorahub/internal/model"
@@ -49,6 +50,10 @@ type Processor struct {
 
 	devLocks sync.Map // app/dev -> *sync.Mutex
 
+	rmu     sync.RWMutex
+	schemes *formatter.SchemeDoc
+	rules   []model.Rule
+
 	Started time.Time
 }
 
@@ -63,6 +68,7 @@ func New(st *store.Store, bus *events.Bus, log *slog.Logger) *Processor {
 	s := config.DefaultSettings()
 	st.GetSetting("settings", &s)
 	p.settings = s
+	p.loadPipeline()
 	return p
 }
 

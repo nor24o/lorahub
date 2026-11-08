@@ -295,7 +295,7 @@ function devHeader(a, d, active) {
   return [pageHead([['Node groups', '#/applications'], [a.node_id || a.application_id, '#/applications/' + a.application_id], [d.serial || d.device_id]],
     d.name || d.device_id, [h('span', null, h('span', { class: 'val' }, (a.node_id || '?') + ' / ' + (d.serial || d.device_id))), seen,
       h('span', null, (d.uplink_count || 0) + ' packets'), d.downlink_queue && d.downlink_queue.length ? h('span', { class: 'badge warn' }, d.downlink_queue.length + ' downlink(s) queued') : null]),
-  tabs(base, [['', 'Overview'], ['live', 'Live data'], ['messaging', 'Downlink'], ['formatters', 'Decoder'], ['settings', 'Settings']], active)];
+  tabs(base, [['', 'Overview'], ['live', 'Live data'], ['messages', 'Messages'], ['messaging', 'Downlink'], ['formatters', 'Decoder'], ['settings', 'Settings']], active)];
 }
 
 async function loadDev(app, dev) { return Promise.all([GET('/applications/' + app), GET(`/applications/${app}/devices/${dev}`)]); }
@@ -582,74 +582,6 @@ App.route('/lab', async () => {
 });
 
 // ======================= Concentrator =======================
-App.route('/concentrator', async () => {
-  const c = await GET('/concentrator');
-  const cfg = c.config || null;
-  const status = c.status;
-  const head = pageHead([['Concentrator']], 'Concentrator (SX1302)', [h('span', { class: 'mono small' }, c.config_path), status ? h('span', { class: 'badge ok' }, 'raw_lora_app running') : h('span', { class: 'badge warn' }, 'raw_lora_app status unavailable')],
-    [h('button', { class: 'btn', onclick: async () => {
-      if (!(await confirmModal('Restart concentrator', 'Restart the raw_lora_app service? Reception pauses for a few seconds.', 'Restart', false))) return;
-      try { await api('POST', '/concentrator/restart'); toast('Concentrator restarted'); setTimeout(() => App.dispatch(), 3000); } catch (e) { errToast(e); }
-    } }, icon('refresh'), 'Restart service')]);
-  const statusCard = status ? h('div', { class: 'grid g4' },
-    [['Uptime', fmtDur(status.uptime_s)], ['RX / TX', `${status.rx} / ${status.tx}`], ['CRC errors', status.crc_err], ['Temperature', status.temp_ok ? status.temp_c + ' °C' : '—'],
-      ['TX status', status.tx_status], ['RX status', status.rx_status], ['Sync word', status.sync], ['Queue', `${status.q_depth} (drop ${status.q_drop})`]].map(([l, v]) =>
-      h('div', { class: 'card stat' }, h('div', { class: 'label' }, l), h('div', { class: 'value', style: { fontSize: '18px' } }, v)))) :
-    h('div', { class: 'callout warn' }, c.status_error || 'Status server not configured.');
-  if (!cfg) return h('div', { class: 'stack' }, head, statusCard, h('div', { class: 'callout warn' }, 'Cannot read concentrator config: ' + (c.config_error || 'unknown error')));
-
-  const st = JSON.parse(JSON.stringify(cfg));
-  let rawMode = false;
-  const holder = h('div');
-  const num = (k, attrs = {}) => inp(st[k], Object.assign({ type: 'number', step: 'any', oninput: (e) => { st[k] = Number(e.target.value); } }, attrs));
-  const txt = (k, attrs = {}) => inp(st[k], Object.assign({ oninput: (e) => { st[k] = e.target.value; } }, attrs));
-  const bool = (k, label, help) => { const c2 = checkbox(st[k], label, help); c2.input.onchange = () => { st[k] = c2.input.checked; }; return c2.el; };
-  const chTable = () => {
-    const tbody = h('tbody');
-    const freqOf = (i) => ((((st.chan_radio || [])[i] || 0) === 0 ? st.rf0_freq : st.rf1_freq) + st.chan_if[i]) / 1e6;
-    const render = () => {
-      tbody.replaceChildren(...(st.chan_if || []).map((iff, i) => {
-        const label = h('span', null, freqOf(i).toFixed(3) + ' MHz');
-        return h('tr', null, h('td', null, i),
-          h('td', null, sel((st.chan_radio || [])[i] || 0, [[0, 'Radio 0'], [1, 'Radio 1']], { onchange: (e) => { st.chan_radio[i] = Number(e.target.value); render(); } })),
-          h('td', null, inp(iff, { type: 'number', step: 1000, style: { width: '120px' }, oninput: (e) => { st.chan_if[i] = Number(e.target.value); label.textContent = freqOf(i).toFixed(3) + ' MHz'; } })),
-          h('td', { class: 'mono' }, label));
-      }));
-    };
-    render();
-    return h('div', { class: 'table-wrap card' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Channel', 'Radio', 'IF offset (Hz)', 'Frequency'].map((x) => h('th', null, x)))), tbody));
-  };
-  const render = () => {
-    if (rawMode) {
-      const ta = h('textarea', { class: 'code', spellcheck: 'false', value: JSON.stringify(st, null, 4) });
-      holder.replaceChildren(h('div', { class: 'stack' }, ta, h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { const parsed = JSON.parse(ta.value); await api('PUT', '/concentrator', parsed); Object.assign(st, parsed); toast('Saved — restart the service to apply'); } catch (e) { errToast(e); }
-      } }, 'Save JSON'))));
-      return;
-    }
-    holder.replaceChildren(h('div', { class: 'form wide stack' },
-      h('h3', null, 'Radio front-ends'),
-      h('div', { class: 'grid g4' }, field('Radio 0 center (Hz)', num('rf0_freq')), field('Radio 1 center (Hz)', num('rf1_freq')), field('RSSI offset 0', num('rf0_rssi_offset')), field('RSSI offset 1', num('rf1_rssi_offset'))),
-      h('div', { class: 'grid g4' }, field('Sync word', sel(st.sync_word, [['private', 'Private (0x12) — raw LoRa'], ['public', 'Public (0x34) — LoRaWAN']], { onchange: (e) => { st.sync_word = e.target.value; } }),
-        'Use public for LoRaWAN devices, private for most raw LoRa nodes.'), field('Radio 0 type', txt('rf0_type')), field('Radio 1 type', txt('rf1_type')), h('div', { style: { alignSelf: 'center' } }, bool('rf0_tx_enable', 'Radio 0 TX enabled'))),
-      h('h3', null, 'Multi-SF channels'), chTable(),
-      h('h3', null, 'Transmit defaults'),
-      h('div', { class: 'grid g4' }, field('Default power (dBm)', num('tx_default_power')), field('Default frequency (Hz)', num('tx_default_freq')), field('Default SF', num('tx_default_sf')), field('Default bandwidth (kHz)', num('tx_default_bandwidth'))),
-      h('h3', null, 'Network'),
-      h('div', { class: 'callout info small' }, 'raw_lora_app sends every uplink to target_ip:port_up and always mirrors it to 127.0.0.1. Keep port_up = 5555 and port_down = 5556 so LoRaHub receives packets and can send downlinks.'),
-      h('div', { class: 'grid g4' }, field('Target IP', txt('target_ip', { class: 'mono' })), field('Uplink port', num('port_up')), field('Downlink port', num('port_down')), field('Heartbeat (s)', num('heartbeat_interval_s'))),
-      h('h3', null, 'Hardware'),
-      h('div', { class: 'grid g4' }, field('SPI device', txt('spi_path', { class: 'mono' })), field('Reset GPIO', txt('reset_gpio', { class: 'mono' })), field('Clock source', num('clksrc')), field('Status port', num('status_port'))),
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await api('PUT', '/concentrator', st); toast('Saved — restart the service to apply'); } catch (e) { errToast(e); }
-      } }, 'Save configuration'))));
-  };
-  const seg = h('div', { class: 'seg' });
-  const renderSeg = () => seg.replaceChildren(h('button', { class: rawMode ? '' : 'on', onclick: () => { rawMode = false; renderSeg(); render(); } }, 'Form'), h('button', { class: rawMode ? 'on' : '', onclick: () => { rawMode = true; renderSeg(); render(); } }, 'JSON'));
-  renderSeg(); render();
-  return h('div', { class: 'stack' }, head, statusCard, h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'raw_lora_app configuration'), seg), h('div', { class: 'card-body' }, holder)));
-});
-
 // ======================= Settings =======================
 async function settingsPage(tab) {
   const s = await GET('/settings');

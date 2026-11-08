@@ -69,6 +69,11 @@ func main() {
 
 	bus := events.New()
 	proc := processor.New(st, bus, log)
+	if ok, err := proc.ImportSchemesFile("/etc/lora/decoders.json"); err != nil {
+		log.Warn("import /etc/lora/decoders.json", "err", err)
+	} else if ok {
+		log.Info("imported decoder schemes from /etc/lora/decoders.json")
+	}
 	stop := make(chan struct{})
 
 	if cfg.SemtechUDP.Enabled {
@@ -116,6 +121,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer mq.Close()
+	mq.Device = st.Device
 	go mq.Run(bus, stop)
 
 	report := func(e *model.Event) {

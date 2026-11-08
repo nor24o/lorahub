@@ -109,9 +109,31 @@ func (s *Server) Handler() http.Handler {
 	p("POST /api/keys", s.createKey)
 	p("DELETE /api/keys/{id}", s.deleteKey)
 
+	p("GET /api/schemes", s.getSchemes)
+	p("PUT /api/schemes", s.putSchemes)
+	p("POST /api/schemes/test", s.testSchemes)
+	p("GET /api/rules", s.listRules)
+	p("POST /api/rules", s.saveRule)
+	p("POST /api/rules/simulate", s.simulateRule)
+	p("PUT /api/rules/{id}", s.saveRule)
+	p("DELETE /api/rules/{id}", s.deleteRule)
+	p("POST /api/rules/{id}/fire", s.fireRule)
+
 	p("GET /api/concentrator", s.getConcentrator)
 	p("PUT /api/concentrator", s.putConcentrator)
 	p("POST /api/concentrator/restart", s.restartConcentrator)
+	p("POST /api/concentrator/service", s.concentratorService)
+	p("POST /api/concentrator/tx", s.concentratorTX)
+	p("GET /api/logs", s.getLogs)
+	p("GET /api/hardware", s.getHardware)
+	p("POST /api/hardware/led", s.setLED)
+	p("POST /api/hardware/gpio", s.setGPIO)
+	p("GET /api/remote/key", s.remoteKey)
+	p("GET /api/gateways/{id}/remote", s.getRemote)
+	p("PUT /api/gateways/{id}/remote", s.putRemote)
+	p("PUT /api/gateways/{id}/remote/config", s.putRemoteConfig)
+	p("POST /api/gateways/{id}/remote/service", s.remoteService)
+	p("GET /api/gateways/{id}/remote/logs", s.remoteLogs)
 
 	// Static web console (SPA)
 	files := http.FileServer(http.FS(s.Web))
@@ -726,7 +748,7 @@ func validateDevice(d *model.Device) error {
 	}
 	switch d.Mode {
 	case "node":
-		if b, err := hex.DecodeString(d.Serial); err != nil || len(b) == 0 {
+		if _, err := hex.DecodeString(d.Serial); err != nil { // empty: identified by NODE_ID alone
 			return fmt.Errorf("serial ID must be hex (e.g. 96B840EB)")
 		}
 	case "otaa":
@@ -835,6 +857,10 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if upd.HAEnabled && !cur.HAEnabled && cur.LastDecoded == nil {
+		writeErr(w, 400, "this node has no decoded data yet: set up a decoder and wait for a packet before exposing it to Home Assistant")
+		return
+	}
 	// check DevEUI uniqueness through SaveDevice semantics
 	for _, o := range s.Store.FindDevices(func(o *model.Device) bool {
 		return o.Mode != "raw" && upd.Mode != "raw" && upd.DevEUI != "" && strings.EqualFold(o.DevEUI, upd.DevEUI) && !(o.AppID == appID && o.ID == devID)
@@ -847,7 +873,7 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		*dv = upd
 		// runtime fields are owned by the server
 		dv.LastSeen, dv.UplinkCount, dv.LastRSSI, dv.LastSNR, dv.LastGateway, dv.LastDecoded = rt.LastSeen, rt.UplinkCount, rt.LastRSSI, rt.LastSNR, rt.LastGateway, rt.LastDecoded
-		dv.Queue, dv.UsedNonces, dv.CreatedAt = rt.Queue, rt.UsedNonces, rt.CreatedAt
+		dv.Queue, dv.UsedNonces, dv.CreatedAt, dv.LastScheme = rt.Queue, rt.UsedNonces, rt.CreatedAt, rt.LastScheme
 		if dv.Mode == "otaa" {
 			dv.Session = rt.Session
 		}
@@ -861,13 +887,20 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	if s.MQTT != nil {
+		s.MQTT.NodeChanged(cur, d)
+	}
 	writeJSON(w, 200, d)
 }
 
 func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
+	cur, _ := s.Store.Device(r.PathValue("app"), r.PathValue("dev"))
 	if err := s.Store.DeleteDevice(r.PathValue("app"), r.PathValue("dev")); err != nil {
 		storeErr(w, err)
 		return
+	}
+	if s.MQTT != nil && cur != nil {
+		s.MQTT.NodeChanged(cur, nil)
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -1126,7 +1159,7 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 // ---------------- concentrator (raw_lora_app) ----------------
 
 func (s *Server) getConcentrator(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{"config_path": s.Cfg.Concentrator.ConfigPath}
+	out := map[string]any{"config_path": s.Cfg.Concentrator.ConfigPath, "service": s.serviceState()}
 	if b, err := os.ReadFile(s.Cfg.Concentrator.ConfigPath); err == nil {
 		out["config"] = json.RawMessage(b)
 	} else {

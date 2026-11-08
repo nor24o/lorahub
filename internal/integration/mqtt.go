@@ -33,6 +33,9 @@ type MQTT struct {
 	settings func() config.Settings
 	downlink DownlinkFunc
 
+	// Device looks up a node; set once before Run.
+	Device func(appID, devID string) (*model.Device, error)
+
 	mu     sync.Mutex
 	ext    paho.Client
 	extKey string
@@ -72,6 +75,9 @@ func NewMQTT(cfg *config.Config, settings func() config.Settings, dl DownlinkFun
 		m.broker = srv
 		prefix := settings().MQTTTopicPrefix
 		srv.Subscribe(prefix+"/+/+/down", 1, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
+			m.handleDown(pk.TopicName, pk.Payload)
+		})
+		srv.Subscribe(prefix+"/+/+/set", 2, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
 			m.handleDown(pk.TopicName, pk.Payload)
 		})
 		log.Info("embedded MQTT broker listening", "addr", cfg.MQTTBroker.Listen)
@@ -125,7 +131,9 @@ func (m *MQTT) ensureExternal() paho.Client {
 		SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(10 * time.Second).
 		SetOnConnectHandler(func(c paho.Client) {
 			m.log.Info("external MQTT connected", "url", s.URL)
-			c.Subscribe(prefix+"/+/+/down", 0, func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload()) })
+			handler := func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload()) }
+			c.Subscribe(prefix+"/+/+/down", 0, handler)
+			c.Subscribe(prefix+"/+/+/set", 0, handler)
 		})
 	c := paho.NewClient(o)
 	c.Connect()
@@ -142,6 +150,10 @@ func (m *MQTT) handleDown(topic string, payload []byte) {
 		return
 	}
 	appID, devID := parts[1], parts[2]
+	if parts[3] == "set" {
+		m.handleSet(appID, devID, payload)
+		return
+	}
 	var req struct {
 		DataHex   string `json:"data_hex"`
 		Data      string `json:"data"`
@@ -205,9 +217,7 @@ func (m *MQTT) handleEvent(e *model.Event) {
 	switch {
 	case e.Name == "as.up":
 		m.publish(fmt.Sprintf("%s/%s/%s/up", p, e.AppID, e.DevID), b, false)
-		if s.HomeAssistant.Enabled {
-			m.haDiscovery(e, s)
-		}
+		m.nodeState(e, s, b)
 	case e.Name == "ns.join.accept":
 		m.publish(fmt.Sprintf("%s/%s/%s/join", p, e.AppID, e.DevID), b, false)
 	case e.Name == "as.down.queued":
@@ -222,61 +232,10 @@ func (m *MQTT) handleEvent(e *model.Event) {
 		m.publish(p+"/gateways/"+e.Gateways[0]+"/up", b, false)
 	case e.Name == "gs.status" && len(e.Gateways) > 0:
 		m.publish(p+"/gateways/"+e.Gateways[0]+"/status", b, true)
-	}
-}
-
-func (m *MQTT) haDiscovery(e *model.Event, s config.Settings) {
-	msg, ok := e.Data.(map[string]any)
-	if !ok {
-		return
-	}
-	dec, _ := msg["decoded"].(map[string]any)
-	stateTopic := fmt.Sprintf("%s/%s/%s/up", s.MQTTTopicPrefix, e.AppID, e.DevID)
-	devIdent := "lorahub_" + e.AppID + "_" + e.DevID
-	emit := func(field, tpl string, unitGuess string) {
-		key := devIdent + "_" + field
-		m.mu.Lock()
-		done := m.haSent[key]
-		m.haSent[key] = true
-		m.mu.Unlock()
-		if done {
-			return
-		}
-		cfg := map[string]any{
-			"name":           field,
-			"unique_id":      sanitize(key),
-			"object_id":      sanitize(key),
-			"state_topic":    stateTopic,
-			"value_template": tpl,
-			"device": map[string]any{"identifiers": []string{sanitize(devIdent)}, "name": fmt.Sprint(msg["name"]),
-				"manufacturer": "LoRaHub", "model": e.AppID},
-		}
-		if dc, unit := haClass(field); dc != "" {
-			cfg["device_class"] = dc
-			cfg["unit_of_measurement"] = unit
-			cfg["state_class"] = "measurement"
-		} else if unitGuess != "" {
-			cfg["unit_of_measurement"] = unitGuess
-		}
-		b, _ := json.Marshal(cfg)
-		m.publish(fmt.Sprintf("%s/sensor/%s/config", s.HomeAssistant.DiscoveryPrefix, sanitize(key)), b, true)
-	}
-	for k, v := range dec {
-		switch vv := v.(type) {
-		case float64, int64, int, bool, string:
-			_ = vv
-			emit(k, fmt.Sprintf("{{ value_json.decoded['%s'] }}", k), "")
-		case map[string]any:
-			for k2, v2 := range vv {
-				switch v2.(type) {
-				case float64, int64, int:
-					emit(k+"_"+k2, fmt.Sprintf("{{ value_json.decoded['%s']['%s'] }}", k, k2), "")
-				}
-			}
+		if s.HomeAssistant.Enabled {
+			m.gatewayDiscovery(e.Gateways[0], e.Data, s)
 		}
 	}
-	emit("rssi", "{{ value_json.gateways[0].rssi }}", "dBm")
-	emit("snr", "{{ value_json.gateways[0].snr }}", "dB")
 }
 
 func haClass(field string) (string, string) {

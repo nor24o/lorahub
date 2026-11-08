@@ -29,6 +29,7 @@ type Gateway struct {
 	Disabled    bool              `json:"disabled"`
 	Attributes  map[string]string `json:"attributes,omitempty"`
 	Forwarders  []Forwarder       `json:"forwarders,omitempty"`
+	Remote      *GatewayRemote    `json:"remote,omitempty"`
 	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
 
@@ -38,6 +39,15 @@ type Gateway struct {
 	RxCount    uint64          `json:"rx_count"`
 	TxCount    uint64          `json:"tx_count"`
 	LastStatus json.RawMessage `json:"last_status,omitempty"`
+}
+
+// GatewayRemote is how LoRaHub reaches a satellite gateway over SSH.
+type GatewayRemote struct {
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	User       string `json:"user"`
+	ConfigPath string `json:"config_path"`
+	HostKey    string `json:"host_key,omitempty"`
 }
 
 // Forwarder forwards a gateway's raw traffic upstream (e.g. to TTN or
@@ -148,6 +158,10 @@ type Device struct {
 	Description   string            `json:"description"`
 	Mode          string            `json:"mode"`             // node | otaa | abp | raw
 	Serial        string            `json:"serial,omitempty"` // node mode: SERIAL_ID hex
+	Adopted       bool              `json:"adopted"`
+	Model         string            `json:"model,omitempty"`
+	Area          string            `json:"area,omitempty"`
+	HAEnabled     bool              `json:"ha_enabled"`
 	Band          string            `json:"frequency_plan"`
 	Class         string            `json:"class"` // A | C
 	DevEUI        string            `json:"dev_eui,omitempty"`
@@ -176,6 +190,29 @@ type Device struct {
 	LastFreq     uint64     `json:"last_frequency,omitempty"`
 	LastDataRate string     `json:"last_data_rate,omitempty"`
 	LastDecoded  any        `json:"last_decoded,omitempty"`
+	LastScheme   string     `json:"last_scheme,omitempty"`
+}
+
+// Rule sends a downlink to one node when a decoded value of another crosses
+// a threshold.
+type Rule struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Enabled     bool    `json:"enabled"`
+	SourceApp   string  `json:"source_group"`
+	SourceDev   string  `json:"source_node"`
+	Field       string  `json:"field"`
+	Operator    string  `json:"operator"` // > < >= <= == != always
+	Threshold   float64 `json:"threshold"`
+	TargetApp   string  `json:"target_group"`
+	TargetDev   string  `json:"target_node"`
+	PayloadHex  string  `json:"payload_hex"`
+	CooldownSec int     `json:"cooldown_s"`
+	PulseSec    int     `json:"pulse_s"`
+	PulseOffHex string  `json:"pulse_off_hex"`
+
+	LastTriggered *time.Time `json:"last_triggered,omitempty"`
+	LastStatus    string     `json:"last_status,omitempty"`
 }
 
 // RxMetadata is the per-gateway reception metadata of an uplink.

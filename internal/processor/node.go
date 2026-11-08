@@ -47,9 +47,17 @@ func (p *Processor) groupByNodeID(nodeID string) *model.Application {
 // handleNode processes NODE_ID | SERIAL | data packets.
 func (p *Processor) handleNode(fr *Frame) bool {
 	s := p.Settings()
-	hdr, ok := ParseNodeHeader(s.PacketFormat, fr.Payload)
-	if !ok {
-		return false
+	pf := s.PacketFormat
+	scheme := p.Schemes().Decode(fr.Payload, fr.At, nil, false)
+	var hdr NodeHeader
+	if nodeEnd := pf.NodeIDOffset + pf.NodeIDLength; scheme != nil && usesNoSerial(scheme, pf.SerialOffset+pf.SerialLength) &&
+		pf.NodeIDLength > 0 && pf.NodeIDOffset >= 0 && len(fr.Payload) >= max(nodeEnd, scheme.Scheme.DataOffset) {
+		hdr = NodeHeader{NodeID: strings.ToUpper(hex.EncodeToString(fr.Payload[pf.NodeIDOffset:nodeEnd])), Data: fr.Payload[scheme.Scheme.DataOffset:]}
+	} else {
+		var ok bool
+		if hdr, ok = ParseNodeHeader(pf, fr.Payload); !ok {
+			return false
+		}
 	}
 	app := p.groupByNodeID(hdr.NodeID)
 	if app == nil {
@@ -79,7 +87,11 @@ func (p *Processor) handleNode(fr *Frame) bool {
 			return true
 		}
 		now := time.Now().UTC()
-		d = &model.Device{ID: strings.ToLower(hdr.Serial), AppID: app.ID, Mode: "node", Serial: hdr.Serial, Name: hdr.NodeID + "-" + hdr.Serial,
+		id, name := strings.ToLower(hdr.Serial), hdr.NodeID+"-"+hdr.Serial
+		if hdr.Serial == "" {
+			id, name = strings.ToLower(hdr.NodeID), hdr.NodeID
+		}
+		d = &model.Device{ID: id, AppID: app.ID, Mode: "node", Serial: hdr.Serial, Name: name,
 			Uplink: model.Formatter{Type: "inherit"}, Downlink: model.Formatter{Type: "inherit"}, CreatedAt: now, UpdatedAt: now}
 		if err := p.store.SaveDevice(d); err != nil {
 			p.log.Warn("auto-register node", "err", err)
@@ -91,9 +103,22 @@ func (p *Processor) handleNode(fr *Frame) bool {
 
 	unlock := p.lockDevice(d.AppID, d.ID)
 	defer unlock()
-	msg := p.buildNodeMessage(app, d, &hdr, fr)
+	msg := p.buildNodeMessage(app, d, &hdr, fr, scheme)
+	decoded, _ := msg["decoded"].(map[string]any)
 	updated, err := p.store.UpdateDevice(d.AppID, d.ID, func(dv *model.Device) error {
 		p.touchDevice(dv, fr, msg["decoded"])(dv)
+		dv.LastScheme = ""
+		if info, ok := msg["decoder"].(map[string]any); ok {
+			dv.LastScheme, _ = info["name"].(string)
+		}
+		if !dv.Adopted { // what the node says about itself, until the owner decides
+			if c, _ := decoded["node_class"].(string); c == "A" || c == "C" {
+				dv.Class = c
+			}
+			if c, _ := decoded["capability"].(string); c != "" && dv.Model == "" {
+				dv.Model = "LoRa " + c
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -109,6 +134,7 @@ func (p *Processor) handleNode(fr *Frame) bool {
 			p.sendRawDown(updated, fr)
 		}
 	}
+	p.evalRules(updated, decoded)
 	return true
 }
 
@@ -118,6 +144,9 @@ func downlinkCfg(app *model.Application, d *model.Device) model.RawDownlink {
 	}
 	if app != nil && app.RawDownlink != nil {
 		return *app.RawDownlink
+	}
+	if d != nil && d.Adopted && d.Class == "A" { // a sleeping node only listens right after it transmits
+		return model.RawDownlink{Mode: "after_uplink", Power: 14}
 	}
 	return model.RawDownlink{Mode: "immediate", Power: 14}
 }
@@ -148,7 +177,7 @@ func (p *Processor) gatewayInfo(meta []model.RxMetadata) []map[string]any {
 	return out
 }
 
-func (p *Processor) buildNodeMessage(app *model.Application, d *model.Device, hdr *NodeHeader, fr *Frame) map[string]any {
+func (p *Processor) buildNodeMessage(app *model.Application, d *model.Device, hdr *NodeHeader, fr *Frame, scheme *formatter.SchemeResult) map[string]any {
 	dr := band.DataRate{SF: fr.Settings.SF, BW: fr.Settings.BW}
 	msg := map[string]any{
 		"node_id":       hdr.NodeID,
@@ -184,6 +213,12 @@ func (p *Processor) buildNodeMessage(app *model.Application, d *model.Device, hd
 	}
 	res := formatter.Decode(f, formatter.Input{Bytes: hdr.Data, FPort: 1, RecvTime: fr.At, Meta: attrs,
 		Vars: map[string]any{"node_id": hdr.NodeID, "serial": hdr.Serial, "payload": fr.Payload}})
+	if (res == nil || (len(res.Data) == 0 && len(res.Errors) == 0)) && scheme != nil { // no usable decoder on the node or group: use the schemes
+		res = &formatter.Result{Data: scheme.Data, Warnings: scheme.Warnings, Errors: scheme.Errors}
+		if scheme.SchemeID != "" {
+			msg["decoder"] = map[string]any{"scheme_id": scheme.SchemeID, "name": scheme.SchemeName}
+		}
+	}
 	if res != nil {
 		if res.Data != nil {
 			msg["decoded"] = res.Data

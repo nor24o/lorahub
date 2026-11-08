@@ -46,6 +46,7 @@ func setup(t *testing.T) (*Processor, *store.Store, *fakeDL, <-chan *model.Event
 	s := p.Settings()
 	s.DedupWindowMs = 50
 	s.LoRaWANEnabled = true
+	s.AutoCreateGroups = false
 	p.SetSettings(s)
 	dl := &fakeDL{}
 	p.RegisterDownlinker("semtech_udp", dl)

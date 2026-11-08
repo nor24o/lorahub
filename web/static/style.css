@@ -286,3 +286,29 @@ pre.json { background: var(--code-bg); border: 1px solid var(--border); border-r
   dl.kv { grid-template-columns: 1fr; gap: 2px 0; }
   dl.kv dd { margin-bottom: 8px; }
 }
+
+/* Decoder Studio */
+.studio { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .studio { grid-template-columns: minmax(0, 1fr); } }
+.scheme-list { max-height: 70vh; overflow-y: auto; }
+.scheme-row { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.scheme-row.on { background: var(--primary-soft); }
+.scheme-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.save-bar { display: flex; justify-content: flex-end; align-items: center; gap: 12px; }
+.card-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; }
+.card-toolbar h2 { margin: 0; }
+.card-toolbar select { max-width: 60%; }
+.byte-map { display: flex; flex-wrap: wrap; gap: 3px; margin: 10px 0; font-family: var(--mono); font-size: 12.5px; }
+.byte { display: inline-flex; flex-direction: column; align-items: center; min-width: 28px; padding: 2px 3px; border: 1px solid var(--border); border-radius: 4px; background: var(--code-bg); }
+.byte small { font-size: 9px; opacity: .65; }
+.byte.hdr { opacity: .5; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.t.compact input, .t.compact select { padding: 3px 5px; }
+textarea.mono, input.mono { font-family: var(--mono); font-size: 12.5px; width: 100%; }
+
+/* Status and logs */
+.ch-bars { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.ch-bar { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.ch-track { width: 100%; max-width: 44px; height: 110px; background: var(--code-bg); border-radius: 4px; display: flex; align-items: flex-end; overflow: hidden; }
+.ch-fill { width: 100%; background: var(--primary); min-height: 2px; }
+.log-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; height: 60vh; overflow: auto; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 0; }
