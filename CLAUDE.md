@@ -51,3 +51,19 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Not ported from the old Python bridge: edge automation rules, import of old
   `/etc/lora/decoders.json` and `nodes.db`.
 - No GitHub remote yet; owner may create one (e.g. nor24o/lorahub). License undecided.
+
+## NEXT TASK (requested by owner)
+Run from the owner's PC (same LAN as the devices):
+1. SSH into the reference device at **192.168.1.17** (user `root`; owner provides the
+   password — do NOT commit it). Explore its web interface and features: pages, tabs,
+   fields, settings, how decoding/forwarding/MQTT/node management work, its config files
+   and services.
+2. Write down every feature/interface element LoRaHub is missing compared to it, agree the
+   list with the owner, then implement them in LoRaHub (keep the NODE_ID|SERIAL model,
+   no LoRaWAN UI).
+3. Build ARM64 (`make arm64` or GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build) and deploy
+   to the Bobcat at **192.168.1.15** (root): copy binary to /usr/local/bin/lorahub and
+   `systemctl restart lorahub` (first install: deploy/install.sh). Verify in the browser.
+4. Commit and push to github.com/nor24o/lorahub.
+Note: the owner's PC is Windows; files cloned there may get CRLF line endings (.gitattributes
+now forces LF). On the Bobcat fix with: sed -i 's/\r$//' deploy/*.sh
