@@ -1,0 +1,5 @@
+/dist/
+/dev-data/
+*.db
+*.db-wal
+*.db-shm

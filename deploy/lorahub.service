@@ -1,0 +1,14 @@
+[Unit]
+Description=LoRaHub — standalone LoRa/LoRaWAN gateway processor & web console
+After=network-online.target raw-lora.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lorahub -config /etc/lorahub/lorahub.yml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

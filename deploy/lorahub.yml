@@ -1,0 +1,36 @@
+# LoRaHub configuration (/etc/lorahub/lorahub.yml)
+# Runtime settings (dedup window, MQTT, Home Assistant, retention…) are
+# edited in the web console and stored in the database.
+
+data_dir: /var/lib/lorahub
+
+http:
+  listen: ":80"
+
+# Satellite gateways using the Semtech UDP packet forwarder protocol
+semtech_udp:
+  enabled: true
+  listen: ":1700"
+
+# raw_lora_app (the Bobcat SX1302 engine) — local and remote Bobcats
+bobcat_raw:
+  enabled: true
+  listen: ":5555"
+  downlink_port: 5556
+  # Optional: pin EUIs for raw_lora_app instances by source IP
+  # static_euis:
+  #   127.0.0.1: "0016C001FF10A235"
+
+# Embedded MQTT broker (Home Assistant, Node-RED, …)
+mqtt_broker:
+  enabled: true
+  listen: ":1883"
+  # ws_listen: ":1884"
+  # username: lorahub
+  # password: change-me
+
+# Local concentrator management (Concentrator page)
+concentrator:
+  config_path: /etc/lora/config.json
+  restart_command: "systemctl restart raw-lora"
+  status_addr: "127.0.0.1:5557"

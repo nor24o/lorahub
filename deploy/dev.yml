@@ -1,0 +1,7 @@
+# Development config: unprivileged ports, data in ./dev-data
+data_dir: ./dev-data
+http: {listen: ":8080"}
+semtech_udp: {enabled: true, listen: ":1700"}
+bobcat_raw: {enabled: true, listen: ":5555", downlink_port: 5556}
+mqtt_broker: {enabled: true, listen: ":1883"}
+concentrator: {config_path: ./dev-data/config.json, restart_command: "echo no-op", status_addr: "127.0.0.1:5557"}

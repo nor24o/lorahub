@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: make arm64 build
+      - name: Package
+        run: |
+          mkdir -p pkg/lorahub
+          cp dist/lorahub-linux-arm64 dist/lorahub-sim-linux-arm64 deploy/install.sh deploy/lorahub.yml deploy/lorahub.service README.md pkg/lorahub/
+          tar -C pkg -czf lorahub-linux-arm64.tar.gz lorahub
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lorahub-linux-arm64
+          path: lorahub-linux-arm64.tar.gz
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lorahub-linux-arm64.tar.gz
