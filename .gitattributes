@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.service text eol=lf
+prebuilt/* binary
+prebuilt/*.md text eol=lf
