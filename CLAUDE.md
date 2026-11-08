@@ -50,7 +50,7 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
   on the real Bobcat** (check downlink timing, raw_lora_app port 5556, sync word `private`).
 - Not ported from the old Python bridge: edge automation rules, import of old
   `/etc/lora/decoders.json` and `nodes.db`.
-- No GitHub remote yet; owner may create one (e.g. nor24o/lorahub). License undecided.
+- GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
 
 ## NEXT TASK (requested by owner)
 Run from the owner's PC (same LAN as the devices):
