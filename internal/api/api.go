@@ -596,9 +596,34 @@ func normalizeWebhooks(a *model.Application) {
 	}
 }
 
+func (s *Server) validateGroup(a *model.Application) error {
+	a.NodeID = normHex(a.NodeID)
+	if a.NodeID == "" {
+		return nil
+	}
+	b, err := hex.DecodeString(a.NodeID)
+	pf := s.Proc.Settings().PacketFormat
+	if err != nil || len(b) != pf.NodeIDLength {
+		return fmt.Errorf("node ID must be %d bytes of hex (%d characters)", pf.NodeIDLength, pf.NodeIDLength*2)
+	}
+	for _, o := range s.Store.Applications() {
+		if o.ID != a.ID && strings.EqualFold(o.NodeID, a.NodeID) {
+			return fmt.Errorf("node ID %s is already used by group %s", a.NodeID, o.ID)
+		}
+	}
+	return nil
+}
+
 func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 	var a model.Application
 	if err := readJSON(r, &a); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if a.ID == "" && a.NodeID != "" {
+		a.ID = "node-" + strings.ToLower(normHex(a.NodeID))
+	}
+	if err := s.validateGroup(&a); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -634,6 +659,10 @@ func (s *Server) updateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upd.ID, upd.CreatedAt, upd.UpdatedAt = cur.ID, cur.CreatedAt, time.Now().UTC()
+	if err := s.validateGroup(&upd); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	normalizeWebhooks(&upd)
 	if err := s.Store.SaveApplication(&upd); err != nil {
 		storeErr(w, err)
@@ -678,6 +707,13 @@ func normHex(s string) string {
 }
 
 func validateDevice(d *model.Device) error {
+	if d.Mode == "" {
+		d.Mode = "node"
+	}
+	d.Serial = normHex(d.Serial)
+	if d.Mode == "node" && d.ID == "" {
+		d.ID = strings.ToLower(d.Serial)
+	}
 	if !idRe.MatchString(d.ID) {
 		return fmt.Errorf("device ID must be 2-36 lowercase letters, digits or dashes")
 	}
@@ -689,6 +725,10 @@ func validateDevice(d *model.Device) error {
 		d.Class = "A"
 	}
 	switch d.Mode {
+	case "node":
+		if b, err := hex.DecodeString(d.Serial); err != nil || len(b) == 0 {
+			return fmt.Errorf("serial ID must be hex (e.g. 96B840EB)")
+		}
 	case "otaa":
 		if _, err := lorawan.ParseEUI(d.DevEUI); err != nil {
 			return fmt.Errorf("DevEUI must be 16 hex characters")
@@ -729,7 +769,7 @@ func validateDevice(d *model.Device) error {
 			return fmt.Errorf("invalid regex: %v", err)
 		}
 	default:
-		return fmt.Errorf("mode must be otaa, abp or raw")
+		return fmt.Errorf("mode must be node, otaa, abp or raw")
 	}
 	if d.Uplink.Type == "" {
 		d.Uplink.Type = "inherit"
@@ -757,7 +797,11 @@ func (s *Server) createDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.Store.Device(appID, d.ID); err == nil {
-		writeErr(w, 409, "device ID already exists in this application")
+		writeErr(w, 409, "a node with this ID already exists in this group")
+		return
+	}
+	if d.Mode == "node" && len(s.Store.FindDevices(func(o *model.Device) bool { return o.AppID == appID && strings.EqualFold(o.Serial, d.Serial) })) > 0 {
+		writeErr(w, 409, "a node with serial "+d.Serial+" already exists in this group")
 		return
 	}
 	if d.Mode == "abp" {

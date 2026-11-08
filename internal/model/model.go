@@ -78,8 +78,13 @@ type Application struct {
 	Downlink    Formatter         `json:"downlink_formatter"`
 	Webhooks    []Webhook         `json:"webhooks"`
 	Attributes  map[string]string `json:"attributes,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+	// Node group: packets whose NODE_ID header equals NodeID belong here.
+	NodeID         string       `json:"node_id"`
+	AutoRegister   bool         `json:"auto_register_nodes"`
+	DownlinkHeader bool         `json:"downlink_header"` // prepend NODE_ID+SERIAL to downlinks
+	RawDownlink    *RawDownlink `json:"downlink_radio,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at"`
 }
 
 // Webhook posts events to an HTTP endpoint.
@@ -141,7 +146,8 @@ type Device struct {
 	AppID         string            `json:"application_id"`
 	Name          string            `json:"name"`
 	Description   string            `json:"description"`
-	Mode          string            `json:"mode"` // otaa | abp | raw
+	Mode          string            `json:"mode"`             // node | otaa | abp | raw
+	Serial        string            `json:"serial,omitempty"` // node mode: SERIAL_ID hex
 	Band          string            `json:"frequency_plan"`
 	Class         string            `json:"class"` // A | C
 	DevEUI        string            `json:"dev_eui,omitempty"`
@@ -162,12 +168,14 @@ type Device struct {
 	UpdatedAt     time.Time         `json:"updated_at"`
 
 	// Runtime
-	LastSeen    *time.Time `json:"last_seen,omitempty"`
-	UplinkCount uint64     `json:"uplink_count"`
-	LastRSSI    float64    `json:"last_rssi"`
-	LastSNR     float64    `json:"last_snr"`
-	LastGateway string     `json:"last_gateway,omitempty"`
-	LastDecoded any        `json:"last_decoded,omitempty"`
+	LastSeen     *time.Time `json:"last_seen,omitempty"`
+	UplinkCount  uint64     `json:"uplink_count"`
+	LastRSSI     float64    `json:"last_rssi"`
+	LastSNR      float64    `json:"last_snr"`
+	LastGateway  string     `json:"last_gateway,omitempty"`
+	LastFreq     uint64     `json:"last_frequency,omitempty"`
+	LastDataRate string     `json:"last_data_rate,omitempty"`
+	LastDecoded  any        `json:"last_decoded,omitempty"`
 }
 
 // RxMetadata is the per-gateway reception metadata of an uplink.

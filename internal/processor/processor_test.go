@@ -45,6 +45,7 @@ func setup(t *testing.T) (*Processor, *store.Store, *fakeDL, <-chan *model.Event
 	p := New(st, bus, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s := p.Settings()
 	s.DedupWindowMs = 50
+	s.LoRaWANEnabled = true
 	p.SetSettings(s)
 	dl := &fakeDL{}
 	p.RegisterDownlinker("semtech_udp", dl)
@@ -136,4 +137,40 @@ func TestRawDevice(t *testing.T) {
 	}
 	p.HandleUplink(rx([]byte{0x01, 0x02, 0x03}, "0000000000000001", 3))
 	waitEvent(t, ch, "ns.up.unmatched")
+}
+
+func TestNodeGroup(t *testing.T) {
+	p, st, dl, ch := setup(t)
+	st.SaveApplication(&model.Application{ID: "node-cafe", NodeID: "CAFE", AutoRegister: true, DownlinkHeader: true,
+		Uplink:      model.Formatter{Type: "cayenne_lpp"},
+		RawDownlink: &model.RawDownlink{Mode: "after_uplink", DelayMs: 1000, Power: 14}})
+	payload, _ := hex.DecodeString("CAFE96B840EB0102014A0271FFF500170429036700FC0488000000000000000000050048060004")
+	p.HandleUplink(rx(payload, "0000000000000001", 7))
+	waitEvent(t, ch, "as.node.registered")
+	e := waitEvent(t, ch, "as.up")
+	msg := e.Data.(map[string]any)
+	if msg["node_id"] != "CAFE" || msg["serial"] != "96B840EB" || e.DevID != "96b840eb" {
+		t.Fatalf("bad header %v %v %s", msg["node_id"], msg["serial"], e.DevID)
+	}
+	dec := msg["decoded"].(map[string]any)
+	if dec["temperature_3"].(float64) != 25.2 || dec["analog_input_1"].(float64) != 3.3 {
+		t.Fatalf("decoded %v", dec)
+	}
+	if gws := msg["gateways"].([]map[string]any); len(gws) != 1 || gws[0]["eui"] != "0000000000000001" {
+		t.Fatalf("gateways %v", gws)
+	}
+	// downlink after next uplink, with NODE_ID+SERIAL header prepended
+	if _, err := p.EnqueueDownlink("node-cafe", "96b840eb", 1, []byte{0x01}, nil, false, false); err != nil {
+		t.Fatal(err)
+	}
+	p.HandleUplink(rx(append(payload[:6:6], 0x01, 0x67, 0x00, 0x10), "0000000000000001", 7))
+	waitEvent(t, ch, "ns.down.sent")
+	if tx := dl.last(); hex.EncodeToString(tx.Payload) != "cafe96b840eb01" || tx.Timestamp != 2000000 {
+		t.Fatalf("downlink %x ts %d", tx.Payload, tx.Timestamp)
+	}
+	// unknown group -> unmatched
+	p.HandleUplink(rx([]byte{0xBE, 0xEF, 1, 2, 3, 4, 5}, "0000000000000001", 7))
+	if e := waitEvent(t, ch, "ns.up.unmatched"); e.Data.(map[string]any)["node_id"] != "BEEF" {
+		t.Fatal("unmatched should carry node_id")
+	}
 }

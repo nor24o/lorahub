@@ -120,10 +120,8 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 		return nil
 	}
 	item := d.Queue[0]
-	cfg := model.RawDownlink{Mode: "immediate", Power: 14}
-	if d.RawDownlink != nil {
-		cfg = *d.RawDownlink
-	}
+	app, _ := p.store.Application(d.AppID)
+	cfg := downlinkCfg(app, d)
 	var g *model.Gateway
 	var tmst uint32
 	freq := uint64(cfg.Frequency * 1e6)
@@ -147,8 +145,14 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 			return p.downFailed(d, "device has not been heard by any gateway yet")
 		}
 	}
+	if freq == 0 {
+		freq = d.LastFreq
+	}
+	if datr == "" {
+		datr = d.LastDataRate
+	}
 	if freq == 0 || datr == "" {
-		return p.downFailed(d, "raw downlink frequency / data rate not configured")
+		return p.downFailed(d, "no frequency / data rate known yet: wait for a packet from the node or set them in the group settings")
 	}
 	dl := p.downlinker(g.Kind)
 	if dl == nil || !dl.CanSend(g.EUI) {
@@ -214,7 +218,12 @@ func (p *Processor) EnqueueDownlink(appID, devID string, fport int, payload []by
 			return nil, fmt.Errorf("encodeDownlink: %w", err)
 		}
 	}
-	if d.Mode != "raw" && (fport < 1 || fport > 223) {
+	if d.Mode == "node" {
+		if app, err := p.store.Application(appID); err == nil {
+			payload = p.NodeDownlinkPayload(app, d, payload)
+		}
+	}
+	if (d.Mode == "otaa" || d.Mode == "abp") && (fport < 1 || fport > 223) {
 		return nil, fmt.Errorf("f_port must be 1..223")
 	}
 	if len(payload) > 242 {
@@ -238,9 +247,11 @@ func (p *Processor) EnqueueDownlink(appID, devID string, fport int, payload []by
 		Summary: fmt.Sprintf("Downlink queued · FPort %d · %s", fport, truncHex(payload, 16)),
 		Data:    map[string]any{"id": item.ID, "f_port": fport, "frm_payload_hex": strings.ToUpper(hex.EncodeToString(payload)), "confirmed": confirmed, "decoded_payload": decoded}}, true)
 
-	if updated.Mode == "raw" && (updated.RawDownlink == nil || updated.RawDownlink.Mode != "after_uplink") {
+	isRaw := updated.Mode == "raw" || updated.Mode == "node"
+	app, _ := p.store.Application(appID)
+	if isRaw && downlinkCfg(app, updated).Mode != "after_uplink" {
 		go p.sendRawDown(updated, nil)
-	} else if updated.Mode != "raw" && updated.Class == "C" && updated.Session != nil {
+	} else if !isRaw && updated.Class == "C" && updated.Session != nil {
 		go p.sendClassC(updated)
 	}
 	return &item, nil

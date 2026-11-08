@@ -2,7 +2,6 @@
 'use strict';
 
 const KIND_LABEL = { bobcat: 'Bobcat (raw_lora_app)', semtech_udp: 'Semtech UDP', http: 'HTTP', simulated: 'Simulated' };
-const MODE_LABEL = { otaa: 'LoRaWAN OTAA', abp: 'LoRaWAN ABP', raw: 'Raw LoRa' };
 
 // ======================= Overview =======================
 App.route('/', async () => {
@@ -13,16 +12,16 @@ App.route('/', async () => {
   const buckets = []; for (let i = 23; i >= 0; i--) buckets.push(Math.floor((now - i * hour) / hour) * hour);
   const series = [
     { label: 'Gateway receptions', color: 'var(--faint)', data: ov.histogram['gs.up'] || {} },
-    { label: 'Decoded uplinks', color: 'var(--success)', data: ov.histogram['as.up'] || {} },
+    { label: 'Node packets', color: 'var(--success)', data: ov.histogram['as.up'] || {} },
     { label: 'Downlinks', color: 'var(--primary)', data: ov.histogram['ns.down.sent'] || {} },
   ];
   return h('div', { class: 'stack' },
     pageHead(null, 'Overview', [h('span', null, sys.hostname), h('span', null, 'up ' + fmtDur(sys.uptime_s)), sys.addresses && sys.addresses.length ? h('span', null, sys.addresses.join(', ')) : null]),
     h('div', { class: 'grid g4' },
       stat('Gateways', `${ov.gateways_online} / ${ov.gateways}`, 'connected / registered', '#/gateways'),
-      stat('End devices', ov.devices, ov.devices_active_24h + ' active in 24 h', '#/applications'),
-      stat('Uplinks (24 h)', ov.uplinks_24h, ov.gateway_rx_24h + ' gateway receptions', '#/live'),
-      stat('Downlinks (24 h)', ov.downlinks_24h, ov.unmatched_24h + ' unmatched packets', '#/live')),
+      stat('Nodes', ov.devices, ov.devices_active_24h + ' active in 24 h', '#/applications'),
+      stat('Packets (24 h)', ov.uplinks_24h, ov.gateway_rx_24h + ' gateway receptions', '#/live'),
+      stat('Downlinks (24 h)', ov.downlinks_24h, ov.unmatched_24h + ' from unknown NODE_IDs', '#/live')),
     h('div', { class: 'grid g2' },
       h('div', { class: 'card card-body' }, h('h2', null, 'Traffic — last 24 hours'), barChart(series, buckets)),
       h('div', { class: 'card' },
@@ -46,66 +45,77 @@ App.route('/', async () => {
         h('dt', null, 'raw_lora_app'), h('dd', null, sys.listeners.bobcat_raw || 'disabled'),
         h('dt', null, 'MQTT broker'), h('dd', null, sys.listeners.mqtt ? `${sys.listeners.mqtt} · ${sys.mqtt_clients} clients` : 'disabled'))),
       h('div', { class: 'card card-body' }, h('h3', null, 'Quick start'), h('ol', { class: 'small', style: { margin: 0, paddingLeft: '18px' } },
-        h('li', null, h('a', { href: '#/applications/new' }, 'Create an application')),
-        h('li', null, 'Register end devices (OTAA, ABP or raw payload match)'),
-        h('li', null, 'Add a payload formatter to get decoded JSON'),
-        h('li', null, h('a', { href: '#/gateways/new' }, 'Connect satellite gateways')),
-        h('li', null, 'Consume data via MQTT, webhooks or the API')))));
+        h('li', null, h('a', { href: '#/applications/new' }, 'Add a node group'), ' for each NODE_ID (e.g. CAFE)'),
+        h('li', null, 'Nodes (SERIAL_IDs) appear automatically when they transmit'),
+        h('li', null, 'Pick a decoder for the data bytes'),
+        h('li', null, h('a', { href: '#/gateways' }, 'Connect satellite gateways')),
+        h('li', null, 'Read the JSON via MQTT, webhooks or the API')))));
 });
 
-// ======================= Applications =======================
+// ======================= Node groups =======================
+// A node group = all nodes whose packets start with the same NODE_ID.
+// A node = one SERIAL_ID inside a group.  Packet: NODE_ID | SERIAL_ID | data
+
 App.route('/applications', async () => {
   const apps = await GET('/applications');
   return h('div', { class: 'stack' },
-    pageHead([['Applications']], 'Applications', [apps.length + ' applications'], [h('a', { class: 'btn primary', href: '#/applications/new' }, icon('plus'), 'Create application')]),
+    pageHead([['Node groups']], 'Node groups', ['Packets are sorted into groups by their NODE_ID header'], [h('a', { class: 'btn primary', href: '#/applications/new' }, icon('plus'), 'Add node group')]),
     h('div', { class: 'card' }, apps.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' },
-      h('thead', null, h('tr', null, ['ID', 'Name', 'Devices', 'Formatter', 'Created'].map((x) => h('th', null, x)))),
+      h('thead', null, h('tr', null, ['NODE_ID', 'Name', 'Nodes', 'Decoder', 'New nodes', 'Created'].map((x) => h('th', null, x)))),
       h('tbody', null, apps.map((a) => h('tr', { class: 'click', onclick: () => { location.hash = '#/applications/' + a.application_id; } },
-        h('td', null, h('b', null, a.application_id)), h('td', null, a.name || h('span', { class: 'faint' }, '—')),
+        h('td', null, a.node_id ? h('span', { class: 'val' }, a.node_id) : h('span', { class: 'faint' }, '—')),
+        h('td', null, h('b', null, a.name || a.application_id)),
         h('td', null, a.device_count), h('td', null, h('span', { class: 'badge' }, (a.uplink_formatter || {}).type || 'none')),
+        h('td', null, a.auto_register_nodes ? h('span', { class: 'badge ok' }, 'auto-add') : h('span', { class: 'badge' }, 'manual')),
         h('td', { class: 'small muted' }, fmtDate(a.created_at))))))) :
-      h('div', { class: 'empty' }, icon('app'), 'No applications yet.', h('div', { style: { marginTop: '10px' } }, h('a', { class: 'btn primary', href: '#/applications/new' }, 'Create your first application')))));
+      h('div', { class: 'empty' }, icon('app'), 'No node groups yet. Create one for each NODE_ID your nodes send (e.g. CAFE).',
+        h('div', { style: { marginTop: '10px' } }, h('a', { class: 'btn primary', href: '#/applications/new' }, 'Add node group')))));
 });
 
 App.route('/applications/new', async () => {
-  const id = inp('', { placeholder: 'my-sensors', class: 'mono' });
-  const name = inp('', { placeholder: 'My sensors' });
-  const desc = h('textarea', { rows: 3 });
-  const tpl = sel('cayenne_lpp', [['none', 'None'], ['cayenne_lpp', 'CayenneLPP'], ['javascript', 'Custom JavaScript'], ['fields', 'Byte fields']]);
-  name.addEventListener('input', () => { if (!id.dataset.touched) id.value = name.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 36); });
-  id.addEventListener('input', () => { id.dataset.touched = 1; });
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const s = await GET('/settings');
+  const nidLen = s.packet_format.node_id_length;
+  const nodeId = inp(params.get('node_id') || '', { class: 'mono', placeholder: 'CAFE', maxlength: nidLen * 2 });
+  const name = inp(params.get('node_id') ? 'Node ' + params.get('node_id') : '', { placeholder: 'Greenhouse sensors' });
+  const desc = h('textarea', { rows: 2 });
+  const tpl = sel('cayenne_lpp', [['none', 'None (raw hex only)'], ['cayenne_lpp', 'CayenneLPP'], ['fields', 'Byte fields (no code)'], ['javascript', 'Custom JavaScript']]);
+  const auto = checkbox(true, 'Add new nodes automatically', 'When a packet with this NODE_ID arrives from a SERIAL_ID that is not known yet, the node is created automatically.');
+  const hdr = checkbox(true, 'Prepend NODE_ID + SERIAL_ID to downlinks', 'Downlink data is sent as NODE_ID | SERIAL_ID | data so the node can recognise it.');
   const save = async () => {
     try {
       const f = { type: tpl.value }; if (f.type === 'javascript') f.code = FMT_TEMPLATES.javascript;
-      await api('POST', '/applications', { application_id: id.value.trim(), name: name.value, description: desc.value, uplink_formatter: f, downlink_formatter: { type: 'none' } });
-      toast('Application created'); location.hash = '#/applications/' + id.value.trim();
+      const a = await api('POST', '/applications', { node_id: cleanHex(nodeId.value), name: name.value, description: desc.value, uplink_formatter: f, downlink_formatter: { type: 'none' },
+        auto_register_nodes: auto.input.checked, downlink_header: hdr.input.checked, downlink_radio: { mode: 'immediate', power: 14, delay_ms: 1000 } });
+      toast('Node group created'); location.hash = '#/applications/' + a.application_id;
     } catch (e) { errToast(e); }
   };
-  return h('div', { class: 'stack' }, pageHead([['Applications', '#/applications'], ['Create']], 'Create application'),
+  return h('div', { class: 'stack' }, pageHead([['Node groups', '#/applications'], ['Add']], 'Add node group'),
     h('div', { class: 'card card-body' }, h('div', { class: 'form' },
-      field('Application name', name), field('Application ID', id, 'Lowercase letters, digits and dashes. Used in MQTT topics and the API; cannot be changed later.'),
-      field('Description', desc), field('Default uplink payload formatter', tpl),
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: save }, 'Create application'), h('a', { class: 'btn', href: '#/applications' }, 'Cancel')))));
+      field('NODE_ID (hex)', nodeId, `The first ${nidLen} byte(s) of every packet from these nodes, e.g. CAFE.`),
+      field('Name', name), field('Description', desc), field('Decoder for the data bytes', tpl, 'Can be changed later on the Decoder tab.'),
+      auto.el, hdr.el,
+      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: save }, 'Create node group'), h('a', { class: 'btn', href: '#/applications' }, 'Cancel')))));
 });
 
 function appHeader(a, active) {
   const base = '#/applications/' + a.application_id;
-  return [pageHead([['Applications', '#/applications'], [a.application_id]], a.name || a.application_id, [h('span', { class: 'mono small' }, 'ID: ' + a.application_id), a.description ? h('span', null, a.description) : null]),
-    tabs(base, [['', 'Overview'], ['devices', 'End devices'], ['live', 'Live data'], ['formatters', 'Payload formatters'], ['integrations', 'Integrations'], ['settings', 'General settings']], active)];
+  return [pageHead([['Node groups', '#/applications'], [a.node_id || a.application_id]], a.name || a.application_id,
+    [a.node_id ? h('span', null, 'NODE_ID ', h('span', { class: 'val' }, a.node_id)) : null, a.description ? h('span', null, a.description) : null]),
+  tabs(base, [['', 'Overview'], ['devices', 'Nodes'], ['live', 'Live data'], ['formatters', 'Decoder'], ['integrations', 'Integrations'], ['settings', 'Settings']], active)];
 }
 
 function deviceTable(appID, devs) {
-  if (!devs.length) return h('div', { class: 'empty' }, icon('device'), 'No end devices in this application yet.',
-    h('div', { style: { marginTop: '10px' } }, h('a', { class: 'btn primary', href: `#/applications/${appID}/devices/new` }, icon('plus'), 'Register end device')));
+  if (!devs.length) return h('div', { class: 'empty' }, icon('device'), 'No nodes yet. They appear here automatically when they send a packet (if "add new nodes automatically" is on).',
+    h('div', { style: { marginTop: '10px' } }, h('a', { class: 'btn', href: `#/applications/${appID}/devices/new` }, icon('plus'), 'Add node manually')));
   return h('div', { class: 'table-wrap' }, h('table', { class: 't' },
-    h('thead', null, h('tr', null, ['ID', 'Name', 'Type', 'DevEUI / match', 'Last seen', 'Signal', 'Uplinks'].map((x) => h('th', null, x)))),
+    h('thead', null, h('tr', null, ['SERIAL_ID', 'Name', 'Last seen', 'Signal', 'Packets', 'Last data'].map((x) => h('th', null, x)))),
     h('tbody', null, devs.map((d) => h('tr', { class: 'click', onclick: () => { location.hash = `#/applications/${appID}/devices/${d.device_id}`; } },
-      h('td', null, h('b', null, d.device_id)), h('td', null, d.name || h('span', { class: 'faint' }, '—')),
-      h('td', null, h('span', { class: 'badge ' + (d.mode === 'raw' ? 'purple' : 'info') }, MODE_LABEL[d.mode] || d.mode)),
-      h('td', { class: 'mono small' }, d.mode === 'raw' ? (d.raw_match ? `${d.raw_match.type} ${d.raw_match.value}` : '—') : (d.dev_eui || (d.session && d.session.dev_addr) || '—')),
+      h('td', null, h('span', { class: 'val' }, d.serial || d.device_id)), h('td', null, h('b', null, d.name || d.device_id)),
       h('td', { class: 'small nowrap' }, d.last_seen ? h('span', { class: 'row', style: { gap: '6px' } }, h('span', { class: 'dot ' + (Date.now() - new Date(d.last_seen) < 36e5 ? 'on' : '') }), ago(d.last_seen)) : h('span', { class: 'faint' }, 'never')),
       h('td', { class: 'small nowrap' }, d.last_seen ? [signalBars(d.last_snr), ' ', d.last_rssi + ' dBm'] : '—'),
-      h('td', null, d.uplink_count || 0))))));
+      h('td', null, d.uplink_count || 0),
+      h('td', { class: 'small mono', style: { maxWidth: '360px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, d.last_decoded ? JSON.stringify(d.last_decoded) : '—'))))));
 }
 
 App.route('/applications/:app', async ({ app }) => {
@@ -113,23 +123,23 @@ App.route('/applications/:app', async ({ app }) => {
   const active = devs.filter((d) => d.last_seen && Date.now() - new Date(d.last_seen) < 864e5).length;
   return h('div', { class: 'stack' }, appHeader(a, ''),
     h('div', { class: 'grid g3' },
-      h('div', { class: 'card stat' }, h('div', { class: 'label' }, 'End devices'), h('div', { class: 'value' }, devs.length), h('div', { class: 'hint' }, active + ' active in 24 h')),
-      h('div', { class: 'card stat' }, h('div', { class: 'label' }, 'Uplink formatter'), h('div', { class: 'value', style: { fontSize: '18px' } }, (a.uplink_formatter || {}).type || 'none')),
+      h('div', { class: 'card stat' }, h('div', { class: 'label' }, 'Nodes'), h('div', { class: 'value' }, devs.length), h('div', { class: 'hint' }, active + ' active in 24 h')),
+      h('div', { class: 'card stat' }, h('div', { class: 'label' }, 'Decoder'), h('div', { class: 'value', style: { fontSize: '18px' } }, (a.uplink_formatter || {}).type || 'none')),
       h('div', { class: 'card stat' }, h('div', { class: 'label' }, 'Webhooks'), h('div', { class: 'value' }, (a.webhooks || []).filter((w) => w.enabled).length), h('div', { class: 'hint' }, 'enabled'))),
-    h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'End devices'), h('a', { class: 'btn sm primary', href: `#/applications/${app}/devices/new` }, icon('plus'), 'Register end device')), deviceTable(app, devs.slice(0, 10))),
+    h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Nodes'), h('a', { class: 'btn sm', href: `#/applications/${app}/devices` }, 'View all')), deviceTable(app, devs.slice(0, 10))),
     liveView({ app, short: true, title: 'Live data' }));
 });
 
 App.route('/applications/:app/devices', async ({ app }) => {
   const [a, devs] = await Promise.all([GET('/applications/' + app), GET(`/applications/${app}/devices`)]);
-  const search = inp('', { placeholder: 'Filter by ID, name, EUI…', style: { maxWidth: '320px' } });
+  const search = inp('', { placeholder: 'Filter by serial or name…', style: { maxWidth: '320px' } });
   const holder = h('div', null, deviceTable(app, devs));
   search.addEventListener('input', () => {
     const q = search.value.toLowerCase();
-    holder.replaceChildren(deviceTable(app, devs.filter((d) => JSON.stringify([d.device_id, d.name, d.dev_eui, d.session && d.session.dev_addr]).toLowerCase().includes(q))));
+    holder.replaceChildren(deviceTable(app, devs.filter((d) => JSON.stringify([d.device_id, d.name, d.serial]).toLowerCase().includes(q))));
   });
   return h('div', { class: 'stack' }, appHeader(a, 'devices'),
-    h('div', { class: 'card' }, h('div', { class: 'card-head' }, search, h('a', { class: 'btn primary', href: `#/applications/${app}/devices/new` }, icon('plus'), 'Register end device')), holder));
+    h('div', { class: 'card' }, h('div', { class: 'card-head' }, search, h('a', { class: 'btn', href: `#/applications/${app}/devices/new` }, icon('plus'), 'Add node manually')), holder));
 });
 
 App.route('/applications/:app/live', async ({ app }) => {
@@ -139,42 +149,44 @@ App.route('/applications/:app/live', async ({ app }) => {
 
 App.route('/applications/:app/formatters', async ({ app }) => {
   const a = await GET('/applications/' + app);
+  let sample = '';
+  try { const evs = await GET(`/events?app=${app}&names=as.up&limit=1`); if (evs[0]) sample = evs[0].data.data_hex; } catch (e) { /* none */ }
   let dir = 'up';
   const holder = h('div');
   const seg = h('div', { class: 'seg' });
   const render = () => {
-    seg.replaceChildren(h('button', { class: dir === 'up' ? 'on' : '', onclick: () => { dir = 'up'; render(); } }, 'Uplink'), h('button', { class: dir === 'down' ? 'on' : '', onclick: () => { dir = 'down'; render(); } }, 'Downlink'));
+    seg.replaceChildren(h('button', { class: dir === 'up' ? 'on' : '', onclick: () => { dir = 'up'; render(); } }, 'Uplink decoder'), h('button', { class: dir === 'down' ? 'on' : '', onclick: () => { dir = 'down'; render(); } }, 'Downlink encoder'));
     if (dir === 'up') {
-      holder.replaceChildren(formatterEditor(a.uplink_formatter, { onSave: async (f) => {
-        try { Object.assign(a, await api('PUT', '/applications/' + app, { uplink_formatter: f })); toast('Uplink formatter saved'); } catch (e) { errToast(e); }
+      holder.replaceChildren(formatterEditor(a.uplink_formatter, { samplePayload: sample, onSave: async (f) => {
+        try { Object.assign(a, await api('PUT', '/applications/' + app, { uplink_formatter: f })); toast('Decoder saved'); } catch (e) { errToast(e); }
       } }));
     } else {
       const st = JSON.parse(JSON.stringify(a.downlink_formatter || { type: 'none' }));
-      const typeSel = sel(st.type || 'none', [['none', 'None (send raw bytes)'], ['javascript', 'Custom JavaScript (encodeDownlink)']]);
+      const typeSel = sel(st.type || 'none', [['none', 'None (send hex bytes)'], ['javascript', 'Custom JavaScript (encodeDownlink)']]);
       const ta = h('textarea', { class: 'code', spellcheck: 'false', value: st.code || FMT_TEMPLATES.javascript });
       const testIn = h('textarea', { class: 'mono', rows: 3, value: '{"relay": true}' });
       const out = h('div');
-      holder.replaceChildren(h('div', { class: 'stack' }, field('Formatter type', typeSel), field('Formatter code', ta, 'Implements encodeDownlink(input) → {bytes, fPort}. Used when a downlink is scheduled with decoded_payload (UI, MQTT or API).'),
-        h('div', { class: 'form-section stack' }, h('h3', null, 'Test'), field('Decoded payload (JSON)', testIn),
+      holder.replaceChildren(h('div', { class: 'stack' }, field('Encoder type', typeSel), field('Encoder code', ta, 'encodeDownlink(input) → {bytes}. Used when you send a downlink as JSON. The NODE_ID + SERIAL header is added afterwards if enabled.'),
+        h('div', { class: 'form-section stack' }, h('h3', null, 'Test'), field('Downlink JSON', testIn),
           h('div', null, h('button', { class: 'btn', onclick: async () => {
             try { const r = await api('POST', '/formatters/test', { direction: 'down', formatter: { type: 'javascript', code: ta.value }, decoded_payload: JSON.parse(testIn.value), f_port: 1 });
-              out.replaceChildren(r.errors ? h('div', { class: 'callout warn' }, r.errors.join('; ')) : h('div', { class: 'row' }, 'Bytes:', h('span', { class: 'val' }, r.bytes_hex || '(empty)'), 'FPort:', h('b', null, r.f_port)));
+              out.replaceChildren(r.errors ? h('div', { class: 'callout warn' }, r.errors.join('; ')) : h('div', { class: 'row' }, 'Data bytes:', h('span', { class: 'val' }, r.bytes_hex || '(empty)')));
             } catch (e) { out.replaceChildren(h('div', { class: 'callout warn' }, e.message)); }
           } }, icon('play'), 'Test encoder')), out),
         h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-          try { Object.assign(a, await api('PUT', '/applications/' + app, { downlink_formatter: { type: typeSel.value, code: ta.value } })); toast('Downlink formatter saved'); } catch (e) { errToast(e); }
+          try { Object.assign(a, await api('PUT', '/applications/' + app, { downlink_formatter: { type: typeSel.value, code: ta.value } })); toast('Encoder saved'); } catch (e) { errToast(e); }
         } }, 'Save changes'))));
     }
   };
   render();
-  return h('div', { class: 'stack' }, appHeader(a, 'formatters'), h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Payload formatters'), seg), h('div', { class: 'card-body' }, holder)));
+  return h('div', { class: 'stack' }, appHeader(a, 'formatters'), h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Decoder'), seg), h('div', { class: 'card-body' }, holder)));
 });
 
 App.route('/applications/:app/integrations', async ({ app }) => {
   const [a, settings, sys] = await Promise.all([GET('/applications/' + app), GET('/settings'), GET('/system')]);
   const hooks = JSON.parse(JSON.stringify(a.webhooks || []));
   const list = h('div', { class: 'stack' });
-  const EVENTS = [['up', 'Uplink message'], ['join', 'Join accept'], ['downlink_queued', 'Downlink queued'], ['downlink_sent', 'Downlink sent'], ['downlink_failed', 'Downlink failed']];
+  const EVENTS = [['up', 'Node data'], ['downlink_queued', 'Downlink queued'], ['downlink_sent', 'Downlink sent'], ['downlink_failed', 'Downlink failed']];
   const render = () => {
     list.replaceChildren(...hooks.map((w, i) => {
       const hdrs = h('textarea', { class: 'mono', rows: 2, value: Object.entries(w.headers || {}).map(([k, v]) => k + ': ' + v).join('\n'), placeholder: 'Authorization: Bearer xyz',
@@ -183,10 +195,10 @@ App.route('/applications/:app/integrations', async ({ app }) => {
       return h('div', { class: 'card card-body stack' },
         h('div', { class: 'row between' }, h('h3', { style: { margin: 0 } }, w.name || 'Webhook ' + (i + 1)), h('button', { class: 'btn sm danger', onclick: () => { hooks.splice(i, 1); render(); } }, icon('trash'), 'Remove')),
         h('div', { class: 'grid g2' }, field('Name', inp(w.name, { oninput: (e) => { w.name = e.target.value; } })),
-          field('Payload format', sel(w.format || 'full', [['full', 'Full message (TTN style)'], ['decoded', 'Decoded payload + metadata only']], { onchange: (e) => { w.format = e.target.value; } }))),
-        field('Endpoint URL', inp(w.url, { type: 'url', placeholder: 'https://example.com/lora', oninput: (e) => { w.url = e.target.value; } })),
-        field('Additional headers', hdrs),
-        field('Enabled event types', h('div', { class: 'row' }, EVENTS.map(([k, l]) => { const c = checkbox((w.events || []).includes(k), l);
+          field('Body', sel(w.format || 'full', [['full', 'Full message (decoded + all gateway metadata)'], ['decoded', 'Short (node, serial, decoded, gateways)']], { onchange: (e) => { w.format = e.target.value; } }))),
+        field('URL', inp(w.url, { type: 'url', placeholder: 'https://example.com/lora', oninput: (e) => { w.url = e.target.value; } })),
+        field('Extra headers', hdrs),
+        field('Send on', h('div', { class: 'row' }, EVENTS.map(([k, l]) => { const c = checkbox((w.events || []).includes(k), l);
           c.input.onchange = () => { w.events = (w.events || []).filter((x) => x !== k); if (c.input.checked) w.events.push(k); }; return c.el; }))),
         en.el);
     }));
@@ -197,15 +209,14 @@ App.route('/applications/:app/integrations', async ({ app }) => {
   const p = settings.mqtt_topic_prefix;
   return h('div', { class: 'stack' }, appHeader(a, 'integrations'),
     h('div', { class: 'card card-body stack' }, h('h2', null, 'MQTT'),
-      h('p', { class: 'muted', style: { margin: 0 } }, 'Every decoded message of this application is published on the embedded MQTT broker' + (settings.external_mqtt.enabled ? ' and on the external broker ' + settings.external_mqtt.url : '') + '. Topics follow The Things Stack conventions.'),
+      h('p', { class: 'muted', style: { margin: 0 } }, 'Every decoded packet of this group is published as JSON on the built-in MQTT broker' + (settings.external_mqtt.enabled ? ' and on ' + settings.external_mqtt.url : '') + '.'),
       h('dl', { class: 'kv' },
-        h('dt', null, 'Broker'), h('dd', null, sys.listeners.mqtt ? val(`mqtt://${host}${sys.listeners.mqtt.replace(/^[^:]*/, '')}`) : h('span', { class: 'badge warn' }, 'embedded broker disabled')),
-        h('dt', null, 'Uplinks'), h('dd', null, val(`${p}/${app}/devices/+/up`)),
-        h('dt', null, 'Join accepts'), h('dd', null, val(`${p}/${app}/devices/+/join`)),
-        h('dt', null, 'Downlink events'), h('dd', null, val(`${p}/${app}/devices/+/down/sent`)),
-        h('dt', null, 'Schedule downlink'), h('dd', null, val(`${p}/${app}/devices/{device_id}/down/push`)),
-        h('dt', null, 'Downlink body'), h('dd', null, h('code', null, '{"downlinks":[{"f_port":1,"frm_payload":"AQI=","confirmed":false}]}'))),
-      h('div', { class: 'small muted' }, 'Home Assistant auto-discovery: ', h('b', null, settings.home_assistant.enabled ? 'enabled' : 'disabled'), ' · ', h('a', { href: '#/settings/integrations' }, 'change'))),
+        h('dt', null, 'Broker'), h('dd', null, sys.listeners.mqtt ? val(`mqtt://${host}${sys.listeners.mqtt.replace(/^[^:]*/, '')}`) : h('span', { class: 'badge warn' }, 'built-in broker disabled')),
+        h('dt', null, 'Node data'), h('dd', null, val(`${p}/${app}/+/up`)),
+        h('dt', null, 'Send downlink'), h('dd', null, val(`${p}/${app}/{node}/down`)),
+        h('dt', null, 'Downlink body'), h('dd', null, h('code', null, '{"data_hex":"0102"}  or  {"decoded":{"relay":true}}')),
+        h('dt', null, 'Downlink events'), h('dd', null, val(`${p}/${app}/+/down/sent`))),
+      h('div', { class: 'small muted' }, 'Home Assistant auto-discovery: ', h('b', null, settings.home_assistant.enabled ? 'on' : 'off'), ' · ', h('a', { href: '#/settings/integrations' }, 'change'))),
     h('div', { class: 'card card-body stack' },
       h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Webhooks'), h('button', { class: 'btn', onclick: () => { hooks.push({ name: '', url: '', events: ['up'], enabled: true, format: 'full', headers: {} }); render(); } }, icon('plus'), 'Add webhook')),
       list,
@@ -214,151 +225,108 @@ App.route('/applications/:app/integrations', async ({ app }) => {
       } }, 'Save webhooks'))));
 });
 
+function radioFields(dl) {
+  return [h('div', { class: 'grid g3' },
+    field('When to send', sel(dl.mode || 'immediate', [['immediate', 'Immediately'], ['after_uplink', 'After the node\'s next packet']], { onchange: (e) => { dl.mode = e.target.value; } })),
+    field('Delay after packet (ms)', inp(dl.delay_ms || 1000, { type: 'number', min: 0, oninput: (e) => { dl.delay_ms = Number(e.target.value); } })),
+    field('TX power (dBm)', inp(dl.power || 14, { type: 'number', min: 0, max: 27, oninput: (e) => { dl.power = Number(e.target.value); } }))),
+  h('div', { class: 'grid g3' },
+    field('Frequency (MHz)', inp(dl.frequency || '', { type: 'number', step: 'any', placeholder: 'same as last packet', oninput: (e) => { dl.frequency = Number(e.target.value); } })),
+    field('Data rate', inp(dl.data_rate || '', { class: 'mono', placeholder: 'SF7BW125 (same as last packet)', oninput: (e) => { dl.data_rate = e.target.value.toUpperCase(); } })),
+    field('Coding rate', sel(dl.coding_rate || '4/5', ['4/5', '4/6', '4/7', '4/8'], { onchange: (e) => { dl.coding_rate = e.target.value; } }))),
+  (() => { const c = checkbox(dl.invert_polarity, 'Invert IQ', 'Only if your nodes listen with inverted IQ.'); c.input.onchange = () => { dl.invert_polarity = c.input.checked; }; return c.el; })()];
+}
+
 App.route('/applications/:app/settings', async ({ app }) => {
   const a = await GET('/applications/' + app);
-  const name = inp(a.name), desc = h('textarea', { rows: 3, value: a.description || '' });
+  const name = inp(a.name), desc = h('textarea', { rows: 2, value: a.description || '' }), nodeId = inp(a.node_id, { class: 'mono' });
+  const auto = checkbox(a.auto_register_nodes, 'Add new nodes automatically');
+  const hdr = checkbox(a.downlink_header, 'Prepend NODE_ID + SERIAL_ID to downlinks');
+  const dl = Object.assign({ mode: 'immediate', power: 14, delay_ms: 1000 }, a.downlink_radio || {});
   return h('div', { class: 'stack' }, appHeader(a, 'settings'),
     h('div', { class: 'card card-body' }, h('div', { class: 'form' },
-      field('Application ID', inp(a.application_id, { disabled: true, class: 'mono' })), field('Name', name), field('Description', desc),
+      field('NODE_ID (hex)', nodeId), field('Name', name), field('Description', desc), auto.el, hdr.el,
+      h('div', { class: 'form-section stack' }, h('h3', null, 'Downlink radio settings'), ...radioFields(dl)),
       h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await api('PUT', '/applications/' + app, { name: name.value, description: desc.value }); toast('Saved'); } catch (e) { errToast(e); }
+        try { await api('PUT', '/applications/' + app, { name: name.value, description: desc.value, node_id: cleanHex(nodeId.value), auto_register_nodes: auto.input.checked, downlink_header: hdr.input.checked, downlink_radio: dl }); toast('Saved'); App.dispatch(); } catch (e) { errToast(e); }
       } }, 'Save changes')))),
-    h('div', { class: 'card card-body' }, h('h2', null, 'Danger zone'), h('p', { class: 'muted' }, 'Deleting the application also deletes all of its end devices and their sessions.'),
+    h('div', { class: 'card card-body' }, h('h2', null, 'Delete node group'), h('p', { class: 'muted' }, 'Deletes the group and all of its nodes.'),
       h('button', { class: 'btn danger', onclick: async () => {
-        if (!(await confirmModal('Delete application', `Delete "${app}" and all its end devices? This cannot be undone.`))) return;
-        try { await api('DELETE', '/applications/' + app); toast('Application deleted'); location.hash = '#/applications'; } catch (e) { errToast(e); }
-      } }, icon('trash'), 'Delete application')));
+        if (!(await confirmModal('Delete node group', `Delete "${a.name || app}" and all its nodes? This cannot be undone.`))) return;
+        try { await api('DELETE', '/applications/' + app); toast('Deleted'); location.hash = '#/applications'; } catch (e) { errToast(e); }
+      } }, icon('trash'), 'Delete node group')));
 });
 
-// ======================= End devices =======================
+// ======================= Nodes =======================
 function deviceForm(d, isNew, onSubmit) {
   const st = JSON.parse(JSON.stringify(d));
-  st.session = st.session || {};
-  st.raw_match = st.raw_match || { type: 'prefix', value: '' };
-  st.raw_downlink = st.raw_downlink || { mode: 'immediate', delay_ms: 1000, frequency: 0, data_rate: '', power: 14, invert_polarity: false };
-  st.location = st.location || null;
-  const holder = h('div', { class: 'form' });
-  const bands = ['EU868', 'US915', 'AU915', 'AS923', 'IN865'];
-  const render = () => {
-    const id = inp(st.device_id, { class: 'mono', disabled: !isNew, oninput: (e) => { st.device_id = e.target.value; }, placeholder: 'node-1' });
-    const modeCards = h('div', { class: 'radio-cards' }, [['otaa', 'Over the air activation', 'LoRaWAN join with AppKey (recommended)'], ['abp', 'Activation by personalization', 'LoRaWAN with fixed session keys'], ['raw', 'Raw LoRa device', 'Non-LoRaWAN payload, matched by bytes']].map(([m, t, s]) =>
-      h('div', { class: 'radio-card' + (st.mode === m ? ' sel' : ''), onclick: () => { st.mode = m; render(); } }, h('b', null, t), h('span', null, s))));
-    const kids = [field('Activation / device type', modeCards),
-      h('div', { class: 'grid g2' }, field('End device ID', id, isNew ? 'Lowercase letters, digits and dashes.' : null), field('Name', inp(st.name, { oninput: (e) => { st.name = e.target.value; } }))),
-      field('Description', h('textarea', { rows: 2, value: st.description || '', oninput: (e) => { st.description = e.target.value; } }))];
-    if (st.mode === 'otaa') {
-      const de = hexInput(st.dev_eui, 16), je = hexInput(st.join_eui, 16, 'Fill'), ak = hexInput(st.app_key, 32);
-      de.input.oninput = (e) => { st.dev_eui = e.target.value; }; je.input.oninput = (e) => { st.join_eui = e.target.value; }; ak.input.oninput = (e) => { st.app_key = e.target.value; };
-      kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'LoRaWAN OTAA keys'),
-        h('div', { class: 'grid g2' }, field('DevEUI', de.el), field('JoinEUI (AppEUI)', je.el, 'All zeros if your device has none.')),
-        field('AppKey', ak.el, 'Root key used to verify join requests and derive session keys.')));
-    } else if (st.mode === 'abp') {
-      const da = hexInput(st.session.dev_addr, 8), nk = hexInput(st.session.nwk_s_key, 32), sk = hexInput(st.session.app_s_key, 32), de = hexInput(st.dev_eui, 16);
-      da.input.oninput = (e) => { st.session.dev_addr = e.target.value; }; nk.input.oninput = (e) => { st.session.nwk_s_key = e.target.value; };
-      sk.input.oninput = (e) => { st.session.app_s_key = e.target.value; }; de.input.oninput = (e) => { st.dev_eui = e.target.value; };
-      kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'LoRaWAN ABP session'),
-        h('div', { class: 'grid g2' }, field('Device address', da.el), field('DevEUI (optional)', de.el)),
-        field('Network session key (NwkSKey)', nk.el), field('App session key (AppSKey)', sk.el)));
-    } else {
-      const m = st.raw_match;
-      const strip = checkbox(m.strip_prefix, 'Strip matched prefix before decoding'); strip.input.onchange = () => { m.strip_prefix = strip.input.checked; };
-      const dl = st.raw_downlink;
-      kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'Raw payload matching'),
-        h('div', { class: 'callout info small' }, 'Raw (non-LoRaWAN) packets are assigned to this device when they match the rule below. The longest matching rule wins.'),
-        h('div', { class: 'grid g3' },
-          field('Match type', sel(m.type, [['prefix', 'Starts with bytes'], ['bytes', 'Bytes at offset'], ['regex_hex', 'Regex on hex']], { onchange: (e) => { m.type = e.target.value; render(); } })),
-          field(m.type === 'regex_hex' ? 'Regular expression' : 'Value (hex)', inp(m.value, { class: 'mono', placeholder: m.type === 'regex_hex' ? '^CAFE.{8}01' : 'CAFE96B8', oninput: (e) => { m.value = e.target.value; } })),
-          m.type === 'bytes' ? field('Offset', inp(m.offset || 0, { type: 'number', min: 0, oninput: (e) => { m.offset = Number(e.target.value); } })) : field('Minimum length', inp(m.min_length || '', { type: 'number', min: 0, oninput: (e) => { m.min_length = Number(e.target.value); } }))),
-        h('div', { class: 'grid g3' }, field('Exact length (optional)', inp(m.length || '', { type: 'number', min: 0, oninput: (e) => { m.length = Number(e.target.value); } })),
-          field('Virtual FPort', inp(st.raw_f_port || 1, { type: 'number', min: 1, max: 255, oninput: (e) => { st.raw_f_port = Number(e.target.value); } }), 'Passed as fPort to the formatter.'),
-          h('div', { style: { alignSelf: 'center' } }, strip.el))),
-        h('div', { class: 'form-section stack' }, h('h3', null, 'Raw downlinks'),
-          h('div', { class: 'grid g3' },
-            field('Delivery', sel(dl.mode, [['immediate', 'Immediately (class C style)'], ['after_uplink', 'After next uplink (class A style)']], { onchange: (e) => { dl.mode = e.target.value; } })),
-            field('Delay after uplink (ms)', inp(dl.delay_ms, { type: 'number', min: 0, oninput: (e) => { dl.delay_ms = Number(e.target.value); } })),
-            field('TX power (dBm)', inp(dl.power, { type: 'number', min: 0, max: 27, oninput: (e) => { dl.power = Number(e.target.value); } }))),
-          h('div', { class: 'grid g3' },
-            field('Frequency (MHz)', inp(dl.frequency || '', { type: 'number', step: 'any', placeholder: 'same as uplink', oninput: (e) => { dl.frequency = Number(e.target.value); } })),
-            field('Data rate', inp(dl.data_rate, { class: 'mono', placeholder: 'SF7BW125 (same as uplink)', oninput: (e) => { dl.data_rate = e.target.value.toUpperCase(); } })),
-            field('Coding rate', sel(dl.coding_rate || '4/5', ['4/5', '4/6', '4/7', '4/8'], { onchange: (e) => { dl.coding_rate = e.target.value; } }))),
-          (() => { const c = checkbox(dl.invert_polarity, 'Invert IQ polarity', 'Enable if your device listens with inverted IQ (LoRaWAN-style).'); c.input.onchange = () => { dl.invert_polarity = c.input.checked; }; return c.el; })()));
-    }
-    const lat = inp(st.location ? st.location.latitude : '', { type: 'number', step: 'any', placeholder: '46.77' });
-    const lon = inp(st.location ? st.location.longitude : '', { type: 'number', step: 'any', placeholder: '23.59' });
-    const updLoc = () => { st.location = lat.value && lon.value ? { latitude: Number(lat.value), longitude: Number(lon.value), altitude: 0, source: 'user' } : null; };
-    lat.oninput = updLoc; lon.oninput = updLoc;
-    const skip = checkbox(st.skip_fcnt_check, 'Skip frame counter check', 'Accept uplinks with a reset or lower frame counter (insecure, useful for development).');
-    skip.input.onchange = () => { st.skip_fcnt_check = skip.input.checked; };
-    kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'Radio & location'),
-      h('div', { class: 'grid g3' }, field('Frequency plan', sel(st.frequency_plan || 'EU868', bands, { onchange: (e) => { st.frequency_plan = e.target.value; } })),
-        st.mode !== 'raw' ? field('LoRaWAN class', sel(st.class || 'A', [['A', 'Class A'], ['C', 'Class C']], { onchange: (e) => { st.class = e.target.value; } })) : h('div'),
-        h('div')),
-      h('div', { class: 'grid g2' }, field('Latitude', lat), field('Longitude', lon)),
-      st.mode !== 'raw' ? skip.el : null));
-    const attrs = h('textarea', { class: 'mono', rows: 3, value: Object.entries(st.attributes || {}).map(([k, v]) => k + '=' + v).join('\n'), placeholder: 'room=kitchen',
-      oninput: (e) => { st.attributes = {}; e.target.value.split('\n').forEach((l) => { const i = l.indexOf('='); if (i > 0) st.attributes[l.slice(0, i).trim()] = l.slice(i + 1).trim(); }); } });
-    kids.push(field('Attributes', attrs, 'key=value per line. Available to JavaScript formatters as input.attributes.'));
-    kids.push(h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: () => {
-      const out = JSON.parse(JSON.stringify(st));
-      if (out.mode !== 'abp') delete out.session;
-      if (out.mode !== 'raw') { delete out.raw_match; delete out.raw_downlink; }
-      onSubmit(out);
-    } }, isNew ? 'Register end device' : 'Save changes')));
-    holder.replaceChildren(...kids);
-  };
-  render();
-  return holder;
+  st.mode = st.mode || 'node';
+  const serial = inp(st.serial, { class: 'mono', disabled: !isNew, placeholder: '96B840EB', oninput: (e) => { st.serial = e.target.value; } });
+  const name = inp(st.name, { oninput: (e) => { st.name = e.target.value; } });
+  const desc = h('textarea', { rows: 2, value: st.description || '', oninput: (e) => { st.description = e.target.value; } });
+  const lat = inp(st.location ? st.location.latitude : '', { type: 'number', step: 'any', placeholder: '46.77' });
+  const lon = inp(st.location ? st.location.longitude : '', { type: 'number', step: 'any', placeholder: '23.59' });
+  const attrs = h('textarea', { class: 'mono', rows: 3, value: Object.entries(st.attributes || {}).map(([k, v]) => k + '=' + v).join('\n'), placeholder: 'room=kitchen',
+    oninput: (e) => { st.attributes = {}; e.target.value.split('\n').forEach((l) => { const i = l.indexOf('='); if (i > 0) st.attributes[l.slice(0, i).trim()] = l.slice(i + 1).trim(); }); } });
+  return h('div', { class: 'form' },
+    field('SERIAL_ID (hex)', serial, isNew ? 'The serial bytes that follow the NODE_ID in the packet.' : null),
+    field('Name', name), field('Description', desc),
+    h('div', { class: 'grid g2' }, field('Latitude', lat), field('Longitude', lon)),
+    field('Attributes', attrs, 'key=value per line. Available to JavaScript decoders as input.attributes.'),
+    h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: () => {
+      st.location = lat.value && lon.value ? { latitude: Number(lat.value), longitude: Number(lon.value), altitude: 0, source: 'user' } : null;
+      st.serial = cleanHex(st.serial);
+      if (isNew) st.device_id = st.serial.toLowerCase();
+      onSubmit(st);
+    } }, isNew ? 'Add node' : 'Save changes')));
 }
 
 App.route('/applications/:app/devices/new', async ({ app }) => {
   const a = await GET('/applications/' + app);
-  const params = new URLSearchParams(location.hash.split('?')[1] || '');
-  const d = { device_id: params.get('id') || '', mode: params.get('mode') || 'otaa', dev_eui: params.get('dev_eui') || '', join_eui: params.get('join_eui') || '', app_key: '', frequency_plan: 'EU868', class: 'A',
-    raw_match: params.get('match') ? { type: 'prefix', value: params.get('match') } : undefined };
-  return h('div', { class: 'stack' }, pageHead([['Applications', '#/applications'], [app, '#/applications/' + app], ['End devices', `#/applications/${app}/devices`], ['Register']], 'Register end device'),
-    h('div', { class: 'card card-body' }, deviceForm(d, true, async (out) => {
-      try { await api('POST', `/applications/${app}/devices`, out); toast('End device registered'); location.hash = `#/applications/${app}/devices/${out.device_id}`; } catch (e) { errToast(e); }
+  return h('div', { class: 'stack' }, pageHead([['Node groups', '#/applications'], [a.node_id || app, '#/applications/' + app], ['Add node']], 'Add node'),
+    h('div', { class: 'card card-body' }, deviceForm({ mode: 'node', serial: '', name: '' }, true, async (out) => {
+      try { const d = await api('POST', `/applications/${app}/devices`, out); toast('Node added'); location.hash = `#/applications/${app}/devices/${d.device_id}`; } catch (e) { errToast(e); }
     })));
 });
 
 function devHeader(a, d, active) {
   const base = `#/applications/${a.application_id}/devices/${d.device_id}`;
-  const seen = d.last_seen ? h('span', { class: 'row', style: { gap: '6px' } }, h('span', { class: 'dot ' + (Date.now() - new Date(d.last_seen) < 36e5 ? 'on' : '') }), 'Last activity ' + ago(d.last_seen)) : h('span', { class: 'faint' }, 'No activity yet');
-  return [pageHead([['Applications', '#/applications'], [a.application_id, '#/applications/' + a.application_id], ['End devices', `#/applications/${a.application_id}/devices`], [d.device_id]],
-    d.name || d.device_id, [h('span', { class: 'mono small' }, 'ID: ' + d.device_id), h('span', { class: 'badge ' + (d.mode === 'raw' ? 'purple' : 'info') }, MODE_LABEL[d.mode]), seen,
-      h('span', null, '↑ ' + (d.uplink_count || 0)), d.downlink_queue && d.downlink_queue.length ? h('span', { class: 'badge warn' }, d.downlink_queue.length + ' queued') : null]),
-  tabs(base, [['', 'Overview'], ['live', 'Live data'], ['messaging', 'Messaging'], ['formatters', 'Payload formatters'], ['settings', 'Settings']], active)];
+  const seen = d.last_seen ? h('span', { class: 'row', style: { gap: '6px' } }, h('span', { class: 'dot ' + (Date.now() - new Date(d.last_seen) < 36e5 ? 'on' : '') }), 'Last packet ' + ago(d.last_seen)) : h('span', { class: 'faint' }, 'No packets yet');
+  return [pageHead([['Node groups', '#/applications'], [a.node_id || a.application_id, '#/applications/' + a.application_id], [d.serial || d.device_id]],
+    d.name || d.device_id, [h('span', null, h('span', { class: 'val' }, (a.node_id || '?') + ' / ' + (d.serial || d.device_id))), seen,
+      h('span', null, (d.uplink_count || 0) + ' packets'), d.downlink_queue && d.downlink_queue.length ? h('span', { class: 'badge warn' }, d.downlink_queue.length + ' downlink(s) queued') : null]),
+  tabs(base, [['', 'Overview'], ['live', 'Live data'], ['messaging', 'Downlink'], ['formatters', 'Decoder'], ['settings', 'Settings']], active)];
 }
 
 async function loadDev(app, dev) { return Promise.all([GET('/applications/' + app), GET(`/applications/${app}/devices/${dev}`)]); }
 
 App.route('/applications/:app/devices/:dev', async ({ app, dev }) => {
   const [a, d] = await loadDev(app, dev);
-  const info = [h('dt', null, 'Device ID'), h('dd', null, val(d.device_id)), h('dt', null, 'Type'), h('dd', null, MODE_LABEL[d.mode] + (d.mode !== 'raw' ? ' · class ' + d.class : '')), h('dt', null, 'Frequency plan'), h('dd', null, d.frequency_plan)];
-  if (d.dev_eui) info.push(h('dt', null, 'DevEUI'), h('dd', null, val(d.dev_eui)));
-  if (d.mode === 'otaa') info.push(h('dt', null, 'JoinEUI'), h('dd', null, val(d.join_eui)), h('dt', null, 'AppKey'), h('dd', null, val(d.app_key, { secret: true })));
-  if (d.mode === 'raw' && d.raw_match) info.push(h('dt', null, 'Match rule'), h('dd', null, h('span', { class: 'badge' }, d.raw_match.type), val(d.raw_match.value)), h('dt', null, 'Virtual FPort'), h('dd', null, d.raw_f_port || 1));
-  info.push(h('dt', null, 'Created'), h('dd', null, fmtDate(d.created_at)));
-  const s = d.session;
-  const sess = d.mode === 'raw' ? h('p', { class: 'muted' }, 'Raw devices have no LoRaWAN session.') : s ? h('dl', { class: 'kv' },
-    h('dt', null, 'Device address'), h('dd', null, val(s.dev_addr)),
-    h('dt', null, 'NwkSKey'), h('dd', null, val(s.nwk_s_key, { secret: true })),
-    h('dt', null, 'AppSKey'), h('dd', null, val(s.app_s_key, { secret: true })),
-    h('dt', null, 'FCnt up / down'), h('dd', null, `${s.has_uplink ? s.f_cnt_up : '—'} / ${s.f_cnt_down}`),
-    h('dt', null, 'Session started'), h('dd', null, fmtDate(s.started_at))) : h('div', { class: 'callout warn' }, 'This OTAA device has not joined yet. Power it on near a gateway — the join request will appear in live data.');
-  const lastDec = d.last_decoded ? jsonView(d.last_decoded) : h('p', { class: 'muted' }, 'No decoded payload yet.');
+  let last = null;
+  try { const evs = await GET(`/events?app=${app}&dev=${dev}&names=as.up&limit=1`); last = evs[0] && evs[0].data; } catch (e) { /* none */ }
+  const gwTable = last && last.gateways ? h('div', { class: 'table-wrap' }, h('table', { class: 't' },
+    h('thead', null, h('tr', null, ['Gateway', 'RSSI', 'SNR', 'Channel', 'Source'].map((x) => h('th', null, x)))),
+    h('tbody', null, last.gateways.map((g) => h('tr', null, h('td', null, h('a', { href: '#/gateways/' + g.gateway_id }, g.name || g.gateway_id)),
+      h('td', null, g.rssi + ' dBm'), h('td', null, [signalBars(g.snr), ' ', g.snr + ' dB']), h('td', null, g.channel), h('td', { class: 'small muted' }, g.source)))))) : null;
   return h('div', { class: 'stack' }, devHeader(a, d, ''),
     h('div', { class: 'grid g2' },
-      h('div', { class: 'card card-body' }, h('h2', null, 'General information'), h('dl', { class: 'kv' }, info)),
-      h('div', { class: 'stack' },
-        h('div', { class: 'card card-body' }, h('h2', null, 'Activity'), h('dl', { class: 'kv' },
-          h('dt', null, 'Last seen'), h('dd', null, d.last_seen ? fmtDate(d.last_seen) + ' (' + ago(d.last_seen) + ')' : 'never'),
-          h('dt', null, 'Uplinks'), h('dd', null, d.uplink_count || 0),
-          h('dt', null, 'Last gateway'), h('dd', null, d.last_gateway ? h('a', { href: '#/gateways/' + d.last_gateway }, d.last_gateway) : '—'),
-          h('dt', null, 'Signal'), h('dd', null, d.last_seen ? [signalBars(d.last_snr), ` RSSI ${d.last_rssi} dBm · SNR ${d.last_snr} dB`] : '—'),
-          d.location ? [h('dt', null, 'Location'), h('dd', null, h('a', { href: `https://www.openstreetmap.org/?mlat=${d.location.latitude}&mlon=${d.location.longitude}#map=16/${d.location.latitude}/${d.location.longitude}`, target: '_blank', rel: 'noopener' }, `${d.location.latitude}, ${d.location.longitude}`))] : null)),
-        h('div', { class: 'card card-body' }, h('h2', null, 'Session'), sess))),
-    h('div', { class: 'card card-body' }, h('h2', null, 'Latest decoded payload'), lastDec),
+      h('div', { class: 'card card-body' }, h('h2', null, 'Node'), h('dl', { class: 'kv' },
+        h('dt', null, 'NODE_ID (group)'), h('dd', null, val(a.node_id || '—')),
+        h('dt', null, 'SERIAL_ID'), h('dd', null, val(d.serial || d.device_id)),
+        h('dt', null, 'Name'), h('dd', null, d.name || '—'),
+        h('dt', null, 'Decoder'), h('dd', null, (d.uplink_formatter || {}).type === 'inherit' || !(d.uplink_formatter || {}).type ? 'group decoder (' + ((a.uplink_formatter || {}).type || 'none') + ')' : d.uplink_formatter.type),
+        h('dt', null, 'Added'), h('dd', null, fmtDate(d.created_at)),
+        d.location ? [h('dt', null, 'Location'), h('dd', null, h('a', { href: `https://www.openstreetmap.org/?mlat=${d.location.latitude}&mlon=${d.location.longitude}#map=16/${d.location.latitude}/${d.location.longitude}`, target: '_blank', rel: 'noopener' }, `${d.location.latitude}, ${d.location.longitude}`))] : null)),
+      h('div', { class: 'card card-body' }, h('h2', null, 'Activity'), h('dl', { class: 'kv' },
+        h('dt', null, 'Last packet'), h('dd', null, d.last_seen ? fmtDate(d.last_seen) + ' (' + ago(d.last_seen) + ')' : 'never'),
+        h('dt', null, 'Packets'), h('dd', null, d.uplink_count || 0),
+        h('dt', null, 'Best gateway'), h('dd', null, d.last_gateway ? h('a', { href: '#/gateways/' + d.last_gateway }, d.last_gateway) : '—'),
+        h('dt', null, 'Signal'), h('dd', null, d.last_seen ? [signalBars(d.last_snr), ` RSSI ${d.last_rssi} dBm · SNR ${d.last_snr} dB`] : '—'),
+        last ? [h('dt', null, 'Radio'), h('dd', null, `${(last.radio.frequency / 1e6).toFixed(3)} MHz · ${last.radio.data_rate} · ${last.radio.airtime_ms} ms airtime`)] : null,
+        last ? [h('dt', null, 'Last data'), h('dd', null, val(last.data_hex || '(empty)'))] : null))),
+    h('div', { class: 'grid g2' },
+      h('div', { class: 'card card-body' }, h('h2', null, 'Latest decoded data'), d.last_decoded ? jsonView(d.last_decoded) : h('p', { class: 'muted' }, 'Nothing decoded yet. Set a decoder on the Decoder tab.')),
+      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Received by (last packet)')), gwTable || h('div', { class: 'empty' }, 'No packets yet.'))),
     liveView({ app, dev, short: true, title: 'Live data' }));
 });
 
@@ -371,54 +339,50 @@ App.route('/applications/:app/devices/:dev/messaging', async ({ app, dev }) => {
   const [a, d] = await loadDev(app, dev);
   const gws = await GET('/gateways');
   let mode = 'hex';
-  const fport = inp(1, { type: 'number', min: 1, max: 223, style: { width: '100px' } });
   const payload = inp('', { class: 'mono', placeholder: '01 02 AB' });
   const json = h('textarea', { class: 'mono', rows: 4, value: '{\n  "relay": true\n}' });
-  const conf = checkbox(false, 'Confirmed downlink');
-  const repl = checkbox(false, 'Replace downlink queue');
+  const repl = checkbox(false, 'Replace queued downlinks');
   const payloadHolder = h('div');
   const seg = h('div', { class: 'seg' });
   const renderMode = () => {
-    seg.replaceChildren(h('button', { class: mode === 'hex' ? 'on' : '', onclick: () => { mode = 'hex'; renderMode(); } }, 'Bytes'), h('button', { class: mode === 'json' ? 'on' : '', onclick: () => { mode = 'json'; renderMode(); } }, 'JSON (encodeDownlink)'));
-    payloadHolder.replaceChildren(mode === 'hex' ? field('Payload (hex)', payload) : field('Decoded payload', json, 'Encoded by the downlink payload formatter.'));
+    seg.replaceChildren(h('button', { class: mode === 'hex' ? 'on' : '', onclick: () => { mode = 'hex'; renderMode(); } }, 'Hex bytes'), h('button', { class: mode === 'json' ? 'on' : '', onclick: () => { mode = 'json'; renderMode(); } }, 'JSON (encoder)'));
+    payloadHolder.replaceChildren(mode === 'hex' ? field('Data (hex)', payload) : field('Data as JSON', json, 'Converted to bytes by the group\'s downlink encoder.'));
   };
   renderMode();
+  const dl = Object.assign({ mode: 'immediate' }, a.downlink_radio || {});
   const queue = h('div');
   const renderQueue = (q) => {
-    queue.replaceChildren(q && q.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['#', 'FPort', 'Payload', 'Confirmed', 'Queued'].map((x) => h('th', null, x)))),
-      h('tbody', null, q.map((x, i) => h('tr', null, h('td', null, i + 1), h('td', null, x.f_port), h('td', { class: 'mono small' }, b64hex(x.frm_payload)), h('td', null, x.confirmed ? 'yes' : 'no'), h('td', { class: 'small muted' }, ago(x.created_at))))))) :
-      h('div', { class: 'empty' }, 'The downlink queue is empty.'));
+    queue.replaceChildren(q && q.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['#', 'Bytes sent on air', 'Queued'].map((x) => h('th', null, x)))),
+      h('tbody', null, q.map((x, i) => h('tr', null, h('td', null, i + 1), h('td', { class: 'mono small' }, b64hex(x.frm_payload)), h('td', { class: 'small muted' }, ago(x.created_at))))))) :
+      h('div', { class: 'empty' }, 'Nothing queued.'));
   };
   renderQueue(d.downlink_queue);
   const refresh = async () => { const nd = await GET(`/applications/${app}/devices/${dev}`); renderQueue(nd.downlink_queue); };
   const t = setInterval(refresh, 4000); App.onLeave(() => clearInterval(t));
-  const schedule = async () => {
-    const body = { f_port: Number(fport.value), confirmed: conf.input.checked, replace: repl.input.checked };
+  const send = async () => {
+    const body = { f_port: 1, replace: repl.input.checked };
     try {
       if (mode === 'hex') body.frm_payload_hex = cleanHex(payload.value); else body.decoded_payload = JSON.parse(json.value);
-      await api('POST', `/applications/${app}/devices/${dev}/down`, body); toast('Downlink scheduled'); refresh();
+      await api('POST', `/applications/${app}/devices/${dev}/down`, body); toast(dl.mode === 'after_uplink' ? 'Queued — sent after the next packet' : 'Downlink sent'); refresh();
     } catch (e) { errToast(e); }
   };
-  // Simulate uplink
   const simGw = sel(gws[0] && gws[0].gateway_id, gws.map((g) => [g.gateway_id, g.name || g.gateway_id]));
-  const simPayload = inp(d.mode === 'raw' && d.raw_match && d.raw_match.type === 'prefix' ? d.raw_match.value : '0167011002687F', { class: 'mono' });
-  const simPort = inp(1, { type: 'number', min: 1, max: 223, style: { width: '90px' } });
+  const simPayload = inp('0167011002687F', { class: 'mono' });
   const simulate = async () => {
-    try { await api('POST', '/simulate', { gateway_id: simGw.value, payload_hex: cleanHex(simPayload.value), application_id: app, device_id: dev, f_port: Number(simPort.value), rssi: -70, snr: 8 }); toast('Uplink simulated — see live data'); } catch (e) { errToast(e); }
+    try { await api('POST', '/simulate', { gateway_id: simGw.value, payload_hex: cleanHex(simPayload.value), application_id: app, device_id: dev, rssi: -70, snr: 8 }); toast('Test packet injected — see live data'); } catch (e) { errToast(e); }
   };
   return h('div', { class: 'stack' }, devHeader(a, d, 'messaging'),
     h('div', { class: 'grid g2' },
-      h('div', { class: 'card card-body stack' }, h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Schedule downlink'), seg),
-        d.mode === 'raw' ? h('div', { class: 'callout info small' }, (d.raw_downlink && d.raw_downlink.mode === 'after_uplink') ? 'Raw device: sent after the next uplink.' : 'Raw device: transmitted immediately via the last gateway that heard it.')
-          : h('div', { class: 'callout info small' }, d.class === 'C' ? 'Class C: transmitted immediately on RX2.' : 'Class A: transmitted in the receive window after the next uplink.'),
-        d.mode !== 'raw' ? field('FPort', fport) : null, payloadHolder, h('div', { class: 'row' }, d.mode !== 'raw' ? conf.el : null, repl.el),
-        h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: schedule }, icon('send'), 'Schedule downlink'))),
+      h('div', { class: 'card card-body stack' }, h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Send downlink'), seg),
+        h('div', { class: 'callout info small' }, (dl.mode === 'after_uplink' ? 'Sent right after this node\'s next packet' : 'Sent immediately via the gateway that heard this node best') +
+          (a.downlink_header ? `. On air: ${a.node_id} ${d.serial} + your data.` : '. Your data is sent as-is (no header).'), ' ', h('a', { href: `#/applications/${app}/settings` }, 'Change')),
+        payloadHolder, repl.el,
+        h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: send }, icon('send'), 'Send'))),
       h('div', { class: 'stack' },
-        h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Downlink queue'), h('button', { class: 'btn sm', onclick: async () => { await api('DELETE', `/applications/${app}/devices/${dev}/down`); refresh(); toast('Queue cleared'); } }, icon('trash'), 'Clear')), queue),
-        h('div', { class: 'card card-body stack' }, h('h2', { style: { margin: 0 } }, 'Simulate uplink'),
-          h('p', { class: 'small muted', style: { margin: 0 } }, d.mode === 'raw' ? 'Injects the raw payload as if received by the gateway.' : 'Encrypts the application payload with the device session and injects it as if received by the gateway.'),
-          gws.length ? [field('Gateway', simGw), h('div', { class: 'row' }, h('div', { style: { flex: 1 } }, field('Payload (hex)', simPayload)), d.mode !== 'raw' ? field('FPort', simPort) : null),
-            h('div', null, h('button', { class: 'btn', onclick: simulate }, icon('play'), 'Simulate uplink'))] : h('div', { class: 'muted small' }, 'Register a gateway first.')))),
+        h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Queue'), h('button', { class: 'btn sm', onclick: async () => { await api('DELETE', `/applications/${app}/devices/${dev}/down`); refresh(); toast('Queue cleared'); } }, icon('trash'), 'Clear')), queue),
+        h('div', { class: 'card card-body stack' }, h('h2', { style: { margin: 0 } }, 'Inject test packet'),
+          h('p', { class: 'small muted', style: { margin: 0 } }, `Pretends this node sent ${a.node_id} ${d.serial} + the data below (for testing decoders without hardware).`),
+          gws.length ? [field('Gateway', simGw), field('Data (hex, after header)', simPayload), h('div', null, h('button', { class: 'btn', onclick: simulate }, icon('play'), 'Inject'))] : h('div', { class: 'muted small' }, 'No gateway registered yet.')))),
     liveView({ app, dev, short: true, title: 'Live data', hideGatewayRaw: true }));
 });
 
@@ -429,11 +393,11 @@ function b64hex(b64) {
 App.route('/applications/:app/devices/:dev/formatters', async ({ app, dev }) => {
   const [a, d] = await loadDev(app, dev);
   let sample = '';
-  try { const evs = await GET(`/events?app=${app}&dev=${dev}&names=as.up&limit=1`); if (evs[0]) sample = evs[0].data.uplink_message.frm_payload_hex; } catch (e) { /* none */ }
+  try { const evs = await GET(`/events?app=${app}&dev=${dev}&names=as.up&limit=1`); if (evs[0]) sample = evs[0].data.data_hex; } catch (e) { /* none */ }
   return h('div', { class: 'stack' }, devHeader(a, d, 'formatters'),
-    h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Uplink payload formatter')),
-      h('div', { class: 'card-body' }, formatterEditor(d.uplink_formatter, { allowInherit: true, samplePayload: sample, fport: d.raw_f_port || 1, onSave: async (f) => {
-        try { await api('PUT', `/applications/${app}/devices/${dev}`, { uplink_formatter: f }); toast('Formatter saved'); } catch (e) { errToast(e); }
+    h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Decoder for this node')),
+      h('div', { class: 'card-body' }, formatterEditor(d.uplink_formatter, { allowInherit: true, samplePayload: sample, onSave: async (f) => {
+        try { await api('PUT', `/applications/${app}/devices/${dev}`, { uplink_formatter: f }); toast('Decoder saved'); } catch (e) { errToast(e); }
       } }))));
 });
 
@@ -441,19 +405,13 @@ App.route('/applications/:app/devices/:dev/settings', async ({ app, dev }) => {
   const [a, d] = await loadDev(app, dev);
   return h('div', { class: 'stack' }, devHeader(a, d, 'settings'),
     h('div', { class: 'card card-body' }, deviceForm(d, false, async (out) => {
-      try { await api('PUT', `/applications/${app}/devices/${dev}`, out); toast('End device updated'); App.dispatch(); } catch (e) { errToast(e); }
+      try { await api('PUT', `/applications/${app}/devices/${dev}`, out); toast('Node updated'); App.dispatch(); } catch (e) { errToast(e); }
     })),
-    d.mode !== 'raw' ? h('div', { class: 'card card-body' }, h('h2', null, 'Reset session'),
-      h('p', { class: 'muted' }, d.mode === 'otaa' ? 'Forget the current session and used DevNonces. The device must re-join.' : 'Reset the frame counters to zero.'),
-      h('button', { class: 'btn', onclick: async () => {
-        if (!(await confirmModal('Reset session', 'Reset the LoRaWAN session of this device?', 'Reset', false))) return;
-        try { await api('POST', `/applications/${app}/devices/${dev}/reset`); toast('Session reset'); App.dispatch(); } catch (e) { errToast(e); }
-      } }, icon('refresh'), 'Reset session')) : null,
-    h('div', { class: 'card card-body' }, h('h2', null, 'Delete end device'),
+    h('div', { class: 'card card-body' }, h('h2', null, 'Delete node'), h('p', { class: 'muted' }, 'If the group adds nodes automatically, it comes back with its next packet.'),
       h('button', { class: 'btn danger', onclick: async () => {
-        if (!(await confirmModal('Delete end device', `Delete "${dev}"? This cannot be undone.`))) return;
+        if (!(await confirmModal('Delete node', `Delete node ${d.serial || dev}?`))) return;
         try { await api('DELETE', `/applications/${app}/devices/${dev}`); toast('Deleted'); location.hash = `#/applications/${app}/devices`; } catch (e) { errToast(e); }
-      } }, icon('trash'), 'Delete end device')));
+      } }, icon('trash'), 'Delete node')));
 });
 
 // ======================= Gateways =======================
@@ -599,38 +557,28 @@ App.route('/gateways/:id/connect', async ({ id }) => {
 
 // ======================= Live data =======================
 App.route('/live', async () => {
-  const devs = await GET('/devices');
-  const unmatched = await GET('/events?names=ns.up.unmatched&limit=100');
+  const unmatched = await GET('/events?names=ns.up.unmatched&limit=200');
   const seen = new Map();
   for (const e of unmatched) {
-    const lw = e.data.lorawan;
-    const key = lw ? (lw.dev_eui || lw.dev_addr) : (e.data.raw_payload_hex || '').slice(0, 4);
-    if (!seen.has(key)) seen.set(key, { e, lw, key, n: 0 });
-    seen.get(key).n++;
+    const key = e.data.node_id || (e.data.payload_hex || e.data.raw_payload_hex || '').slice(0, 4);
+    if (!seen.has(key)) seen.set(key, { e, key, serials: new Set(), n: 0 });
+    const x = seen.get(key); x.n++; if (e.data.serial) x.serials.add(e.data.serial);
   }
-  const apps = await GET('/applications');
-  const firstApp = apps[0] && apps[0].application_id;
-  const onboarding = seen.size ? h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Unknown devices heard recently'), h('span', { class: 'small muted' }, 'register them to get decoded data')),
-    h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Kind', 'Identifier', 'Packets', 'Last heard', 'Sample', ''].map((x) => h('th', null, x)))),
-      h('tbody', null, [...seen.values()].slice(0, 8).map(({ e, lw, key, n }) => {
-        let href = null;
-        if (firstApp) {
-          if (lw && lw.dev_eui) href = `#/applications/${firstApp}/devices/new?mode=otaa&dev_eui=${lw.dev_eui}&join_eui=${lw.join_eui}`;
-          else if (!lw) href = `#/applications/${firstApp}/devices/new?mode=raw&match=${key}&id=node-${key.toLowerCase()}`;
-        }
-        return h('tr', null, h('td', null, h('span', { class: 'badge ' + (lw ? 'info' : 'purple') }, lw ? lw.m_type : 'Raw')), h('td', { class: 'mono small' }, lw ? (lw.dev_eui ? 'DevEUI ' + lw.dev_eui : 'DevAddr ' + lw.dev_addr) : 'prefix ' + key),
-          h('td', null, n), h('td', { class: 'small muted' }, ago(e.time)), h('td', { class: 'mono small' }, (e.data.raw_payload_hex || '').slice(0, 24)),
-          h('td', { class: 'right' }, href ? h('a', { class: 'btn sm', href }, icon('plus'), 'Register') : h('span', { class: 'faint small' }, lw ? 'ABP: register with session keys' : 'create an application first')));
-      }))))) : null;
-  return h('div', { class: 'stack' }, pageHead([['Live data']], 'Live data', ['All events of all gateways, applications and devices', h('span', null, devs.length + ' devices')]), onboarding, liveView({}));
+  const onboarding = seen.size ? h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Unknown NODE_IDs heard recently'), h('span', { class: 'small muted' }, 'add a group to start decoding them')),
+    h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['NODE_ID', 'Serials', 'Packets', 'Last heard', 'Sample packet', ''].map((x) => h('th', null, x)))),
+      h('tbody', null, [...seen.values()].slice(0, 10).map(({ e, key, serials, n }) =>
+        h('tr', null, h('td', null, h('span', { class: 'val' }, key)), h('td', { class: 'mono small' }, [...serials].slice(0, 4).join(', ') + (serials.size > 4 ? ' …' : '')),
+          h('td', null, n), h('td', { class: 'small muted' }, ago(e.time)), h('td', { class: 'mono small' }, (e.data.payload_hex || e.data.raw_payload_hex || '').slice(0, 28)),
+          e.application_id ? h('td', { class: 'right' }, h('a', { class: 'btn sm', href: '#/applications/' + e.application_id + '/settings' }, 'Open group'))
+            : h('td', { class: 'right' }, h('a', { class: 'btn sm primary', href: '#/applications/new?node_id=' + key }, icon('plus'), 'Add group')))))))) : null;
+  return h('div', { class: 'stack' }, pageHead([['Live data']], 'Live data', ['Everything received by all gateways']), onboarding, liveView({}));
 });
 
 // ======================= Payload lab =======================
 App.route('/lab', async () => {
-  return h('div', { class: 'stack' }, pageHead([['Payload lab']], 'Payload lab', ['Design and test payload formatters against real bytes before assigning them to an application or device.']),
-    h('div', { class: 'card card-body' }, formatterEditor({ type: 'fields', fields: [{ name: 'header', offset: 0, length: 2, type: 'hex' }, { name: 'battery', offset: 8, length: 2, type: 'int16_be', scale: 0.01, unit: 'V' }] },
-      { samplePayload: 'CAFE96B840EB0102014A0271FFF500170429036700FC0488000000000000000000050048060004' })),
-    h('div', { class: 'callout small' }, 'Tip: copy the formatter you built here into an application\'s or device\'s ', h('b', null, 'Payload formatters'), ' tab.'));
+  return h('div', { class: 'stack' }, pageHead([['Decoder lab']], 'Decoder lab', ['Try decoders on the data bytes of a packet (everything after NODE_ID + SERIAL_ID).']),
+    h('div', { class: 'card card-body' }, formatterEditor({ type: 'cayenne_lpp' }, { samplePayload: '0102014A0271FFF500170429036700FC0488000000000000000000050048060004' })),
+    h('div', { class: 'callout small' }, 'When it works, set the same decoder on the node group\'s ', h('b', null, 'Decoder'), ' tab.'));
 });
 
 // ======================= Concentrator =======================
@@ -718,15 +666,21 @@ async function settingsPage(tab) {
     const crc = checkbox(s.drop_crc_errors, 'Drop packets with CRC errors');
     const raw = checkbox(s.store_gateway_raw_events, 'Store gateway receptions in history', 'Keep raw gateway receptions (gs.up) in the event history, not only live.');
     const ret = inp(s.event_retention_hours, { type: 'number', min: 1 }), rows = inp(s.event_max_rows, { type: 'number', min: 1000 }), off = inp(s.gateway_offline_after_s, { type: 'number', min: 10 });
+    const pf = s.packet_format;
+    const pfIn = (k) => inp(pf[k], { type: 'number', min: 0, max: 64, oninput: (e) => { pf[k] = Number(e.target.value); } });
+    const agrp = checkbox(s.auto_create_groups, 'Create node groups automatically', 'Packets with an unknown NODE_ID create a new group instead of showing up as unknown.');
     return h('div', { class: 'stack' }, head, card(
+      h('h3', null, 'Packet format: NODE_ID | SERIAL_ID | data'),
+      h('div', { class: 'grid g3' }, field('NODE_ID offset', pfIn('node_id_offset')), field('NODE_ID length (bytes)', pfIn('node_id_length')), h('div')),
+      h('div', { class: 'grid g3' }, field('SERIAL_ID offset', pfIn('serial_offset')), field('SERIAL_ID length (bytes)', pfIn('serial_length')), field('Data starts at byte', pfIn('data_offset'))),
+      agrp.el,
       h('h3', null, 'Packet processing'),
-      h('div', { class: 'grid g2' }, field('De-duplication window (ms)', dedup, 'Receptions of the same packet by several gateways within this window are merged into one uplink with metadata of every gateway.'), field('Default frequency plan', band)),
+      h('div', { class: 'grid g2' }, field('De-duplication window (ms)', dedup, 'The same packet heard by several gateways within this window becomes one message listing every gateway.'), field('Default frequency plan', band)),
       auto.el, crc.el, raw.el,
-      h('h3', null, 'LoRaWAN'),
-      h('div', { class: 'grid g4' }, field('NetID', netid), field('DevAddr prefix', prefix), field('Prefix bits', bits), field('RX1 delay (s)', rx1)),
       h('h3', null, 'Storage'),
       h('div', { class: 'grid g3' }, field('Event retention (hours)', ret), field('Max stored events', rows), field('Gateway offline after (s)', off)),
       h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: () => save({
+        packet_format: pf, auto_create_groups: agrp.input.checked,
         dedup_window_ms: Number(dedup.value), default_frequency_plan: band.value, net_id: netid.value, dev_addr_prefix: prefix.value, dev_addr_prefix_bits: Number(bits.value), rx1_delay_s: Number(rx1.value),
         auto_register_gateways: auto.input.checked, drop_crc_errors: crc.input.checked, store_gateway_raw_events: raw.input.checked,
         event_retention_hours: Number(ret.value), event_max_rows: Number(rows.value), gateway_offline_after_s: Number(off.value) }) }, 'Save settings'))));

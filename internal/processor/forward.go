@@ -123,7 +123,19 @@ func (p *Processor) Simulate(r SimulateRequest) error {
 		if err != nil {
 			return err
 		}
-		if d.Mode != "raw" {
+		if d.Mode == "node" {
+			pf := p.Settings().PacketFormat
+			buf := make([]byte, max(pf.DataOffset, pf.NodeIDOffset+pf.NodeIDLength, pf.SerialOffset+pf.SerialLength))
+			app, err := p.store.Application(r.AppID)
+			if err != nil {
+				return err
+			}
+			nid, _ := hex.DecodeString(app.NodeID)
+			ser, _ := hex.DecodeString(d.Serial)
+			copy(buf[pf.NodeIDOffset:pf.NodeIDOffset+pf.NodeIDLength], nid)
+			copy(buf[pf.SerialOffset:pf.SerialOffset+pf.SerialLength], ser)
+			payload = append(buf, payload...)
+		} else if d.Mode != "raw" {
 			if d.Session == nil {
 				return fmt.Errorf("device has no session (OTAA device not joined yet)")
 			}

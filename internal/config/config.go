@@ -76,8 +76,21 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
+// PacketFormat describes the node packet header: NODE_ID | SERIAL | data.
+type PacketFormat struct {
+	NodeIDOffset int `json:"node_id_offset"`
+	NodeIDLength int `json:"node_id_length"`
+	SerialOffset int `json:"serial_offset"`
+	SerialLength int `json:"serial_length"`
+	DataOffset   int `json:"data_offset"`
+}
+
 // Settings are runtime settings stored in the database.
 type Settings struct {
+	PacketFormat     PacketFormat `json:"packet_format"`
+	AutoCreateGroups bool         `json:"auto_create_groups"`
+	LoRaWANEnabled   bool         `json:"lorawan_enabled"`
+
 	DedupWindowMs        int    `json:"dedup_window_ms"`
 	AutoRegisterGateways bool   `json:"auto_register_gateways"`
 	DropCRCErrors        bool   `json:"drop_crc_errors"`
@@ -120,7 +133,8 @@ func DefaultSettings() Settings {
 		EventMaxRows:         200000,
 		StoreGatewayRaw:      true,
 		GatewayOfflineSec:    120,
-		MQTTTopicPrefix:      "v3",
+		MQTTTopicPrefix:      "lorahub",
+		PacketFormat:         PacketFormat{NodeIDOffset: 0, NodeIDLength: 2, SerialOffset: 2, SerialLength: 4, DataOffset: 6},
 	}
 	s.HomeAssistant.DiscoveryPrefix = "homeassistant"
 	return s

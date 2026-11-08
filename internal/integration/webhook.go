@@ -84,10 +84,8 @@ func (w *Webhooks) deliver(appID string, h model.Webhook, kind string, e *model.
 	var body any = e.Data
 	if h.Format == "decoded" && kind == "up" {
 		if m, ok := e.Data.(map[string]any); ok {
-			up, _ := m["uplink_message"].(map[string]any)
-			body = map[string]any{"application_id": appID, "device_id": e.DevID, "received_at": m["received_at"],
-				"decoded_payload": up["decoded_payload"], "f_port": up["f_port"], "f_cnt": up["f_cnt"],
-				"frm_payload_hex": up["frm_payload_hex"], "rx_metadata": up["rx_metadata"]}
+			body = map[string]any{"node_id": m["node_id"], "serial": m["serial"], "group": appID, "received_at": m["received_at"],
+				"decoded": m["decoded"], "data_hex": m["data_hex"], "gateways": m["gateways"]}
 		}
 	}
 	b, _ := json.Marshal(body)

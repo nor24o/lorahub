@@ -22,11 +22,11 @@ import (
 func main() {
 	server := flag.String("server", "127.0.0.1:1700", "LoRaHub Semtech UDP address")
 	gwEUI := flag.String("gateway-eui", "AA555A0000000101", "simulated gateway EUI")
-	mode := flag.String("mode", "otaa", "otaa | raw")
+	mode := flag.String("mode", "raw", "raw (NODE_ID|SERIAL|data packets) | otaa (LoRaWAN test)")
 	devEUI := flag.String("dev-eui", "0004A30B001C0530", "device EUI")
 	joinEUI := flag.String("join-eui", "70B3D57ED0000001", "join EUI")
 	appKeyS := flag.String("app-key", "000102030405060708090A0B0C0D0E0F", "AppKey")
-	payloadHex := flag.String("payload", "0167011002687F", "payload hex (Cayenne temp+hum by default)")
+	payloadHex := flag.String("payload", "CAFE96B840EB0102014A0367010F", "payload hex (default: NODE_ID CAFE, serial 96B840EB, Cayenne data)")
 	count := flag.Int("count", 3, "number of uplinks")
 	interval := flag.Duration("interval", 3*time.Second, "uplink interval")
 	confirmed := flag.Bool("confirmed", false, "send confirmed uplinks")

@@ -31,6 +31,7 @@ type Input struct {
 	FPort    int
 	RecvTime time.Time
 	Meta     map[string]any // device attributes etc.
+	Vars     map[string]any // extra properties set on input (node_id, serial, payload)
 }
 
 const jsTimeout = 200 * time.Millisecond
@@ -115,6 +116,13 @@ func DecodeJS(code string, in Input) Result {
 		input.Set("hex", strings.ToUpper(hex.EncodeToString(in.Bytes)))
 		if in.Meta != nil {
 			input.Set("attributes", in.Meta)
+		}
+		for k, v := range in.Vars {
+			if b, ok := v.([]byte); ok {
+				input.Set(k, bytesToJS(vm, b))
+			} else {
+				input.Set(k, v)
+			}
 		}
 		out, err = fn(goja.Undefined(), input)
 		if err != nil {

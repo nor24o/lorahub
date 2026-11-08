@@ -71,12 +71,9 @@ func NewMQTT(cfg *config.Config, settings func() config.Settings, dl DownlinkFun
 		}()
 		m.broker = srv
 		prefix := settings().MQTTTopicPrefix
-		for i, suffix := range []string{"push", "replace"} {
-			replace := suffix == "replace"
-			srv.Subscribe(prefix+"/+/devices/+/down/"+suffix, i+1, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
-				m.handleDown(pk.TopicName, pk.Payload, replace)
-			})
-		}
+		srv.Subscribe(prefix+"/+/+/down", 1, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
+			m.handleDown(pk.TopicName, pk.Payload)
+		})
 		log.Info("embedded MQTT broker listening", "addr", cfg.MQTTBroker.Listen)
 	}
 	return m, nil
@@ -128,8 +125,7 @@ func (m *MQTT) ensureExternal() paho.Client {
 		SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(10 * time.Second).
 		SetOnConnectHandler(func(c paho.Client) {
 			m.log.Info("external MQTT connected", "url", s.URL)
-			c.Subscribe(prefix+"/+/devices/+/down/push", 0, func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload(), false) })
-			c.Subscribe(prefix+"/+/devices/+/down/replace", 0, func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload(), true) })
+			c.Subscribe(prefix+"/+/+/down", 0, func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload()) })
 		})
 	c := paho.NewClient(o)
 	c.Connect()
@@ -137,35 +133,38 @@ func (m *MQTT) ensureExternal() paho.Client {
 	return c
 }
 
-func (m *MQTT) handleDown(topic string, payload []byte, replace bool) {
+// handleDown accepts downlinks on <prefix>/<group>/<node>/down with body
+// {"data_hex":"0102"} | {"data":"<base64>"} | {"decoded":{...}}, optional
+// "f_port", "confirmed", "replace".
+func (m *MQTT) handleDown(topic string, payload []byte) {
 	parts := strings.Split(topic, "/")
-	if len(parts) < 6 {
+	if len(parts) != 4 {
 		return
 	}
-	appID, devID := parts[1], parts[3]
+	appID, devID := parts[1], parts[2]
 	var req struct {
-		Downlinks []struct {
-			FPort      int    `json:"f_port"`
-			FRMPayload string `json:"frm_payload"`
-			Hex        string `json:"frm_payload_hex"`
-			Decoded    any    `json:"decoded_payload"`
-			Confirmed  bool   `json:"confirmed"`
-		} `json:"downlinks"`
+		DataHex   string `json:"data_hex"`
+		Data      string `json:"data"`
+		Decoded   any    `json:"decoded"`
+		FPort     int    `json:"f_port"`
+		Confirmed bool   `json:"confirmed"`
+		Replace   bool   `json:"replace"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
 		m.log.Warn("mqtt downlink: bad json", "topic", topic, "err", err)
 		return
 	}
-	for i, d := range req.Downlinks {
-		var b []byte
-		if d.FRMPayload != "" {
-			b, _ = base64.StdEncoding.DecodeString(d.FRMPayload)
-		} else if d.Hex != "" {
-			b, _ = hexDecode(d.Hex)
-		}
-		if err := m.downlink(appID, devID, d.FPort, b, d.Decoded, d.Confirmed, replace && i == 0); err != nil {
-			m.log.Warn("mqtt downlink", "app", appID, "dev", devID, "err", err)
-		}
+	var b []byte
+	if req.DataHex != "" {
+		b, _ = hexDecode(req.DataHex)
+	} else if req.Data != "" {
+		b, _ = base64.StdEncoding.DecodeString(req.Data)
+	}
+	if req.FPort == 0 {
+		req.FPort = 1
+	}
+	if err := m.downlink(appID, devID, req.FPort, b, req.Decoded, req.Confirmed, req.Replace); err != nil {
+		m.log.Warn("mqtt downlink", "group", appID, "node", devID, "err", err)
 	}
 }
 
@@ -205,24 +204,24 @@ func (m *MQTT) handleEvent(e *model.Event) {
 	b, _ := json.Marshal(e.Data)
 	switch {
 	case e.Name == "as.up":
-		m.publish(fmt.Sprintf("%s/%s/devices/%s/up", p, e.AppID, e.DevID), b, false)
+		m.publish(fmt.Sprintf("%s/%s/%s/up", p, e.AppID, e.DevID), b, false)
 		if s.HomeAssistant.Enabled {
 			m.haDiscovery(e, s)
 		}
 	case e.Name == "ns.join.accept":
-		m.publish(fmt.Sprintf("%s/%s/devices/%s/join", p, e.AppID, e.DevID), b, false)
+		m.publish(fmt.Sprintf("%s/%s/%s/join", p, e.AppID, e.DevID), b, false)
 	case e.Name == "as.down.queued":
-		m.publish(fmt.Sprintf("%s/%s/devices/%s/down/queued", p, e.AppID, e.DevID), b, false)
+		m.publish(fmt.Sprintf("%s/%s/%s/down/queued", p, e.AppID, e.DevID), b, false)
 	case e.Name == "ns.down.sent":
-		m.publish(fmt.Sprintf("%s/%s/devices/%s/down/sent", p, e.AppID, e.DevID), b, false)
+		m.publish(fmt.Sprintf("%s/%s/%s/down/sent", p, e.AppID, e.DevID), b, false)
 	case e.Name == "ns.down.failed":
-		m.publish(fmt.Sprintf("%s/%s/devices/%s/down/failed", p, e.AppID, e.DevID), b, false)
+		m.publish(fmt.Sprintf("%s/%s/%s/down/failed", p, e.AppID, e.DevID), b, false)
 	case e.Name == "ns.up.unmatched":
-		m.publish("lorahub/unmatched", b, false)
+		m.publish(p+"/unmatched", b, false)
 	case e.Name == "gs.up" && len(e.Gateways) > 0:
-		m.publish("lorahub/gateways/"+e.Gateways[0]+"/up", b, false)
+		m.publish(p+"/gateways/"+e.Gateways[0]+"/up", b, false)
 	case e.Name == "gs.status" && len(e.Gateways) > 0:
-		m.publish("lorahub/gateways/"+e.Gateways[0]+"/status", b, true)
+		m.publish(p+"/gateways/"+e.Gateways[0]+"/status", b, true)
 	}
 }
 
@@ -231,9 +230,8 @@ func (m *MQTT) haDiscovery(e *model.Event, s config.Settings) {
 	if !ok {
 		return
 	}
-	up, _ := msg["uplink_message"].(map[string]any)
-	dec, _ := up["decoded_payload"].(map[string]any)
-	stateTopic := fmt.Sprintf("%s/%s/devices/%s/up", s.MQTTTopicPrefix, e.AppID, e.DevID)
+	dec, _ := msg["decoded"].(map[string]any)
+	stateTopic := fmt.Sprintf("%s/%s/%s/up", s.MQTTTopicPrefix, e.AppID, e.DevID)
 	devIdent := "lorahub_" + e.AppID + "_" + e.DevID
 	emit := func(field, tpl string, unitGuess string) {
 		key := devIdent + "_" + field
@@ -250,7 +248,7 @@ func (m *MQTT) haDiscovery(e *model.Event, s config.Settings) {
 			"object_id":      sanitize(key),
 			"state_topic":    stateTopic,
 			"value_template": tpl,
-			"device": map[string]any{"identifiers": []string{sanitize(devIdent)}, "name": e.DevID,
+			"device": map[string]any{"identifiers": []string{sanitize(devIdent)}, "name": fmt.Sprint(msg["name"]),
 				"manufacturer": "LoRaHub", "model": e.AppID},
 		}
 		if dc, unit := haClass(field); dc != "" {
@@ -267,18 +265,18 @@ func (m *MQTT) haDiscovery(e *model.Event, s config.Settings) {
 		switch vv := v.(type) {
 		case float64, int64, int, bool, string:
 			_ = vv
-			emit(k, fmt.Sprintf("{{ value_json.uplink_message.decoded_payload['%s'] }}", k), "")
+			emit(k, fmt.Sprintf("{{ value_json.decoded['%s'] }}", k), "")
 		case map[string]any:
 			for k2, v2 := range vv {
 				switch v2.(type) {
 				case float64, int64, int:
-					emit(k+"_"+k2, fmt.Sprintf("{{ value_json.uplink_message.decoded_payload['%s']['%s'] }}", k, k2), "")
+					emit(k+"_"+k2, fmt.Sprintf("{{ value_json.decoded['%s']['%s'] }}", k, k2), "")
 				}
 			}
 		}
 	}
-	emit("rssi", "{{ value_json.uplink_message.rx_metadata[0].rssi }}", "dBm")
-	emit("snr", "{{ value_json.uplink_message.rx_metadata[0].snr }}", "dB")
+	emit("rssi", "{{ value_json.gateways[0].rssi }}", "dBm")
+	emit("snr", "{{ value_json.gateways[0].snr }}", "dB")
 }
 
 func haClass(field string) (string, string) {

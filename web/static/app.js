@@ -146,7 +146,9 @@ function jsonView(obj) {
 
 // ---------- event typing ----------
 const EV = {
-  'as.up': ['Forward uplink data', 't-up'],
+  'as.up': ['Node data', 't-up'],
+  'as.node.registered': ['New node', 't-join'],
+  'as.group.created': ['New group', 't-join'],
   'gs.up': ['Receive uplink', 't-gw'],
   'gs.status': ['Gateway status', 't-gw'],
   'gs.gateway.connect': ['Gateway connected', 't-gw'],
@@ -157,14 +159,14 @@ const EV = {
   'ns.join.accept': ['Accept join', 't-join'],
   'ns.join.mic_failed': ['Join MIC failed', 't-err'],
   'ns.join.nonce_reused': ['DevNonce reused', 't-warn'],
-  'ns.up.unmatched': ['Unknown device', 't-warn'],
+  'ns.up.unmatched': ['Unknown node', 't-warn'],
   'ns.up.mic_failed': ['MIC failed', 't-err'],
   'ns.up.fcnt_rejected': ['FCnt rejected', 't-err'],
   'ns.up.retransmission': ['Retransmission', 't-warn'],
   'ns.up.mac': ['MAC uplink', 't-gw'],
-  'ns.down.sent': ['Send downlink', 't-down'],
+  'ns.down.sent': ['Downlink sent', 't-down'],
   'ns.down.failed': ['Downlink failed', 't-err'],
-  'as.down.queued': ['Schedule downlink', 't-down'],
+  'as.down.queued': ['Downlink queued', 't-down'],
   'as.webhook.failed': ['Webhook failed', 't-err'],
 };
 function evType(name) { const [label, cls] = EV[name] || [name, 't-gw']; return h('span', { class: 'ev-type ' + cls }, h('i'), label); }
@@ -202,9 +204,9 @@ function liveView(opts = {}) {
     return h('span', { class: 'faint' }, '—');
   };
   const decodedChips = (e) => {
-    const up = e.data && e.data.uplink_message;
-    if (!up || !up.decoded_payload) return null;
-    return h('div', { class: 'chips' }, Object.entries(up.decoded_payload).slice(0, 12).map(([k, v]) =>
+    const dec = e.data && (e.data.decoded || (e.data.uplink_message && e.data.uplink_message.decoded_payload));
+    if (!dec) return null;
+    return h('div', { class: 'chips' }, Object.entries(dec).slice(0, 12).map(([k, v]) =>
       h('span', { class: 'chip' }, h('b', null, k + ': '), typeof v === 'object' ? JSON.stringify(v) : String(v))));
   };
   const renderEvent = (e, fresh) => {
@@ -295,8 +297,11 @@ function cleanHex(s) { return (s || '').replace(/[\s:-]/g, '').replace(/^0x/i, '
 
 // ---------- formatter editor (TTN "payload formatters") ----------
 const FMT_TEMPLATES = {
-  javascript: `// TTN-compatible payload formatter.
-// input.bytes: array of bytes, input.fPort: port, input.hex: hex string
+  javascript: `// Payload decoder.
+// input.bytes   : data bytes AFTER the NODE_ID + SERIAL header
+// input.node_id : NODE_ID (group) as hex, e.g. "CAFE"
+// input.serial  : SERIAL_ID as hex, e.g. "96B840EB"
+// input.payload : the complete packet bytes (header included)
 function decodeUplink(input) {
   var b = input.bytes;
   var data = {};
@@ -307,9 +312,9 @@ function decodeUplink(input) {
   return { data: data, warnings: [], errors: [] };
 }
 
-// Optional: encode downlinks from JSON {data, fPort}
+// Optional: build downlink data bytes from JSON (header is added automatically)
 function encodeDownlink(input) {
-  return { bytes: [input.data.relay ? 1 : 0], fPort: input.fPort || 1 };
+  return { bytes: [input.data.relay ? 1 : 0] };
 }
 `,
 };
@@ -324,7 +329,7 @@ function formatterEditor(fmt, opts = {}) {
   if (!st.type) st.type = opts.allowInherit ? 'inherit' : 'none';
   st.fields = st.fields || [];
   const types = [['none', 'None'], ['cayenne_lpp', 'CayenneLPP'], ['javascript', 'Custom JavaScript'], ['fields', 'Byte fields (no code)']];
-  if (opts.allowInherit) types.unshift(['inherit', 'Use application formatter']);
+  if (opts.allowInherit) types.unshift(['inherit', 'Use the group decoder']);
   const body = h('div', { class: 'stack' });
   const typeSel = sel(st.type, types, { onchange: () => { st.type = typeSel.value; if (st.type === 'javascript' && !st.code) st.code = FMT_TEMPLATES.javascript; render(); } });
   const testHex = inp(opts.samplePayload || '', { class: 'mono', placeholder: 'e.g. 0167011002687F' });
@@ -379,18 +384,18 @@ function formatterEditor(fmt, opts = {}) {
       ta.addEventListener('keydown', (e) => {
         if (e.key === 'Tab') { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText('  ', s, ta.selectionEnd, 'end'); st.code = ta.value; }
       });
-      kids.push(field('Formatter code', ta, 'Implements decodeUplink(input) → {data, warnings, errors}. Compatible with TTN Device Repository codecs. Legacy Decoder(bytes, port) also works.'));
+      kids.push(field('Decoder code', ta, 'Implements decodeUplink(input) → {data, warnings, errors}. input.bytes are the data bytes after the header.'));
     } else if (st.type === 'cayenne_lpp') {
       kids.push(field('Data offset', inp(st.data_offset || 0, { type: 'number', min: 0, oninput: (e) => { st.data_offset = Number(e.target.value); }, style: { width: '120px' } }),
-        'Skip this many bytes before Cayenne LPP data (e.g. 6 for a custom header on raw devices).'));
+        'Extra bytes to skip at the start of the data (the NODE_ID + SERIAL header is already removed).'));
     } else if (st.type === 'fields') {
-      kids.push(field('Fields', fieldsTable(), 'Slice the payload into named values. Scale and add are applied to numeric types (value × scale + add).'));
+      kids.push(field('Fields', fieldsTable(), 'Offsets count from the first data byte after the header. Numeric values become value × scale + add.'));
     } else if (st.type === 'inherit') {
-      kids.push(h('div', { class: 'callout info' }, 'This device uses the payload formatter of its application.'));
+      kids.push(h('div', { class: 'callout info' }, 'This node uses the decoder of its group.'));
     }
     if (st.type !== 'none' && st.type !== 'inherit') {
       kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'Test'),
-        h('div', { class: 'row' }, h('div', { style: { flex: 1, minWidth: '220px' } }, field('Byte payload (hex)', testHex)), field('FPort', testPort),
+        h('div', { class: 'row' }, h('div', { style: { flex: 1, minWidth: '220px' } }, field('Data bytes (hex, after NODE_ID + SERIAL)', testHex)),
           h('div', { style: { alignSelf: 'flex-end' } }, h('button', { class: 'btn', onclick: test }, icon('play'), 'Test decoder'))),
         pills, out));
     }
@@ -475,11 +480,11 @@ const App = {
       h('div', { class: 'nav' },
         navItem('#/', 'home', 'Overview'),
         h('div', { class: 'nav-section' }, 'Network'),
-        navItem('#/applications', 'app', 'Applications'),
+        navItem('#/applications', 'app', 'Node groups'),
         navItem('#/gateways', 'gateway', 'Gateways'),
         navItem('#/live', 'live', 'Live data'),
         h('div', { class: 'nav-section' }, 'Tools'),
-        navItem('#/lab', 'code', 'Payload lab'),
+        navItem('#/lab', 'code', 'Decoder lab'),
         navItem('#/concentrator', 'chip', 'Concentrator'),
         navItem('#/settings', 'gear', 'Settings')));
     this.sidebar.addEventListener('click', (e) => { if (e.target.closest('a')) this.sidebar.classList.remove('open'); });

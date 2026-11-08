@@ -347,7 +347,10 @@ func (p *Processor) process(pkts []model.RxPacket) {
 		}
 	}()
 
-	if f, err := lorawan.Parse(fr.Payload); err == nil {
+	if p.handleNode(fr) {
+		return
+	}
+	if f, err := lorawan.Parse(fr.Payload); err == nil && p.Settings().LoRaWANEnabled {
 		switch f.MType {
 		case lorawan.JoinRequest:
 			if p.handleJoin(fr, f) {
@@ -374,15 +377,15 @@ func gatewayIDs(meta []model.RxMetadata) []string {
 }
 
 func (p *Processor) emitUnmatched(fr *Frame) {
-	data := map[string]any{
-		"received_at":     fr.At,
-		"raw_payload":     base64.StdEncoding.EncodeToString(fr.Payload),
-		"raw_payload_hex": strings.ToUpper(hex.EncodeToString(fr.Payload)),
-		"rx_metadata":     fr.Meta,
-		"settings":        fr.Settings,
-	}
 	summary := fmt.Sprintf("Unmatched %d byte packet %s", len(fr.Payload), truncHex(fr.Payload, 12))
-	if f, err := lorawan.Parse(fr.Payload); err == nil {
+	var hdr *NodeHeader
+	if h, ok := ParseNodeHeader(p.Settings().PacketFormat, fr.Payload); ok {
+		hdr = &h
+		summary = fmt.Sprintf("Unknown node group %s (serial %s) — create a group for it", h.NodeID, h.Serial)
+	}
+	data := p.unmatchedData(fr, hdr)
+	data["raw_payload_hex"] = data["payload_hex"]
+	if f, err := lorawan.Parse(fr.Payload); err == nil && p.Settings().LoRaWANEnabled {
 		info := map[string]any{"m_type": lorawan.MTypeName(f.MType)}
 		if f.MType == lorawan.JoinRequest {
 			info["dev_eui"], info["join_eui"] = f.DevEUI.String(), f.JoinEUI.String()
@@ -501,6 +504,8 @@ func (p *Processor) touchDevice(d *model.Device, fr *Frame, decoded any) func(*m
 		dv.LastRSSI = fr.Meta[0].RSSI
 		dv.LastSNR = fr.Meta[0].SNR
 		dv.LastGateway = fr.Meta[0].GatewayIDs.GatewayID
+		dv.LastFreq = fr.Settings.Frequency
+		dv.LastDataRate = fr.Settings.DataRate
 		if decoded != nil {
 			dv.LastDecoded = decoded
 		}
