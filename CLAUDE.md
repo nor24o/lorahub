@@ -55,16 +55,21 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Gather: unknown NODE_IDs auto-create groups and appear on `#/nodes` for adoption. A prefix
   scheme with data before byte 6 (or `serial: none`) identifies a node by NODE_ID alone, so
   `NODE|TYPE|SEQ|data` packets do not create one node per sequence number.
-- Decode: `internal/formatter/schemes.go`, ordered schemes, first match that decodes wins; JSON
+- Decode: `internal/formatter/fields.go` (field types and options), `methods.go` (TLV, bit-packed, CSV, key=value, regex, JSON, CBOR, MessagePack, preprocessing), `schemes.go`: ordered schemes, first match that decodes wins; JSON
   compatible with `/etc/lora/decoders.json`, imported on first start. A decoder set on a node or
   group has priority. UI: `web/static/hub.js` (Nodes, Decoder Studio, Automation, Messages tab).
 - Output: `lorahub/{group}/{serial}/up` (full) and retained flat `/state`; commands on `/set`
   (ON, OFF or hex). Home Assistant discovery is per node: adopted + ha_enabled only
   (`internal/integration/homeassistant.go`). Rules: `internal/processor/rules.go`.
 
-## Addon pages (web/static/addons.js, internal/api/addons.go, remote.go)
-Realtime status, Radio config, TX test, Remote config (SSH with a key in data_dir/remote_id_rsa),
-Logs, GPIO and hardware, Pinout. GPIO output is limited to `concentrator.gpio_allowed` in lorahub.yml.
+## Addon pages (web/static/addons.js, integrations.js, lab.js, internal/api/addons.go, remote.go)
+Realtime status, Radio config, TX test, Remote config, Logs, Decoder lab, MQTT & Home Assistant (publishing, commands,
+per-entity exposure). GPIO and Pinout pages were removed on request.
+Remote config does NOT use SSH (owner's requirement). It uses raw_lora_app's own commands: `{"cmd":"get_config"}` and
+`{"cmd":"set_config","config":{...}}` on the UDP downlink port, status JSON on TCP 5557. set_config only accepts rf0_freq,
+rf1_freq, sync_word, tx_default_power, tx_default_freq, target_ip, port_up. The Dragino at .17 got these commands on 2026-11-09 (previous
+binary kept at /etc/lora/raw_lora_app.before-remote). Its source is targets/sx1302/src in ~/2027_Latest_LORA/custom-lps8-firmware
+on WSL Ubuntu-18.04, toolchain ~/openwrt/openwrt/staging_dir/toolchain-mips_24kc_gcc-7.5.0_musl. Its port_down is 1700; the hub detects it.
 
 ## Deploying
 Windows PC has Go 1.27 in `C:/Program Files/Go/bin`. Key login works on .15 and .17 (.17 needs

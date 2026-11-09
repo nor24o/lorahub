@@ -54,6 +54,9 @@ type Processor struct {
 	schemes *formatter.SchemeDoc
 	rules   []model.Rule
 
+	dutyMu sync.Mutex
+	duty   map[string][]dutyEntry
+
 	Started time.Time
 }
 
@@ -246,6 +249,9 @@ func (p *Processor) HandleUplink(pkt model.RxPacket) {
 		gw.RxCount++
 		gw.LastSeen = &now
 	})
+	if rejectedByFilter(g, &pkt.Meta) {
+		return
+	}
 	pkt.Meta.GatewayIDs = model.GatewayIDs{GatewayID: g.ID, EUI: g.EUI}
 	if g.Location != nil {
 		loc := *g.Location

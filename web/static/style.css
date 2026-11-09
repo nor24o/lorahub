@@ -312,3 +312,18 @@ textarea.mono, input.mono { font-family: var(--mono); font-size: 12.5px; width: 
 .ch-track { width: 100%; max-width: 44px; height: 110px; background: var(--code-bg); border-radius: 4px; display: flex; align-items: flex-end; overflow: hidden; }
 .ch-fill { width: 100%; background: var(--primary); min-height: 2px; }
 .log-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; height: 60vh; overflow: auto; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 0; }
+
+/* Decoder lab */
+.lab-map { display: flex; flex-wrap: wrap; gap: 3px; }
+.lab-byte { width: 36px; padding: 2px 0 3px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2); color: var(--text); font-family: var(--mono); font-size: 12.5px; cursor: pointer; }
+.lab-byte small { display: block; font-size: 9px; color: var(--faint); }
+.lab-byte.r-node, .chip.c-node { background: var(--primary-soft); }
+.lab-byte.r-serial, .chip.c-serial { background: var(--warning-soft); }
+.lab-byte.r-data, .chip.c-data { background: var(--success-soft); }
+.lab-byte.sel { outline: 2px solid var(--primary); outline-offset: -1px; }
+tr.hl td { background: var(--primary-soft); }
+textarea.bad { border-color: var(--danger); }
+.modal { max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.modal .card-head { flex: none; }
+.modal > .card-body { overflow-y: auto; }
+.modal.wide { max-width: 880px; }

@@ -215,6 +215,10 @@ func (p *Processor) SendRaw(gwID string, tx model.TxPacket) error {
 	if tx.Power == 0 {
 		tx.Power = 14
 	}
+	tx.Power = TxPowerFor(g, tx.Power)
+	if err := p.reserveAirtime(g, tx); err != nil {
+		return err
+	}
 	if err := dl.Send(g.EUI, tx); err != nil {
 		return err
 	}

@@ -156,9 +156,6 @@ const EV = {
   'gs.down.tx_ack': ['TX rejected', 't-err'],
   'gs.down.manual': ['Manual transmit', 't-down'],
   'gs.down.forwarded': ['Upstream downlink', 't-down'],
-  'ns.join.accept': ['Accept join', 't-join'],
-  'ns.join.mic_failed': ['Join MIC failed', 't-err'],
-  'ns.join.nonce_reused': ['DevNonce reused', 't-warn'],
   'ns.up.unmatched': ['Unknown node', 't-warn'],
   'ns.up.mic_failed': ['MIC failed', 't-err'],
   'ns.up.fcnt_rejected': ['FCnt rejected', 't-err'],
@@ -176,7 +173,6 @@ function evType(name) { const [label, cls] = EV[name] || [name, 't-gw']; return 
 const FILTERS = {
   all: null,
   uplink: (e) => e.name === 'as.up',
-  join: (e) => e.name.startsWith('ns.join') || e.name === 'gs.gateway.registered',
   downlink: (e) => e.name.includes('down'),
   gateway: (e) => e.name.startsWith('gs.'),
   problems: (e) => (EV[e.name] || [])[1] === 't-err' || (EV[e.name] || [])[1] === 't-warn',
@@ -320,7 +316,139 @@ function encodeDownlink(input) {
 }
 `,
 };
-const FIELD_TYPES = ['uint8', 'int8', 'uint16_be', 'int16_be', 'uint16_le', 'int16_le', 'uint24_be', 'int24_be', 'uint32_be', 'int32_be', 'uint32_le', 'int32_le', 'float32_be', 'float32_le', 'bool', 'bit', 'hex', 'ascii'];
+const FIELD_TYPES = ['uint8', 'int8', 'uint16_be', 'uint16_le', 'int16_be', 'int16_le', 'uint24_be', 'uint24_le', 'int24_be', 'int24_le', 'uint32_be', 'uint32_le', 'int32_be', 'int32_le', 'uint40_be', 'uint48_be', 'uint64_be', 'uint64_le', 'int64_be', 'int64_le', 'float32_be', 'float32_le', 'float64_be', 'float64_le', 'bool', 'bit', 'bits', 'bits_le', 'bits_signed', 'bcd', 'unix_s_be', 'unix_s_le', 'unix_ms_be', 'unix_ms_le', 'hex', 'hex_le', 'ascii', 'utf8', 'base64', 'checksum'];
+function typeBytes(t) {
+  const m = /^u?int(\d+)/.exec(t || '');
+  if (m) return Number(m[1]) / 8;
+  if (/^float64|^unix_ms/.test(t)) return 8;
+  if (/^float32|^unix_s/.test(t)) return 4;
+  return 1;
+}
+const METHOD_TYPES = [['tlv_custom', 'Tag / length / value (custom)'], ['bitstream', 'Bit-packed fields'], ['csv', 'Delimited text (CSV)'], ['kv', 'Key = value text'], ['regex', 'Regular expression'], ['json', 'JSON text'], ['cbor', 'CBOR'], ['msgpack', 'MessagePack']];
+const isMethod = (t) => METHOD_TYPES.some(([k]) => k === t);
+const PRE_STEPS = [['', 'None'], ['hex_text', 'Hex written as text'], ['base64_text', 'Base64 text'], ['xor', 'XOR with a key'], ['reverse', 'Reverse byte order']];
+const CHECKSUM_ALGOS = [['xor', 'XOR'], ['sum8', 'Sum (8-bit)'], ['crc8', 'CRC-8'], ['crc8_maxim', 'CRC-8/Maxim'], ['crc16_ccitt', 'CRC-16/CCITT'], ['crc16_ccitt_le', 'CRC-16/CCITT, low byte first'], ['crc16_modbus', 'CRC-16/Modbus'], ['crc16_modbus_le', 'CRC-16/Modbus, low byte first'], ['crc32', 'CRC-32'], ['crc32_le', 'CRC-32, low byte first']];
+
+function fieldOptionCount(f) {
+  return [f.decimals != null, f.min != null, f.max != null, f.invalid, f.map && Object.keys(f.map).length, f.expr, f.when, f.repeat > 1, f.invert, f.required, f.type === 'checksum' && f.algo, /^bits/.test(f.type || '') && (f.bit || f.bit_length)].filter(Boolean).length;
+}
+
+/** Popup with every optional parameter of one field. */
+function fieldOptionsModal(f, onDone) {
+  modal('Options for ' + (f.name || 'this field'), (close) => {
+    const num = (v, attrs) => inp(v ?? '', Object.assign({ type: 'number', step: 'any', placeholder: 'not set' }, attrs));
+    const decimals = num(f.decimals, { min: 0, max: 12, step: 1 }), min = num(f.min), max = num(f.max);
+    const invalid = inp(f.invalid || '', { class: 'mono', placeholder: 'FFFF' });
+    const labels = h('textarea', { class: 'mono', rows: 3, placeholder: '0=closed\n1=open', value: Object.entries(f.map || {}).map(([k, v]) => `${k}=${v}`).join('\n') });
+    const expr = inp(f.expr || '', { class: 'mono', placeholder: 'x * 1.8 + 32' }), when = inp(f.when || '', { class: 'mono', placeholder: 'bytes[6] == 1' });
+    const repeat = num(f.repeat || '', { min: 0, max: 256, step: 1 }), stride = num(f.stride || '', { min: 0, step: 1, placeholder: 'field length' });
+    const invert = checkbox(f.invert, 'Invert (true becomes false)'), required = checkbox(f.required, 'Required', 'If this field cannot be read, or its checksum is wrong, the packet is left to the next decoder.');
+    const bit = num(f.bit || 0, { min: 0, max: 63, step: 1 }), bitLen = num(f.bit_length || 1, { min: 1, max: 64, step: 1 });
+    const algo = sel(f.algo || 'crc16_ccitt', CHECKSUM_ALGOS), from = num(f.from || 0, { step: 1 });
+    const isBits = /^bits/.test(f.type || ''), isCheck = f.type === 'checksum', isBool = f.type === 'bool' || f.type === 'bit';
+    const optNum = (el) => (el.value === '' ? undefined : Number(el.value));
+    const apply = () => {
+      f.decimals = optNum(decimals); f.min = optNum(min); f.max = optNum(max);
+      f.invalid = cleanHex(invalid.value) || undefined; f.expr = expr.value.trim() || undefined; f.when = when.value.trim() || undefined;
+      f.repeat = optNum(repeat) || undefined; f.stride = optNum(stride) || undefined;
+      f.invert = invert.input.checked || undefined; f.required = required.input.checked || undefined;
+      const m = {}; labels.value.split('\n').forEach((l) => { const i = l.indexOf('='); if (i > 0) m[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+      f.map = Object.keys(m).length ? m : undefined;
+      if (isBits || f.type === 'bit') f.bit = optNum(bit) || 0;
+      if (isBits) f.bit_length = optNum(bitLen) || 1;
+      if (isCheck) { f.algo = algo.value; f.from = optNum(from) || 0; }
+      close(); onDone();
+    };
+    return h('div', { class: 'stack' },
+      isBits ? h('div', { class: 'grid g2' }, field('First bit', bit, '0 is the lowest bit.'), field('Number of bits', bitLen)) : null,
+      f.type === 'bit' ? field('Bit', bit, '0 is the lowest bit.') : null,
+      isCheck ? h('div', { class: 'grid g2' }, field('Algorithm', algo), field('Covers from byte', from, 'Up to the byte before this field.')) : null,
+      isBool ? invert.el : null,
+      h('div', { class: 'grid g3' }, field('Decimals', decimals), field('Lowest valid', min), field('Highest valid', max)),
+      field('Means "no reading" (hex)', invalid, 'If the raw bytes equal this, the field is left out.'),
+      field('Labels', labels, 'raw=label per line. Raw values can be decimal or 0x hex.'),
+      field('Formula', expr, 'JavaScript. x is the scaled value, v holds earlier fields, bytes the packet.'),
+      field('Decode only when', when, 'JavaScript that returns true or false.'),
+      h('div', { class: 'grid g2' }, field('Repeat', repeat, 'Creates name_1, name_2 and so on.'), field('Bytes between repeats', stride)),
+      required.el,
+      h('div', { class: 'form-actions', style: { justifyContent: 'flex-end' } }, h('button', { class: 'btn', onclick: close }, 'Cancel'), h('button', { class: 'btn primary', onclick: apply }, 'Apply')));
+  });
+}
+
+function fieldOptionsButton(f, onDone) {
+  const n = fieldOptionCount(f);
+  return h('button', { class: 'btn sm', type: 'button', title: 'More options', onclick: () => fieldOptionsModal(f, onDone) }, n ? `Options (${n})` : 'Options');
+}
+
+/** Preprocessing applied to the data bytes before decoding. */
+function preEditor(st, onChange) {
+  const key = inp((st.options || {}).pre_key || '', { class: 'mono', placeholder: 'A5 5A', oninput: (e) => { st.options.pre_key = e.target.value; onChange(); } });
+  const keyField = field('XOR key (hex)', key);
+  const paint = (v) => { keyField.style.display = v === 'xor' ? '' : 'none'; };
+  const step = sel((st.options || {}).pre || '', PRE_STEPS, { onchange: (e) => { st.options = st.options || {}; st.options.pre = e.target.value || undefined; paint(e.target.value); onChange(); } });
+  st.options = st.options || {};
+  paint(st.options.pre || '');
+  return h('div', { class: 'grid g2' }, field('Before decoding', step), keyField);
+}
+
+/** Settings of one decoding method; st holds type, options and fields. */
+function decodeMethodEditor(st, onChange) {
+  st.options = st.options || {};
+  st.fields = st.fields || [];
+  const o = st.options;
+  const box = h('div', { class: 'stack' });
+  const text = (key, attrs) => inp(o[key] || '', Object.assign({ class: 'mono', oninput: (e) => { o[key] = e.target.value; onChange(); } }, attrs));
+  const number = (v, fn, attrs) => inp(v ?? '', Object.assign({ type: 'number', step: 'any', style: { width: '74px' }, oninput: (e) => { fn(e.target.value === '' ? 0 : Number(e.target.value)); onChange(); } }, attrs));
+  const del = (list, i, again) => h('button', { class: 'icon-btn', title: 'Remove', onclick: () => { list.splice(i, 1); again(); onChange(); } }, icon('trash'));
+  const table = (heads, rows, addBtn) => h('div', { class: 'stack' }, h('div', { class: 'table-wrap card' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, heads.map((x) => h('th', null, x)))), h('tbody', null, rows))), h('div', null, addBtn));
+
+  function paint() {
+    const kids = [];
+    if (st.type === 'csv') {
+      kids.push(h('div', { class: 'grid g2' }, field('Separator', text('separator', { placeholder: ',' })),
+        field('Column names', inp((o.columns || []).join(', '), { placeholder: 'temperature, humidity, battery', oninput: (e) => { o.columns = e.target.value.split(',').map((x) => x.trim()); onChange(); } }), 'Leave a name empty to skip that column.')));
+    } else if (st.type === 'kv') {
+      kids.push(h('div', { class: 'grid g2' }, field('Between pairs', text('separator', { placeholder: ';' })), field('Between key and value', text('kv_separator', { placeholder: '=' }))));
+    } else if (st.type === 'regex') {
+      const on = sel(o.pattern_on || 'text', [['text', 'The packet as text'], ['hex', 'The packet as hex']], { onchange: (e) => { o.pattern_on = e.target.value; onChange(); } });
+      kids.push(field('Pattern', text('pattern', { placeholder: 'T=(?P<temperature>[0-9.]+)' }), 'Each (?P<name>…) group becomes a value.'), field('Search in', on));
+    } else if (st.type === 'json' || st.type === 'cbor' || st.type === 'msgpack') {
+      kids.push(h('div', { class: 'small muted' }, 'Keys and values are taken directly from the packet, so there is nothing to set up.'));
+    } else if (st.type === 'tlv_custom') {
+      o.tags = o.tags || [];
+      if (!o.tag_size) o.tag_size = 1;
+      if (o.len_size === undefined) o.len_size = 1;
+      const pick = (val, opts, fn) => sel(val, opts, { onchange: (e) => { fn(e.target.value); onChange(); } });
+      kids.push(h('div', { class: 'grid g4' },
+        field('Tag size', pick(o.tag_size, [[1, '1 byte'], [2, '2 bytes'], [3, '3 bytes'], [4, '4 bytes']], (v) => { o.tag_size = Number(v); })),
+        field('Length size', pick(o.len_size, [[0, 'None (from type)'], [1, '1 byte'], [2, '2 bytes']], (v) => { o.len_size = Number(v); })),
+        field('Order', pick(o.length_first ? 'ltv' : 'tlv', [['tlv', 'Tag, length, value'], ['ltv', 'Length, tag, value']], (v) => { o.length_first = v === 'ltv'; })),
+        field('Multi-byte numbers', pick(o.little_endian ? 'le' : 'be', [['be', 'High byte first'], ['le', 'Low byte first']], (v) => { o.little_endian = v === 'le'; }))));
+      kids.push(table(['Tag (hex)', 'Name', 'Type', 'Scale', 'Add', '', ''], o.tags.map((f, i) => h('tr', null,
+        h('td', null, inp(f.tag || '', { class: 'mono', style: { width: '80px' }, oninput: (e) => { f.tag = e.target.value; onChange(); } })),
+        h('td', null, inp(f.name || '', { oninput: (e) => { f.name = e.target.value; onChange(); } })),
+        h('td', null, sel(f.type, FIELD_TYPES, { onchange: (e) => { f.type = e.target.value; onChange(); paint(); } })),
+        h('td', null, number(f.scale || '', (v) => { f.scale = v; }, { placeholder: '1' })), h('td', null, number(f.add || '', (v) => { f.add = v; }, { placeholder: '0' })),
+        h('td', null, fieldOptionsButton(f, () => { paint(); onChange(); })), h('td', null, del(o.tags, i, paint)))),
+      h('button', { class: 'btn sm', onclick: () => { o.tags.push({ tag: '', name: '', type: 'uint8', scale: 1 }); paint(); onChange(); } }, icon('plus'), 'Add tag')));
+      kids.push(h('div', { class: 'small muted' }, 'Tags that are not listed appear as tag_XX with their hex value.'));
+    } else if (st.type === 'bitstream') {
+      const kind = (f) => (f.type === 'bool' ? 'bool' : /int|signed/.test(f.type || '') && !/^uint/.test(f.type || '') ? 'int' : 'uint');
+      kids.push(table(['Name', 'Bits', 'Kind', 'Scale', 'Add', '', ''], st.fields.map((f, i) => h('tr', null,
+        h('td', null, inp(f.name || '', { placeholder: 'empty skips these bits', oninput: (e) => { f.name = e.target.value; onChange(); } })),
+        h('td', null, number(f.bit_length || 1, (v) => { f.bit_length = v; }, { min: 1, max: 64, step: 1 })),
+        h('td', null, sel(kind(f), [['uint', 'Unsigned'], ['int', 'Signed'], ['bool', 'True / false']], { onchange: (e) => { f.type = e.target.value; onChange(); paint(); } })),
+        h('td', null, number(f.scale || '', (v) => { f.scale = v; }, { placeholder: '1' })), h('td', null, number(f.add || '', (v) => { f.add = v; }, { placeholder: '0' })),
+        h('td', null, fieldOptionsButton(f, () => { paint(); onChange(); })), h('td', null, del(st.fields, i, paint)))),
+      h('button', { class: 'btn sm', onclick: () => { st.fields.push({ name: '', bit_length: 8, type: 'uint', scale: 1, offset: 0 }); paint(); onChange(); } }, icon('plus'), 'Add field')));
+      kids.push(h('div', { class: 'small muted' }, 'Read one after another, highest bit first.'));
+    }
+    box.replaceChildren(...kids);
+  }
+  paint();
+  return box;
+}
+
 
 /**
  * formatterEditor(fmt, {allowInherit, onSave, samplePayload, fport})
@@ -330,7 +458,7 @@ function formatterEditor(fmt, opts = {}) {
   const st = JSON.parse(JSON.stringify(fmt || { type: 'none' }));
   if (!st.type) st.type = opts.allowInherit ? 'inherit' : 'none';
   st.fields = st.fields || [];
-  const types = [['none', 'None'], ['cayenne_lpp', 'CayenneLPP'], ['javascript', 'Custom JavaScript'], ['fields', 'Byte fields (no code)']];
+  const types = [['none', 'None'], ['cayenne_lpp', 'CayenneLPP'], ['javascript', 'Custom JavaScript'], ['fields', 'Byte fields (no code)'], ...METHOD_TYPES];
   if (opts.allowInherit) types.unshift(['inherit', 'Use the group decoder']);
   const body = h('div', { class: 'stack' });
   const typeSel = sel(st.type, types, { onchange: () => { st.type = typeSel.value; if (st.type === 'javascript' && !st.code) st.code = FMT_TEMPLATES.javascript; render(); } });
@@ -344,16 +472,16 @@ function formatterEditor(fmt, opts = {}) {
       const upd = (k, conv) => (e) => { f[k] = conv ? conv(e.target.value) : e.target.value; };
       tbody.append(h('tr', null,
         h('td', null, inp(f.name, { oninput: upd('name'), placeholder: 'temperature' })),
-        h('td', null, inp(f.offset, { type: 'number', min: 0, oninput: upd('offset', Number), style: { width: '70px' } })),
-        h('td', null, inp(f.length || '', { type: 'number', min: 0, oninput: upd('length', Number), style: { width: '70px' }, placeholder: 'auto' })),
-        h('td', null, sel(f.type, FIELD_TYPES, { onchange: upd('type') })),
+        h('td', null, inp(f.offset, { type: 'number', oninput: upd('offset', Number), style: { width: '70px' } })),
+        h('td', null, inp(f.length || '', { type: 'number', oninput: upd('length', Number), style: { width: '70px' }, placeholder: 'auto' })),
+        h('td', null, sel(f.type, FIELD_TYPES, { onchange: (e) => { f.type = e.target.value; f.length = 0; render(); } })),
         h('td', null, inp(f.scale || '', { type: 'number', step: 'any', oninput: upd('scale', Number), style: { width: '80px' }, placeholder: '1' })),
         h('td', null, inp(f.add || '', { type: 'number', step: 'any', oninput: upd('add', Number), style: { width: '70px' }, placeholder: '0' })),
-        h('td', null, f.type === 'bit' ? inp(f.bit || 0, { type: 'number', min: 0, max: 7, oninput: upd('bit', Number), style: { width: '60px' } }) : h('span', { class: 'faint' }, '—')),
+        h('td', null, fieldOptionsButton(f, render)),
         h('td', null, h('button', { class: 'icon-btn', onclick: () => { st.fields.splice(i, 1); render(); } }, icon('trash')))));
     });
     return h('div', { class: 'stack' },
-      h('div', { class: 'table-wrap card' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Name', 'Offset', 'Length', 'Type', 'Scale', 'Add', 'Bit', ''].map((x) => h('th', null, x)))), tbody)),
+      h('div', { class: 'table-wrap card' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Name', 'Offset', 'Length', 'Type', 'Scale', 'Add', '', ''].map((x) => h('th', null, x)))), tbody)),
       h('button', { class: 'btn', onclick: () => { st.fields.push({ name: '', offset: 0, type: 'uint8', scale: 1 }); render(); } }, icon('plus'), 'Add field'));
   }
 
@@ -373,7 +501,7 @@ function formatterEditor(fmt, opts = {}) {
     const hx = cleanHex(testHex.value);
     if (!/^[0-9A-F]*$/.test(hx) || hx.length % 2) return h('span', { class: 'small faint' }, 'Enter an even-length hex payload');
     const hl = new Set();
-    if (st.type === 'fields') st.fields.forEach((f) => { const l = f.length || (/16/.test(f.type) ? 2 : /24/.test(f.type) ? 3 : /32/.test(f.type) ? 4 : 1); for (let i = 0; i < l; i++) hl.add(Number(f.offset) + i); });
+    if (st.type === 'fields') st.fields.forEach((f) => { const l = f.length > 0 ? f.length : typeBytes(f.type); for (let i = 0; i < l; i++) hl.add(Number(f.offset) + i); });
     return h('div', { class: 'bytes' }, (hx.match(/../g) || []).map((b, i) => h('span', { class: hl.has(i) ? 'hl' : '' }, b, h('small', null, i))));
   }
   const pills = h('div');
@@ -391,11 +519,14 @@ function formatterEditor(fmt, opts = {}) {
       kids.push(field('Data offset', inp(st.data_offset || 0, { type: 'number', min: 0, oninput: (e) => { st.data_offset = Number(e.target.value); }, style: { width: '120px' } }),
         'Extra bytes to skip at the start of the data (the NODE_ID + SERIAL header is already removed).'));
     } else if (st.type === 'fields') {
-      kids.push(field('Fields', fieldsTable(), 'Offsets count from the first data byte after the header. Numeric values become value × scale + add.'));
+      kids.push(field('Fields', fieldsTable(), 'Offsets count from the first data byte after the header; a negative offset counts from the end. Length -1 reads to the end. Numeric values become value × scale + add.'));
+    } else if (isMethod(st.type)) {
+      kids.push(decodeMethodEditor(st, () => {}));
     } else if (st.type === 'inherit') {
       kids.push(h('div', { class: 'callout info' }, 'This node uses the decoder of its group.'));
     }
     if (st.type !== 'none' && st.type !== 'inherit') {
+      kids.push(preEditor(st, () => {}));
       kids.push(h('div', { class: 'form-section stack' }, h('h3', null, 'Test'),
         h('div', { class: 'row' }, h('div', { style: { flex: 1, minWidth: '220px' } }, field('Data bytes (hex, after NODE_ID + SERIAL)', testHex)),
           h('div', { style: { alignSelf: 'flex-end' } }, h('button', { class: 'btn', onclick: test }, icon('play'), 'Test decoder'))),
@@ -492,15 +623,13 @@ const App = {
         navItem('#/decoders', 'wand', 'Decoder Studio'),
         navItem('#/lab', 'code', 'Decoder lab'),
         navItem('#/rules', 'link', 'Automation'),
-        navItem('#/settings/integrations', 'send', 'MQTT & Home Assistant'),
+        navItem('#/integrations', 'send', 'MQTT & Home Assistant'),
         h('div', { class: 'nav-section' }, 'Radio'),
         navItem('#/radio', 'chip', 'Radio config'),
         navItem('#/tx', 'send', 'TX test'),
         navItem('#/remote', 'key', 'Remote config'),
         h('div', { class: 'nav-section' }, 'System'),
         navItem('#/logs', 'inbox', 'Logs'),
-        navItem('#/hardware', 'chip', 'GPIO & hardware'),
-        navItem('#/pinout', 'link', 'Pinout'),
         navItem('#/settings', 'gear', 'Settings')));
     this.sidebar.addEventListener('click', (e) => { if (e.target.closest('a')) this.sidebar.classList.remove('open'); });
     this.main = h('main', { class: 'main' });

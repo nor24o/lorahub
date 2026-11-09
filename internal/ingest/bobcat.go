@@ -36,6 +36,8 @@ type BobcatServer struct {
 	// ResolveAddr returns the last known IP of a gateway EUI (from the
 	// database) so downlinks work right after a LoRaHub restart.
 	ResolveAddr func(eui string) string
+	// ResolvePort returns a gateway's own downlink port; 0 means the default.
+	ResolvePort func(eui string) int
 }
 
 type pendingRx struct {
@@ -254,7 +256,13 @@ func (s *BobcatServer) Send(eui string, tx model.TxPacket) error {
 		m["prea"] = tx.Preamble
 	}
 	b, _ := json.Marshal(m)
-	ua := &net.UDPAddr{IP: net.ParseIP(ip), Port: s.downlinkPort}
+	port := s.downlinkPort
+	if s.ResolvePort != nil {
+		if p := s.ResolvePort(eui); p > 0 {
+			port = p
+		}
+	}
+	ua := &net.UDPAddr{IP: net.ParseIP(ip), Port: port}
 	_, err := s.conn.WriteToUDP(b, ua)
 	return err
 }

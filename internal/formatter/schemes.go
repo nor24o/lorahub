@@ -49,20 +49,21 @@ func (f *FlexString) UnmarshalJSON(b []byte) error {
 // Field offsets refer to the whole packet; ctv, cayenne and javascript start
 // at DataOffset.
 type Scheme struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	Description    string        `json:"description,omitempty"`
-	Enabled        *bool         `json:"enabled,omitempty"`
-	MatchType      string        `json:"matchType"`
-	MatchValue     FlexString    `json:"matchValue,omitempty"`
-	MatchCondition string        `json:"matchCondition,omitempty"`
-	Type           string        `json:"type"`
-	DataOffset     int           `json:"dataOffset"`
-	Serial         string        `json:"serial,omitempty"` // "" auto | header | none
-	Fields         []model.Field `json:"fields,omitempty"`
-	Code           string        `json:"code,omitempty"`   // javascript: decodeUplink(input)
-	JSCode         string        `json:"jsCode,omitempty"` // js: function body using bytes and hex, returns an object
-	SampleHex      string        `json:"sampleHex,omitempty"`
+	ID             string               `json:"id"`
+	Name           string               `json:"name"`
+	Description    string               `json:"description,omitempty"`
+	Enabled        *bool                `json:"enabled,omitempty"`
+	MatchType      string               `json:"matchType"`
+	MatchValue     FlexString           `json:"matchValue,omitempty"`
+	MatchCondition string               `json:"matchCondition,omitempty"`
+	Type           string               `json:"type"`
+	DataOffset     int                  `json:"dataOffset"`
+	Serial         string               `json:"serial,omitempty"` // "" auto | header | none
+	Fields         []model.Field        `json:"fields,omitempty"`
+	Options        *model.DecodeOptions `json:"options,omitempty"`
+	Code           string               `json:"code,omitempty"`   // javascript: decodeUplink(input)
+	JSCode         string               `json:"jsCode,omitempty"` // js: function body using bytes and hex, returns an object
+	SampleHex      string               `json:"sampleHex,omitempty"`
 }
 
 // IsEnabled reports whether the scheme takes part in matching.
@@ -132,7 +133,12 @@ func (d *SchemeDoc) Validate() error {
 		switch s.Type {
 		case "ctv", "tlv", "cayenne_lpp", "fields", "javascript", "js", "ascii":
 		default:
-			return fmt.Errorf("scheme %q: unknown decoder type %q", s.Name, s.Type)
+			if !IsMethod(s.Type) {
+				return fmt.Errorf("scheme %q: unknown decoder type %q", s.Name, s.Type)
+			}
+		}
+		if err := validateMethod("scheme "+s.Name, s.Type, s.Fields, s.Options); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -220,6 +226,16 @@ func (s *Scheme) Run(b []byte, at time.Time, vars map[string]any) (map[string]an
 	start := s.DataOffset
 	if start > len(b) {
 		start = len(b)
+	}
+	if s.Options != nil && s.Options.Pre != "" {
+		data, err := applyPre(s.Options, b[start:])
+		if err != nil {
+			return nil, nil, []string{err.Error()}
+		}
+		b = append(append([]byte{}, b[:start]...), data...)
+	}
+	if IsMethod(s.Type) {
+		return decodeMethod(s.Type, s.Fields, s.Options, b[start:])
 	}
 	switch s.Type {
 	case "ctv", "tlv", "cayenne_lpp":

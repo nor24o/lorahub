@@ -3,7 +3,9 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -15,18 +17,17 @@ import (
 // ON, OFF, 1, 0 or a hex payload.
 func (m *MQTT) handleSet(appID, devID string, payload []byte) {
 	cmd := strings.TrimSpace(string(payload))
-	var b []byte
+	cmds := m.settings().MQTTCommands
 	switch strings.ToUpper(cmd) {
 	case "ON", "1":
-		b = []byte{0x01, 0x01}
+		cmd = cmds.OnHex
 	case "OFF", "0":
-		b = []byte{0x01, 0x00}
-	default:
-		var err error
-		if b, err = hexDecode(cmd); err != nil || len(b) == 0 {
-			m.log.Warn("mqtt set: expected ON, OFF or hex", "group", appID, "node", devID)
-			return
-		}
+		cmd = cmds.OffHex
+	}
+	b, err := hexDecode(cmd)
+	if err != nil || len(b) == 0 {
+		m.log.Warn("mqtt set: expected ON, OFF or hex", "group", appID, "node", devID)
+		return
 	}
 	if err := m.downlink(appID, devID, 1, b, nil, false, false); err != nil {
 		m.log.Warn("mqtt set", "group", appID, "node", devID, "err", err)
@@ -64,19 +65,28 @@ func (m *MQTT) nodeState(e *model.Event, s config.Settings, raw []byte) {
 	}
 	state["datr"] = msg.Radio["data_rate"]
 	b, _ := json.Marshal(state)
-	m.publish(fmt.Sprintf("%s/%s/%s/state", s.MQTTTopicPrefix, e.AppID, e.DevID), b, true)
+	// Home Assistant's node entities read this topic.
+	if s.MQTTPublish.State || s.HomeAssistant.Enabled {
+		m.publish(fmt.Sprintf("%s/%s/%s/state", s.MQTTTopicPrefix, e.AppID, e.DevID), b, s.MQTTPublish.StateRetain || s.HomeAssistant.Enabled)
+	}
 
 	if !s.HomeAssistant.Enabled || m.Device == nil || len(msg.Decoded) == 0 {
 		return
 	}
 	d, err := m.Device(e.AppID, e.DevID)
-	if err != nil || !exposed(d) {
+	if err != nil || !exposed(d, s) {
 		return
 	}
 	m.publishEntities(d, msg.Decoded, gateway, s)
 }
 
-func exposed(d *model.Device) bool { return d != nil && d.Adopted && d.HAEnabled }
+// exposed reports whether a node goes to Home Assistant at all.
+func exposed(d *model.Device, s config.Settings) bool {
+	if d == nil {
+		return false
+	}
+	return s.HomeAssistant.ExposeMode == "all" || (d.Adopted && d.HAEnabled)
+}
 
 func flatten(dec map[string]any) map[string]any {
 	out := map[string]any{}
@@ -100,24 +110,81 @@ func flatten(dec map[string]any) map[string]any {
 
 type haEntity struct {
 	component, key string
+	category       string // field | diagnostic | control
 	cfg            map[string]any
 }
 
 var channelState = regexp.MustCompile(`^ch\d+_(state|digital_in|val|analog_in|temperature|humidity)$`)
 
-// entities lists a node's Home Assistant entities. The result depends only on
-// the node and its field names, so the same call can also retract them.
+// hiddenReason explains why an entity is not exposed; "" means it is.
+func hiddenReason(d *model.Device, e haEntity, s config.Settings) string {
+	ha := s.HomeAssistant
+	if d.HAFields[e.key].Disabled {
+		return "turned off for this node"
+	}
+	switch e.category {
+	case "diagnostic":
+		if !slices.Contains(ha.Diagnostics, e.key) {
+			return "diagnostic turned off"
+		}
+	case "control":
+		if !ha.Switches || !s.MQTTCommands.AcceptSet {
+			return "switches turned off"
+		}
+	default:
+		for _, pat := range ha.ExcludeFields {
+			if ok, _ := path.Match(pat, e.key); ok {
+				return "excluded by " + pat
+			}
+		}
+	}
+	return ""
+}
+
+// entities lists the entities a node exposes. The result depends only on the
+// node, its field names and the settings, so it can also retract them.
 func entities(d *model.Device, decoded map[string]any, s config.Settings) []haEntity {
+	var out []haEntity
+	for _, e := range allEntities(d, decoded, s) {
+		if hiddenReason(d, e, s) == "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// allEntities lists every entity a node could expose.
+func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []haEntity {
 	stateTopic := fmt.Sprintf("%s/%s/%s/state", s.MQTTTopicPrefix, d.AppID, d.ID)
 	id := sanitize("lorahub_" + d.AppID + "_" + d.ID)
 	var out []haEntity
 	add := func(component, key, name, tpl string, extra map[string]any) {
 		cfg := map[string]any{"name": name, "has_entity_name": true, "unique_id": sanitize(id + "_" + key),
 			"state_topic": stateTopic, "value_template": tpl}
+		category := "field"
+		if component == "switch" {
+			category = "control"
+		} else if extra["entity_category"] == "diagnostic" {
+			category = "diagnostic"
+		}
 		for k, v := range extra {
 			cfg[k] = v
 		}
-		out = append(out, haEntity{component, sanitize(key), cfg})
+		if ov := d.HAFields[sanitize(key)]; ov != (model.HAField{}) {
+			if ov.Name != "" {
+				cfg["name"] = ov.Name
+			}
+			if ov.DeviceClass != "" {
+				cfg["device_class"] = ov.DeviceClass
+			}
+			if ov.Unit != "" {
+				cfg["unit_of_measurement"] = ov.Unit
+			}
+		}
+		if s.HomeAssistant.ExpireAfter > 0 && component != "switch" {
+			cfg["expire_after"] = s.HomeAssistant.ExpireAfter
+		}
+		out = append(out, haEntity{component, sanitize(key), category, cfg})
 	}
 	val := func(k string) string { return fmt.Sprintf("{{ value_json['%s'] | default(none) }}", k) }
 	flat := flatten(decoded)
@@ -216,31 +283,65 @@ func normalize(v any) map[string]any {
 	return out
 }
 
-// NodeChanged applies an edit or deletion (after == nil) to Home Assistant.
-func (m *MQTT) NodeChanged(before, after *model.Device) {
-	s := m.settings()
-	if before != nil {
-		wasOn := exposed(before)
-		prefix := fmt.Sprintf("%s/", s.HomeAssistant.DiscoveryPrefix)
-		marker := "/" + sanitize("lorahub_"+before.AppID+"_"+before.ID) + "/"
+func nodeMarker(d *model.Device) string { return "/" + sanitize("lorahub_"+d.AppID+"_"+d.ID) + "/" }
+
+func nodeTopics(d *model.Device, s config.Settings) map[string]bool {
+	out := map[string]bool{}
+	if d == nil || d.LastDecoded == nil || !s.HomeAssistant.Enabled || !exposed(d, s) {
+		return out
+	}
+	for _, e := range entities(d, normalize(d.LastDecoded), s) {
+		out[entityTopic(s, d, e)] = true
+	}
+	return out
+}
+
+// syncNode retracts what a node no longer exposes and publishes the rest.
+func (m *MQTT) syncNode(before *model.Device, bs config.Settings, after *model.Device, as config.Settings) {
+	current := nodeTopics(after, as)
+	for t := range nodeTopics(before, bs) {
+		if !current[t] {
+			m.publish(t, []byte{}, true)
+		}
+	}
+	for _, d := range []*model.Device{before, after} {
+		if d == nil {
+			continue
+		}
 		m.mu.Lock()
 		for t := range m.haSent {
-			if strings.HasPrefix(t, prefix) && strings.Contains(t, marker) {
+			if strings.Contains(t, nodeMarker(d)) {
 				delete(m.haSent, t)
 			}
 		}
 		m.mu.Unlock()
-		if wasOn && s.HomeAssistant.Enabled {
-			for _, e := range entities(before, normalize(before.LastDecoded), s) {
-				if after == nil || !exposed(after) {
-					m.publish(entityTopic(s, before, e), []byte{}, true)
-				}
-			}
-		}
 	}
-	if exposed(after) && s.HomeAssistant.Enabled && after.LastDecoded != nil {
-		m.publishEntities(after, normalize(after.LastDecoded), after.LastGateway, s)
+	if len(current) > 0 {
+		m.publishEntities(after, normalize(after.LastDecoded), after.LastGateway, as)
 	}
+}
+
+// NodeChanged applies an edit or deletion (after == nil) to Home Assistant.
+func (m *MQTT) NodeChanged(before, after *model.Device) {
+	s := m.settings()
+	m.syncNode(before, s, after, s)
+}
+
+// gatewayField is a value a gateway can expose to Home Assistant.
+type gatewayField struct{ key, name, class, unit string }
+
+var gatewayFields = []gatewayField{
+	{"rx", "Packets received", "", ""}, {"tx", "Packets sent", "", ""}, {"crc_err", "CRC errors", "", ""}, {"tx_err", "TX errors", "", ""},
+	{"uptime_s", "Uptime", "duration", "s"}, {"temp_c", "Concentrator temperature", "temperature", "°C"},
+}
+
+func gatewayTopic(s config.Settings, gatewayID, key string) string {
+	return fmt.Sprintf("%s/sensor/%s/%s/config", s.HomeAssistant.DiscoveryPrefix, sanitize("lorahub_gw_"+gatewayID), key)
+}
+
+func gatewayExposes(s config.Settings, key string) bool {
+	ha := s.HomeAssistant
+	return ha.Enabled && ha.Gateways && slices.Contains(ha.GatewayFields, key)
 }
 
 // gatewayDiscovery exposes a gateway's counters, as the parent of its nodes.
@@ -251,15 +352,11 @@ func (m *MQTT) gatewayDiscovery(gatewayID string, data any, s config.Settings) {
 	}
 	id := sanitize("lorahub_gw_" + gatewayID)
 	device := map[string]any{"identifiers": []string{id}, "name": "LoRa gateway " + gatewayID, "manufacturer": "LoRaHub"}
-	known := []struct{ key, name, class, unit string }{
-		{"rx", "Packets received", "", ""}, {"tx", "Packets sent", "", ""}, {"crc_err", "CRC errors", "", ""}, {"tx_err", "TX errors", "", ""},
-		{"uptime_s", "Uptime", "duration", "s"}, {"temp_c", "Concentrator temperature", "temperature", "°C"},
-	}
-	for _, k := range known {
-		if _, ok := status[k.key]; !ok {
+	for _, k := range gatewayFields {
+		if _, ok := status[k.key]; !ok || !gatewayExposes(s, k.key) {
 			continue
 		}
-		topic := fmt.Sprintf("%s/sensor/%s/%s/config", s.HomeAssistant.DiscoveryPrefix, id, k.key)
+		topic := gatewayTopic(s, gatewayID, k.key)
 		m.mu.Lock()
 		done := m.haSent[topic]
 		m.haSent[topic] = true
@@ -273,7 +370,101 @@ func (m *MQTT) gatewayDiscovery(gatewayID string, data any, s config.Settings) {
 		if k.class != "" {
 			cfg["device_class"], cfg["unit_of_measurement"] = k.class, k.unit
 		}
+		if s.HomeAssistant.ExpireAfter > 0 {
+			cfg["expire_after"] = s.HomeAssistant.ExpireAfter
+		}
 		b, _ := json.Marshal(cfg)
 		m.publish(topic, b, true)
 	}
+}
+
+// ReconcileHA applies a settings change to what Home Assistant already has.
+func (m *MQTT) ReconcileHA(before, after config.Settings) {
+	if m.Devices != nil {
+		for _, d := range m.Devices() {
+			m.syncNode(d, before, d, after)
+		}
+	}
+	if m.Gateways != nil {
+		for _, id := range m.Gateways() {
+			for _, k := range gatewayFields {
+				oldTopic := gatewayTopic(before, id, k.key)
+				gone := gatewayExposes(before, k.key) && (!gatewayExposes(after, k.key) || oldTopic != gatewayTopic(after, id, k.key))
+				if gone {
+					m.publish(oldTopic, []byte{}, true)
+				}
+				m.mu.Lock()
+				delete(m.haSent, oldTopic)
+				delete(m.haSent, gatewayTopic(after, id, k.key))
+				m.mu.Unlock()
+			}
+		}
+	}
+}
+
+// RepublishHA sends every discovery message again.
+func (m *MQTT) RepublishHA() {
+	s := m.settings()
+	m.ReconcileHA(s, s)
+}
+
+// RemoveHA deletes everything LoRaHub has announced to Home Assistant. Nodes
+// and gateways announce themselves again with their next packet or status.
+func (m *MQTT) RemoveHA() {
+	s := m.settings()
+	if m.Devices != nil {
+		for _, d := range m.Devices() {
+			m.syncNode(d, s, nil, s)
+		}
+	}
+	if m.Gateways != nil {
+		for _, id := range m.Gateways() {
+			for _, k := range gatewayFields {
+				m.publish(gatewayTopic(s, id, k.key), []byte{}, true)
+				m.mu.Lock()
+				delete(m.haSent, gatewayTopic(s, id, k.key))
+				m.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (m *MQTT) handleBirth(payload []byte) {
+	if strings.TrimSpace(string(payload)) == "online" && m.settings().HomeAssistant.RepublishOnBirth {
+		m.RepublishHA()
+	}
+}
+
+// EntityView describes one entity on the exposure page.
+type EntityView struct {
+	Key         string `json:"key"`
+	Component   string `json:"component"`
+	Name        string `json:"name"`
+	Category    string `json:"category"`
+	Exposed     bool   `json:"exposed"`
+	Reason      string `json:"reason,omitempty"`
+	DeviceClass any    `json:"device_class,omitempty"`
+	Unit        any    `json:"unit,omitempty"`
+}
+
+// EntityReport lists what every node and gateway exposes, and why not.
+func (m *MQTT) EntityReport() map[string]any {
+	s := m.settings()
+	nodes := []map[string]any{}
+	if m.Devices != nil {
+		for _, d := range m.Devices() {
+			views := []EntityView{}
+			if d.LastDecoded != nil {
+				for _, e := range allEntities(d, normalize(d.LastDecoded), s) {
+					reason := hiddenReason(d, e, s)
+					name, _ := e.cfg["name"].(string)
+					views = append(views, EntityView{Key: e.key, Component: e.component, Name: name, Category: e.category, Exposed: reason == "" && exposed(d, s) && s.HomeAssistant.Enabled,
+						Reason: reason, DeviceClass: e.cfg["device_class"], Unit: e.cfg["unit_of_measurement"]})
+				}
+			}
+			nodes = append(nodes, map[string]any{"group": d.AppID, "node": d.ID, "name": d.Name, "adopted": d.Adopted, "ha_enabled": d.HAEnabled, "exposed": exposed(d, s),
+				"has_data": d.LastDecoded != nil, "ha_fields": d.HAFields, "entities": views})
+		}
+	}
+	return map[string]any{"enabled": s.HomeAssistant.Enabled, "nodes": nodes}
 }

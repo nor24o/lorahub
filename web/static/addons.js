@@ -1,4 +1,4 @@
-/* LoRaHub console: concentrator, radio, TX, remote gateways, logs and hardware. */
+/* LoRaHub console: concentrator status, radio, TX, remote gateways and logs. */
 'use strict';
 
 function statTile(label, value) { return h('div', { class: 'card stat' }, h('div', { class: 'label' }, label), h('div', { class: 'value', style: { fontSize: '18px' } }, value)); }
@@ -57,10 +57,27 @@ function radioEditor(cfg, save) {
   const st = JSON.parse(JSON.stringify(cfg));
   const holder = h('div');
   let raw = false;
-  const num = (k) => inp(st[k], { type: 'number', step: 'any', oninput: (e) => { st[k] = e.target.value === '' ? undefined : Number(e.target.value); } });
-  const txt = (k, cls) => inp(st[k], { class: cls, oninput: (e) => { st[k] = e.target.value; } });
-  const pick = (k, opts) => sel(st[k], opts, { onchange: (e) => { const n = Number(e.target.value); st[k] = String(n) === e.target.value ? n : e.target.value; } });
-  const bool = (k, label) => { const c = checkbox(st[k], label); c.input.onchange = () => { st[k] = c.input.checked; }; return c.el; };
+  const shown = new Set(['chan_if', 'chan_radio', 'tx_gain_lut', 'sf_mask']);
+  const num = (k) => { shown.add(k); return inp(st[k], { type: 'number', step: 'any', oninput: (e) => { st[k] = e.target.value === '' ? undefined : Number(e.target.value); } }); };
+  const txt = (k, cls) => { shown.add(k); return inp(st[k], { class: cls, oninput: (e) => { st[k] = e.target.value; } }); };
+  const pick = (k, opts) => { shown.add(k); return sel(st[k], opts, { onchange: (e) => { const n = Number(e.target.value); st[k] = String(n) === e.target.value ? n : e.target.value; } }); };
+  const bool = (k, label) => { shown.add(k); const c = checkbox(st[k], label); c.input.onchange = () => { st[k] = c.input.checked; }; return c.el; };
+  const label = (k) => k.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+  const anyField = (obj, k) => {
+    const v = obj[k];
+    if (typeof v === 'boolean') { const c = checkbox(v, label(k)); c.input.onchange = () => { obj[k] = c.input.checked; }; return c.el; }
+    if (typeof v === 'number') return field(label(k), inp(v, { type: 'number', step: 'any', oninput: (e) => { obj[k] = Number(e.target.value); } }));
+    if (typeof v === 'string') return field(label(k), h('input', { type: /pass/i.test(k) ? 'password' : 'text', value: v, autocomplete: 'off', oninput: (e) => { obj[k] = e.target.value; } }));
+    return field(label(k), h('textarea', { class: 'mono', rows: 3, value: JSON.stringify(v, null, 1), oninput: (e) => { try { obj[k] = JSON.parse(e.target.value); e.target.classList.remove('bad'); } catch (err) { e.target.classList.add('bad'); } } }));
+  };
+  const otherSettings = () => {
+    const keys = Object.keys(st).filter((k) => !shown.has(k)).sort();
+    const plain = keys.filter((k) => st[k] === null || typeof st[k] !== 'object' || Array.isArray(st[k]));
+    const groups = keys.filter((k) => !plain.includes(k));
+    if (!keys.length) return [];
+    return [h('h3', null, 'Other settings'), h('div', { class: 'grid g3' }, plain.map((k) => anyField(st, k))),
+      ...groups.flatMap((k) => [h('h3', null, label(k)), h('div', { class: 'grid g3' }, Object.keys(st[k]).map((sub) => anyField(st[k], sub)))])];
+  };
   const chips = ['SX1250', 'SX1255', 'SX1257'], bws = [125, 250, 500], crs = ['4/5', '4/6', '4/7', '4/8'], sfs = [5, 6, 7, 8, 9, 10, 11, 12];
   const channels = () => {
     const body = h('tbody');
@@ -118,6 +135,7 @@ function radioEditor(cfg, save) {
       h('h3', null, 'Hardware'),
       h('div', { class: 'grid g4' }, field('SPI device', txt('spi_path', 'mono')), field('Reset GPIO', txt('reset_gpio', 'mono')), field('PA GPIO', txt('pa_gpio', 'mono')), field('Clock source', pick('clksrc', [[0, 'Radio 0'], [1, 'Radio 1']]))),
       h('div', { class: 'grid g4' }, field('RX LED', txt('led_rx', 'mono')), field('TX LED', txt('led_tx', 'mono')), h('div', null, bool('full_duplex', 'Full duplex'), bool('ftime_enable', 'Fine timestamps')), h('div', null, bool('temp_monitor_enable', 'Temperature monitor'), bool('mcu_health_check', 'MCU health check'))),
+      ...otherSettings(),
       saveBtn(() => st)));
   };
   const seg = h('div', { class: 'seg' });
@@ -138,72 +156,185 @@ App.route('/radio', async () => {
 });
 
 // ======================= TX =======================
-App.route('/tx', async () => {
-  const modu = sel('LORA', [['LORA', 'LoRa packet'], ['CW', 'Continuous tone'], ['FSK', 'FSK packet']]);
-  const freq = inp('868.100', { type: 'number', step: '0.001' }), power = inp(14, { type: 'number', min: 0, max: 27 }), rf = sel(0, [[0, 'Chain 0'], [1, 'Chain 1']]);
-  const sf = sel('SF7BW125', [7, 8, 9, 10, 11, 12].flatMap((s) => [125, 250, 500].map((b) => `SF${s}BW${b}`)));
-  const rate = inp(50000, { type: 'number' }), cr = sel('4/5', ['4/5', '4/6', '4/7', '4/8']), pre = inp(8, { type: 'number', min: 0 });
-  const ipol = checkbox(false, 'Invert IQ');
-  const asHex = checkbox(false, 'Payload is hex');
-  const data = inp('PING_FROM_LORAHUB', { class: 'mono' });
-  const out = h('div', { class: 'small muted' });
-  const sfField = field('Data rate', sf), rateField = field('FSK rate (bit/s)', rate), crField = field('Coding rate', cr), dataField = field('Payload', data);
-  const warn = h('div', { class: 'callout warn small' }, 'A tone keeps transmitting until you press Stop TX.');
-  const sync = () => { const m = modu.value; sfField.style.display = m === 'LORA' ? '' : 'none'; crField.style.display = m === 'LORA' ? '' : 'none'; rateField.style.display = m === 'FSK' ? '' : 'none'; dataField.style.display = m === 'CW' ? 'none' : ''; warn.style.display = m === 'CW' ? '' : 'none'; };
-  modu.addEventListener('change', sync); sync();
+function loraAirtimeMs(len, sf, bw, cr, preamble, implicit, noCrc) {
+  const ts = (2 ** sf) / bw;
+  const de = sf >= 11 && bw === 125 ? 1 : 0;
+  const n = 8 + Math.max(Math.ceil((8 * len - 4 * sf + 28 + (noCrc ? 0 : 16) - (implicit ? 20 : 0)) / (4 * (sf - 2 * de))) * (cr + 4), 0);
+  return (preamble + 4.25) * ts + n * ts;
+}
+const TX_FREQS = ['863.000', '865.000', '867.100', '867.300', '867.500', '867.700', '867.900', '868.100', '868.300', '868.500', '869.525'];
+
+async function txPage(preset, header) {
+  const gws = (await GET('/gateways')).filter((g) => g.kind === 'bobcat');
+  if (!gws.length) return h('div', { class: 'stack' }, ...header, h('div', { class: 'empty card' }, 'No raw_lora_app gateway is registered yet.'));
+  const log = [];
+  const gw = sel(preset || gws[0].gateway_id, gws.map((g) => [g.gateway_id, (g.name || g.gateway_id) + (g.online ? '' : ' (offline)')]));
+  const modu = sel('LORA', [['LORA', 'LoRa packet'], ['FSK', 'FSK packet'], ['CW', 'Continuous tone']]);
+  const freqList = h('datalist', { id: 'tx-freqs' }, TX_FREQS.map((f) => h('option', { value: f })));
+  const freq = inp('868.100', { type: 'number', step: '0.001', list: 'tx-freqs' }), power = inp(14, { type: 'number', min: 0, max: 27 }), rf = sel(0, [[0, 'Chain 0'], [1, 'Chain 1']]);
+  const sf = sel(7, [5, 6, 7, 8, 9, 10, 11, 12].map((x) => [x, 'SF' + x])), bw = sel(125, [125, 250, 500].map((x) => [x, x + ' kHz']));
+  const cr = sel('4/5', ['4/5', '4/6', '4/7', '4/8']), pre = inp(8, { type: 'number', min: 6, max: 65535 });
+  const rate = inp(50000, { type: 'number' }), fdev = inp(25, { type: 'number', min: 1, max: 200 }), foff = inp(0, { type: 'number', min: -128, max: 127 });
+  const ipol = checkbox(false, 'Invert IQ'), ncrc = checkbox(false, 'No CRC'), nhdr = checkbox(false, 'Implicit header');
+  const source = sel('text', [['text', 'Text'], ['hex', 'Hex bytes'], ['random', 'Random bytes']]);
+  const data = inp('PING_FROM_LORAHUB', { class: 'mono' }), randomLen = inp(16, { type: 'number', min: 1, max: 255 });
+  const counter = checkbox(false, 'Add a 2-byte counter at the end');
+  const count = inp(1, { type: 'number', min: 1, max: 1000 }), interval = inp(5000, { type: 'number', min: 100, step: 100 }), delay = inp(0, { type: 'number', min: 0, max: 60000, step: 100 });
+  const readout = h('div', { class: 'chips' });
+  const progress = h('div', { class: 'small muted' });
   const counters = h('div');
-  const refresh = async () => { const c = await GET('/concentrator'); counters.replaceChildren(c.status ? h('div', { class: 'grid g4' }, statTile('Transmitted', c.status.tx), statTile('TX errors', c.status.tx_err), statTile('Queue', c.status.q_depth), statTile('TX state', c.status.tx_status)) : h('div', { class: 'callout warn' }, 'raw_lora_app is not answering.')); };
-  await refresh();
-  const send = async () => {
-    const body = { modu: modu.value, freq: Number(freq.value), powe: Number(power.value), rfch: Number(rf.value), datr: modu.value === 'FSK' ? rate.value : sf.value, codr: cr.value, ipol: ipol.input.checked, prea: Number(pre.value) };
-    if (modu.value !== 'CW') { if (asHex.input.checked) body.payload_hex = cleanHex(data.value); else body.ascii = data.value; }
-    try { await api('POST', '/concentrator/tx', body); out.textContent = 'Handed to raw_lora_app. Check the counters below for the result.'; setTimeout(() => refresh().catch(() => {}), 1500); } catch (e) { errToast(e); }
+  const history = h('div');
+
+  const fields = { sf: field('Spreading factor', sf), bw: field('Bandwidth', bw), cr: field('Coding rate', cr), pre: field('Preamble', pre), rate: field('Bit rate (bit/s)', rate), fdev: field('Deviation (kHz)', fdev), foff: field('Tone offset (kHz)', foff), data: field('Payload', data), randomLen: field('Length (bytes)', randomLen) };
+  const flags = h('div', { class: 'row' }, ipol.el, ncrc.el, nhdr.el);
+  const warn = h('div', { class: 'callout warn small' }, 'A tone keeps transmitting until you press Stop TX.');
+  const size = () => {
+    if (source.value === 'random') return Number(randomLen.value) + (counter.input.checked ? 2 : 0);
+    const n = source.value === 'hex' ? cleanHex(data.value).length / 2 : new TextEncoder().encode(data.value).length;
+    return Math.floor(n) + (counter.input.checked ? 2 : 0);
   };
-  const root = h('div', { class: 'stack' }, pageHead([['TX test']], 'TX test', ['Sends through the local concentrator. Keep to your region\'s duty cycle and power limits.']), counters,
-    h('div', { class: 'card card-body' }, h('div', { class: 'form wide stack' }, warn,
-      h('div', { class: 'grid g4' }, field('Mode', modu), field('Frequency (MHz)', freq), field('Power (dBm)', power), field('RF chain', rf)),
-      h('div', { class: 'grid g4' }, sfField, rateField, crField, field('Preamble', pre), h('div', { style: { alignSelf: 'center' } }, ipol.el)),
-      dataField, asHex.el,
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: send }, icon('send'), 'Transmit now'),
-        h('button', { class: 'btn danger', onclick: async () => { try { await api('POST', '/concentrator/tx', { abort: true, rfch: Number(rf.value) }); out.textContent = 'Stop command sent.'; } catch (e) { errToast(e); } } }, 'Stop TX')), out)));
+  const sync = () => {
+    const m = modu.value, lora = m === 'LORA';
+    fields.sf.style.display = fields.bw.style.display = fields.cr.style.display = flags.style.display = lora ? '' : 'none';
+    fields.rate.style.display = fields.fdev.style.display = m === 'FSK' ? '' : 'none';
+    fields.foff.style.display = warn.style.display = m === 'CW' ? '' : 'none';
+    fields.pre.style.display = m === 'CW' ? 'none' : '';
+    source.parentElement.style.display = m === 'CW' ? 'none' : '';
+    fields.data.style.display = m === 'CW' || source.value === 'random' ? 'none' : '';
+    fields.randomLen.style.display = m !== 'CW' && source.value === 'random' ? '' : 'none';
+    counter.el.style.display = m === 'CW' ? 'none' : '';
+    const chips = [];
+    if (m !== 'CW') chips.push(h('span', { class: 'chip' }, h('b', null, 'size '), size() + ' B'));
+    if (lora) {
+      const ms = loraAirtimeMs(size(), Number(sf.value), Number(bw.value), Number(cr.value.split('/')[1]) - 4, Number(pre.value), nhdr.input.checked, ncrc.input.checked);
+      chips.push(h('span', { class: 'chip' }, h('b', null, 'airtime '), ms.toFixed(1) + ' ms'));
+      if (Number(count.value) > 1) chips.push(h('span', { class: 'chip' }, h('b', null, 'duty '), ((ms / Number(interval.value)) * 100).toFixed(2) + ' %'));
+    }
+    if (Number(count.value) > 1) chips.push(h('span', { class: 'chip' }, h('b', null, 'total '), fmtDur(Math.round(((Number(count.value) - 1) * Number(interval.value)) / 1000))));
+    readout.replaceChildren(...chips);
+  };
+
+  const refresh = async () => {
+    const r = await GET(`/gateways/${gw.value}/remote?status=1`);
+    counters.replaceChildren(r.status ? h('div', { class: 'grid g4' }, statTile('Transmitted', r.status.tx), statTile('TX errors', r.status.tx_err), statTile('Queue', r.status.q_depth), statTile('TX state', r.status.tx_status)) : h('div', { class: 'callout warn' }, 'No live status from this gateway: ' + (r.status_error || r.error || 'unknown')));
+  };
+  const paintHistory = () => history.replaceChildren(log.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, ['Time', 'Gateway', 'Frequency', 'Mode', 'Power', 'Result'].map((x) => h('th', null, x)))),
+    h('tbody', null, log.slice(0, 20).map((x) => h('tr', null, h('td', { class: 'small nowrap' }, x.time), h('td', null, x.gw), h('td', { class: 'mono small' }, x.freq), h('td', { class: 'small' }, x.mode), h('td', { class: 'small' }, x.power + ' dBm'), h('td', { class: 'small' }, x.result)))))) : h('div', { class: 'empty' }, 'Nothing sent from this page yet.'));
+
+  const watchJob = async (entry) => {
+    const j = await GET('/concentrator/tx/job');
+    entry.result = `${j.sent} of ${j.total}` + (j.error ? ': ' + j.error : '');
+    progress.textContent = j.running ? `Sending: ${j.sent} of ${j.total}` : `Finished: ${j.sent} of ${j.total} handed to raw_lora_app` + (j.error ? '. ' + j.error : '');
+    paintHistory();
+    if (j.running && root.isConnected) setTimeout(() => watchJob(entry).catch(errToast), 1000);
+  };
+  const send = async () => {
+    const m = modu.value;
+    const body = { gateway: gw.value, modu: m, freq: Number(freq.value), powe: Number(power.value), rfch: Number(rf.value), codr: cr.value, ipol: ipol.input.checked, ncrc: ncrc.input.checked, nhdr: nhdr.input.checked,
+      prea: Number(pre.value), count: Number(count.value), interval_ms: Number(interval.value), delay_ms: Number(delay.value), append_counter: m !== 'CW' && counter.input.checked,
+      datr: m === 'FSK' ? rate.value : `SF${sf.value}BW${bw.value}`, f_dev: m === 'FSK' ? Number(fdev.value) : 0, f_off: m === 'CW' ? Number(foff.value) : 0 };
+    if (m !== 'CW') { if (source.value === 'hex') body.payload_hex = cleanHex(data.value); else if (source.value === 'random') body.random_len = Number(randomLen.value); else body.ascii = data.value; }
+    const entry = { time: new Date().toLocaleTimeString(), gw: gw.selectedOptions[0].textContent, freq: Number(freq.value).toFixed(3), mode: m === 'LORA' ? body.datr : m, power: body.powe, result: 'sending' };
+    log.unshift(entry);
+    try {
+      const r = await api('POST', '/concentrator/tx', body);
+      if (r.sent) { entry.power = r.sent.powe; entry.result = 'handed to raw_lora_app'; progress.textContent = 'Handed to raw_lora_app. The counters above show the result.'; } else { entry.power = r.power; watchJob(entry).catch(errToast); }
+    } catch (e) { entry.result = e.message; errToast(e); }
+    paintHistory();
+    setTimeout(() => refresh().catch(() => {}), 1500);
+  };
+  const stop = async () => { try { await api('POST', '/concentrator/tx', { gateway: gw.value, abort: true, rfch: Number(rf.value) }); progress.textContent = 'Stop command sent.'; } catch (e) { errToast(e); } };
+
+  const form = h('div', { class: 'form wide stack' }, warn,
+    h('div', { class: 'grid g4' }, field('Gateway', gw), field('Mode', modu), field('Frequency (MHz)', freq), field('Power (dBm)', power)),
+    h('div', { class: 'grid g4' }, field('RF chain', rf), fields.sf, fields.bw, fields.cr, fields.pre, fields.rate, fields.fdev, fields.foff), flags,
+    h('h3', null, 'Payload'),
+    h('div', { class: 'grid g4' }, h('div', { class: 'field' }, h('label', null, 'Content'), source), fields.randomLen), fields.data, counter.el,
+    h('h3', null, 'Timing'),
+    h('div', { class: 'grid g4' }, field('Packets', count), field('Interval (ms)', interval), field('Start delay (ms)', delay)),
+    readout,
+    h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: send }, icon('send'), 'Transmit'), h('button', { class: 'btn danger', onclick: stop }, 'Stop TX')), progress, freqList);
+  form.addEventListener('input', sync); form.addEventListener('change', sync);
+  gw.addEventListener('change', () => refresh().catch(errToast));
+  sync(); paintHistory();
+  await refresh().catch(() => {});
+  const root = h('div', { class: 'stack' }, ...header, counters, h('div', { class: 'card card-body' }, form), h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Sent from this page')), history));
   pollWhileVisible(root, 5000, () => refresh().catch(() => {}));
   return root;
-});
+}
+App.route('/tx', () => txPage(null, [pageHead([['TX test']], 'TX test', ['Keep to your region\'s duty-cycle and power limits.'])]));
+App.route('/gateways/:id/transmit', async ({ id }) => txPage(id, gwHeader(await GET('/gateways/' + id), 'transmit')));
 
 // ======================= Remote gateways =======================
+function remoteForm(g, r, reload) {
+  const c = r.config;
+  const mhz = (v) => (v ? (v / 1e6).toFixed(3) : '');
+  const rf0 = inp(mhz(c.rf0_freq), { type: 'number', step: '0.001' }), rf1 = inp(mhz(c.rf1_freq), { type: 'number', step: '0.001' });
+  const sync = sel(c.sync_word, [['private', 'Private (0x12)'], ['public', 'Public (0x34)']]);
+  const power = inp(c.tx_power, { type: 'number', min: 0, max: 27 }), txf = inp('', { type: 'number', step: '0.001', placeholder: 'unchanged' });
+  const ip = inp(c.target_ip, { class: 'mono' }), port = inp(c.port_up, { type: 'number', min: 1, max: 65535 });
+  const apply = async () => {
+    const d = {};
+    const hz = (input, cur, key) => { if (input.value !== '' && mhz(cur) !== Number(input.value).toFixed(3)) d[key] = Math.round(Number(input.value) * 1e6); };
+    hz(rf0, c.rf0_freq, 'rf0_freq'); hz(rf1, c.rf1_freq, 'rf1_freq'); hz(txf, 0, 'tx_default_freq');
+    if (sync.value !== c.sync_word) d.sync_word = sync.value;
+    if (Number(power.value) !== c.tx_power) d.tx_default_power = Number(power.value);
+    if (ip.value.trim() !== c.target_ip) d.target_ip = ip.value.trim();
+    if (Number(port.value) !== c.port_up) d.port_up = Number(port.value);
+    if (!Object.keys(d).length) { toast('Nothing changed'); return; }
+    const leaves = d.target_ip || d.port_up;
+    const text = leaves ? 'The gateway will send its packets to the new address. If that address is wrong, it disappears from LoRaHub and has to be fixed on the gateway itself.' : 'The radio restarts to apply this, so reception pauses for a moment.';
+    if (!(await confirmModal('Apply to ' + (g.name || g.gateway_id), text, 'Apply', Boolean(leaves)))) return;
+    try { await api('PUT', `/gateways/${g.gateway_id}/remote/config`, d); toast('Applied by the gateway'); reload(); } catch (e) { errToast(e); }
+  };
+  return h('div', { class: 'card card-body' }, h('div', { class: 'form wide stack' },
+    h('h3', null, 'Radio'),
+    h('div', { class: 'grid g4' }, field('Radio 0 centre (MHz)', rf0), field('Radio 1 centre (MHz)', rf1), field('Sync word', sync), h('div')),
+    h('h3', null, 'Transmit defaults'),
+    h('div', { class: 'grid g4' }, field('Power (dBm)', power), field('Frequency (MHz)', txf), h('div'), h('div')),
+    h('h3', null, 'Where it sends packets'),
+    h('div', { class: 'grid g4' }, field('Server IP', ip), field('Uplink port', port), field('Downlink port', inp(c.port_down, { disabled: true }), 'Read only on the gateway.'), h('div')),
+    h('div', { class: 'small muted' }, 'These are the settings raw_lora_app accepts remotely. Channels, spreading-factor mask and the TX gain table are not part of its remote command.'),
+    h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: apply }, 'Apply to gateway'))));
+}
+
+async function radioPanel(g) {
+  const live = h('div', { class: 'stack' });
+  const paintLive = (r) => live.replaceChildren(...(r.status ? [statusTiles(r.status), channelBars(r.status)] : [h('div', { class: 'callout warn' }, 'No live status from this gateway: ' + (r.status_error || 'unknown'))]));
+  const body = h('div', { class: 'stack' });
+  const load = async () => {
+    const r = await GET(`/gateways/${g.gateway_id}/remote`);
+    if (!r.supported) { live.replaceChildren(); body.replaceChildren(h('div', { class: 'callout' }, r.error)); return; }
+    paintLive(r);
+    if (r.local) {
+      const c = await GET('/concentrator');
+      body.replaceChildren(c.config ? radioEditor(c.config, async (cfg, restart) => { await api('PUT', '/concentrator', cfg); if (restart) await api('POST', '/concentrator/service', { cmd: 'restart' }); }) : h('div', { class: 'callout warn' }, 'Cannot read the configuration: ' + (c.config_error || 'unknown error')));
+      return;
+    }
+    const facts = h('dl', { class: 'kv small' }, h('dt', null, 'Address'), h('dd', { class: 'mono' }, r.host), h('dt', null, 'Control port'), h('dd', { class: 'mono' }, 'UDP ' + r.control_port), h('dt', null, 'Status port'), h('dd', { class: 'mono' }, 'TCP ' + r.status_port));
+    body.replaceChildren(h('div', { class: 'card card-body' }, h('h2', null, 'Connection'), facts), r.config ? remoteForm(g, r, () => load().catch(errToast)) : h('div', { class: 'callout warn' }, r.error || 'The gateway did not answer.'));
+  };
+  await load();
+  const root = h('div', { class: 'stack' }, live, body);
+  pollWhileVisible(root, 5000, async () => { if (document.querySelector('.modal-bg')) return; try { const r = await GET(`/gateways/${g.gateway_id}/remote?status=1`); if (r.supported) paintLive(r); } catch (e) { /* next round */ } });
+  return root;
+}
+
 App.route('/remote', async () => {
-  const gws = await GET('/gateways');
-  return h('div', { class: 'stack' }, pageHead([['Remote config']], 'Remote config', ['Configure and control satellite gateways over SSH']),
+  const gws = (await GET('/gateways')).filter((g) => g.kind === 'bobcat');
+  return h('div', { class: 'stack' }, pageHead([['Remote config']], 'Remote config', ['Change the radio of each gateway from here']),
     h('div', { class: 'card' }, gws.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Gateway', 'Address', 'Status', 'Last seen'].map((x) => h('th', null, x)))),
-      h('tbody', null, gws.map((g) => h('tr', { class: 'click', onclick: () => { location.hash = '#/remote/' + g.gateway_id; } }, h('td', null, g.name || g.gateway_id), h('td', { class: 'mono small' }, g.last_addr || '—'), h('td', null, onlineBadge(g.online, g.last_seen)), h('td', { class: 'small' }, ago(g.last_seen))))))) : h('div', { class: 'empty' }, 'No gateways yet.')));
+      h('tbody', null, gws.map((g) => h('tr', { class: 'click', onclick: () => { location.hash = '#/remote/' + g.gateway_id; } }, h('td', null, g.name || g.gateway_id), h('td', { class: 'mono small' }, g.last_addr || '—'), h('td', null, onlineBadge(g.online, g.last_seen)), h('td', { class: 'small' }, ago(g.last_seen))))))) : h('div', { class: 'empty' }, 'No raw_lora_app gateways yet.')));
 });
 
 App.route('/remote/:id', async ({ id }) => {
-  const [g, key] = await Promise.all([GET('/gateways/' + id), GET('/remote/key')]);
-  const body = h('div', { class: 'stack' });
-  const load = async () => {
-    body.replaceChildren(h('div', { class: 'empty' }, 'Connecting to the gateway…'));
-    const r = await GET(`/gateways/${id}/remote`);
-    const rc = r.remote || {};
-    const host = inp(rc.host, { class: 'mono' }), port = inp(rc.port, { type: 'number' }), user = inp(rc.user, { class: 'mono' }), path = inp(rc.config_path, { class: 'mono' });
-    const trust = checkbox(false, 'Trust a new host key', rc.host_key ? 'Pinned: ' + rc.host_key : null);
-    const conn = h('div', { class: 'card card-body' }, h('h2', null, 'Connection'), h('div', { class: 'form wide stack' },
-      h('div', { class: 'grid g4' }, field('Address', host), field('SSH port', port), field('User', user), field('Config file', path)), trust.el,
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await api('PUT', `/gateways/${id}/remote`, { host: host.value, port: Number(port.value), user: user.value, config_path: path.value, trust_new_key: trust.input.checked }); toast('Saved'); load(); } catch (e) { errToast(e); }
-      } }, 'Save and connect'))));
-    const keyCard = h('div', { class: 'card card-body' }, h('h2', null, 'Allow this server to log in'),
-      h('p', { class: 'small muted' }, 'Add this line once on the gateway, to /etc/dropbear/authorized_keys on OpenWrt or /root/.ssh/authorized_keys on Debian.'), val(key.public_key));
-    if (r.error) { body.replaceChildren(h('div', { class: 'callout warn' }, 'Could not connect: ' + r.error), conn, keyCard); return; }
-    const send = async (cmd) => { await api('POST', `/gateways/${id}/remote/service`, { cmd }); setTimeout(() => load().catch(errToast), 2500); };
-    const log = logBox(async () => (await GET(`/gateways/${id}/remote/logs`)).log);
-    body.replaceChildren(h('div', { class: 'card card-body' }, h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Concentrator service'), h('div', { class: 'chips' }, serviceButtons(send, r.running ? 'active' : 'stopped')))),
-      ...(r.status ? [statusTiles(r.status), channelBars(r.status)] : []),
-      r.config ? radioEditor(r.config, async (cfg, restart) => { await api('PUT', `/gateways/${id}/remote/config`, cfg); if (restart) await send('restart'); }) : h('div', { class: 'callout warn' }, r.config_error || 'No configuration found.'),
-      h('div', { class: 'card card-body' }, h('h2', null, 'Log'), log.el), conn);
-  };
-  await load();
-  return h('div', { class: 'stack' }, pageHead([['Remote config', '#/remote'], [g.name || id]], g.name || id, [h('span', { class: 'mono small' }, g.last_addr || '')]), body);
+  const g = await GET('/gateways/' + id);
+  return h('div', { class: 'stack' }, pageHead([['Remote config', '#/remote'], [g.name || id]], g.name || id, [h('span', { class: 'mono small' }, g.last_addr || ''), h('a', { href: `#/gateways/${id}/settings` }, 'Gateway settings')]), await radioPanel(g));
+});
+
+App.route('/gateways/:id/radio', async ({ id }) => {
+  const g = await GET('/gateways/' + id);
+  return h('div', { class: 'stack' }, ...gwHeader(g, 'radio'), await radioPanel(g));
 });
 
 // ======================= Logs =======================
@@ -215,31 +346,3 @@ function logsPage(source) {
 }
 App.route('/logs', () => logsPage('concentrator'));
 App.route('/logs/lorahub', () => logsPage('lorahub'));
-
-// ======================= Hardware =======================
-App.route('/hardware', async () => {
-  const body = h('div', { class: 'stack' });
-  const render = async () => {
-    const hw = await GET('/hardware');
-    const setGpio = async (g, payload) => { try { await api('POST', '/hardware/gpio', Object.assign({ gpio: g.gpio }, payload)); render(); } catch (e) { errToast(e); } };
-    body.replaceChildren(pageHead([['GPIO & hardware']], 'GPIO & hardware', [hw.board || '']),
-      h('div', { class: 'grid g2' },
-        h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'LEDs')), h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('tbody', null, hw.leds.map((l) => h('tr', null, h('td', null, l.name), h('td', { class: 'small muted' }, l.trigger), h('td', null, h('span', { class: 'badge ' + (l.brightness ? 'ok' : '') }, l.brightness ? 'on' : 'off')),
-          h('td', null, h('button', { class: 'btn sm', onclick: async () => { try { await api('POST', '/hardware/led', { name: l.name, value: l.brightness ? 0 : l.max }); render(); } catch (e) { errToast(e); } } }, 'Toggle')))))))),
-        h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Network')), h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Interface', 'State', 'RX packets', 'TX packets'].map((x) => h('th', null, x)))), h('tbody', null, hw.net.map((n) => h('tr', null, h('td', null, n.name), h('td', null, h('span', { class: 'badge ' + (n.carrier ? 'ok' : 'warn') }, n.state)), h('td', null, n.rx_packets), h('td', null, n.tx_packets))))))) ),
-      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'GPIO lines in use')), hw.gpio.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['GPIO', 'Pin', 'Used by', 'Direction', 'Level', ''].map((x) => h('th', null, x)))),
-        h('tbody', null, hw.gpio.map((g) => h('tr', null, h('td', { class: 'mono' }, g.gpio), h('td', { class: 'mono' }, g.pin), h('td', null, g.label || '—'), h('td', null, g.direction), h('td', null, h('span', { class: 'badge ' + (g.value ? 'ok' : '') }, g.value ? 'high' : 'low')),
-          h('td', null, g.can_set ? h('div', { class: 'chips' }, h('button', { class: 'btn sm', onclick: () => setGpio(g, { action: 'set', value: 1 }) }, 'High'), h('button', { class: 'btn sm', onclick: () => setGpio(g, { action: 'set', value: 0 }) }, 'Low'), h('button', { class: 'btn sm', onclick: () => setGpio(g, { action: 'pulse' }) }, 'Pulse')) : h('span', { class: 'small muted' }, 'protected'))))))) : h('div', { class: 'empty' }, 'GPIO information is not available on this system.')));
-  };
-  await render();
-  return body;
-});
-
-App.route('/pinout', async () => {
-  const hw = await GET('/hardware');
-  const named = hw.gpio.filter((g) => g.label && g.label !== 'sysfs');
-  return h('div', { class: 'stack' }, pageHead([['Pinout']], 'Pinout', [hw.board || '', h('span', null, 'Read from this device')]),
-    h('div', { class: 'grid g2' },
-      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Concentrator wiring')), h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('tbody', null, hw.roles.map((r) => h('tr', null, h('td', null, r.function), h('td', { class: 'mono' }, r.value))))))),
-      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Pins assigned by the kernel')), h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Pin', 'GPIO', 'Function'].map((x) => h('th', null, x)))), h('tbody', null, named.map((g) => h('tr', null, h('td', { class: 'mono' }, g.pin), h('td', { class: 'mono' }, g.gpio), h('td', null, g.label)))))))));
-});

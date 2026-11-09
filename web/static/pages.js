@@ -216,7 +216,7 @@ App.route('/applications/:app/integrations', async ({ app }) => {
         h('dt', null, 'Send downlink'), h('dd', null, val(`${p}/${app}/{node}/down`)),
         h('dt', null, 'Downlink body'), h('dd', null, h('code', null, '{"data_hex":"0102"}  or  {"decoded":{"relay":true}}')),
         h('dt', null, 'Downlink events'), h('dd', null, val(`${p}/${app}/+/down/sent`))),
-      h('div', { class: 'small muted' }, 'Home Assistant auto-discovery: ', h('b', null, settings.home_assistant.enabled ? 'on' : 'off'), ' · ', h('a', { href: '#/settings/integrations' }, 'change'))),
+      h('div', { class: 'small muted' }, 'Home Assistant auto-discovery: ', h('b', null, settings.home_assistant.enabled ? 'on' : 'off'), ' · ', h('a', { href: '#/integrations/homeassistant' }, 'change'))),
     h('div', { class: 'card card-body stack' },
       h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Webhooks'), h('button', { class: 'btn', onclick: () => { hooks.push({ name: '', url: '', events: ['up'], enabled: true, format: 'full', headers: {} }); render(); } }, icon('plus'), 'Add webhook')),
       list,
@@ -464,7 +464,7 @@ App.route('/gateways/new', async () => {
 function gwHeader(g, active) {
   return [pageHead([['Gateways', '#/gateways'], [g.gateway_id]], g.name || g.gateway_id,
     [h('span', { class: 'mono small' }, 'EUI ' + g.eui), onlineBadge(g.online, g.last_seen), h('span', { class: 'badge' }, KIND_LABEL[g.kind] || g.kind), h('span', null, `↑ ${g.rx_count}  ↓ ${g.tx_count}`)]),
-  tabs('#/gateways/' + g.gateway_id, [['', 'Overview'], ['live', 'Live data'], ['transmit', 'Transmit'], ['settings', 'Settings'], ['connect', 'Connection']], active)];
+  tabs('#/gateways/' + g.gateway_id, [['', 'Overview'], ['live', 'Live data'], ['radio', 'Radio'], ['transmit', 'Transmit'], ['settings', 'Settings'], ['connect', 'Connection']], active)];
 }
 
 App.route('/gateways/:id', async ({ id }) => {
@@ -489,21 +489,6 @@ App.route('/gateways/:id/live', async ({ id }) => {
   return h('div', { class: 'stack' }, gwHeader(g, 'live'), liveView({ gateway: id }));
 });
 
-App.route('/gateways/:id/transmit', async ({ id }) => {
-  const g = await GET('/gateways/' + id);
-  const f = { payload: inp('48656C6C6F', { class: 'mono' }), freq: inp(869.525, { type: 'number', step: 'any' }), dr: inp('SF9BW125', { class: 'mono' }),
-    cr: sel('4/5', ['4/5', '4/6', '4/7', '4/8']), pw: inp(14, { type: 'number', min: 0, max: 27 }) };
-  const ipol = checkbox(false, 'Invert IQ polarity (LoRaWAN downlink style)');
-  return h('div', { class: 'stack' }, gwHeader(g, 'transmit'),
-    h('div', { class: 'card card-body' }, h('div', { class: 'form' },
-      h('div', { class: 'callout warn small' }, 'Transmits a packet immediately. Respect the duty cycle and the maximum EIRP of your region.'),
-      field('Payload (hex)', f.payload),
-      h('div', { class: 'grid g4' }, field('Frequency (MHz)', f.freq), field('Data rate', f.dr), field('Coding rate', f.cr), field('Power (dBm)', f.pw)), ipol.el,
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await api('POST', `/gateways/${id}/downlink`, { payload_hex: cleanHex(f.payload.value), frequency: Number(f.freq.value), data_rate: f.dr.value.toUpperCase(), coding_rate: f.cr.value, power: Number(f.pw.value), invert_polarity: ipol.input.checked }); toast('Transmitted'); } catch (e) { errToast(e); }
-      } }, icon('send'), 'Transmit now')))));
-});
-
 App.route('/gateways/:id/settings', async ({ id }) => {
   const [g, bands] = await Promise.all([GET('/gateways/' + id), GET('/bands')]);
   const st = JSON.parse(JSON.stringify(g));
@@ -524,6 +509,9 @@ App.route('/gateways/:id/settings', async ({ id }) => {
   const lat = inp(st.location ? st.location.latitude : '', { type: 'number', step: 'any' }), lon = inp(st.location ? st.location.longitude : '', { type: 'number', step: 'any' }), alt = inp(st.location ? st.location.altitude : '', { type: 'number', step: 'any' });
   const dl = checkbox(st.downlink_enabled, 'Downlinks enabled', 'Allow LoRaHub to schedule downlinks through this gateway.');
   const dis = checkbox(st.disabled, 'Disabled', 'Ignore all traffic from this gateway.');
+  const numIn = (key, attrs) => inp(st[key] || '', Object.assign({ type: 'number', step: 'any', oninput: (e) => { st[key] = e.target.value === '' ? 0 : Number(e.target.value); } }, attrs));
+  const minSnr = inp(st.min_snr ?? '', { type: 'number', step: 'any', placeholder: 'no limit' });
+  const attrs = h('textarea', { class: 'mono', rows: 3, placeholder: 'site=roof', value: Object.entries(st.attributes || {}).map(([k, v]) => k + '=' + v).join('\n') });
   return h('div', { class: 'stack' }, gwHeader(g, 'settings'),
     h('div', { class: 'card card-body' }, h('div', { class: 'form' },
       h('div', { class: 'grid g2' }, field('Gateway ID', inp(st.gateway_id, { disabled: true, class: 'mono' })), field('Gateway EUI', inp(st.eui, { class: 'mono', oninput: (e) => { st.eui = e.target.value; } }))),
@@ -536,11 +524,21 @@ App.route('/gateways/:id/settings', async ({ id }) => {
       st.kind === 'http' ? field('Gateway API key', h('div', { class: 'row' }, st.api_key ? val(st.api_key, { secret: true }) : h('span', { class: 'muted' }, 'generated on save'))) : null,
       h('div', { class: 'form-section stack' }, h('h3', null, 'Location'), h('div', { class: 'grid g3' }, field('Latitude', lat), field('Longitude', lon), field('Altitude (m)', alt)),
         h('div', null, h('button', { class: 'btn sm', onclick: () => navigator.geolocation && navigator.geolocation.getCurrentPosition((p) => { lat.value = p.coords.latitude.toFixed(6); lon.value = p.coords.longitude.toFixed(6); alt.value = Math.round(p.coords.altitude || 0); }, (e) => errToast(e)) }, 'Use my current location'))),
-      h('div', { class: 'form-section stack' }, dl.el, dis.el),
+      h('div', { class: 'form-section stack' }, h('h3', null, 'Reception'),
+        h('div', { class: 'grid g3' }, field('RSSI correction (dB)', numIn('rssi_offset', { placeholder: '0' }), 'Added to every RSSI this gateway reports.'), field('Ignore packets below RSSI (dBm)', numIn('min_rssi', { max: 0, placeholder: 'no limit' })), field('Ignore packets below SNR (dB)', minSnr)), dis.el),
+      h('div', { class: 'form-section stack' }, h('h3', null, 'Transmission'), dl.el,
+        h('div', { class: 'grid g3' }, field('Antenna gain (dBi)', numIn('antenna_gain_dbi', { min: 0, placeholder: '0' }), 'Subtracted from the requested power, so the radiated power stays at the level you set.'), field('Duty-cycle limit (%)', numIn('duty_cycle_pct', { min: 0, max: 100, placeholder: 'no limit' }), 'Measured over a sliding hour. Downlinks above it are refused.'), h('div'))),
+      st.kind === 'bobcat' ? h('div', { class: 'form-section stack' }, h('h3', null, 'raw_lora_app link'),
+        h('div', { class: 'grid g3' }, field('Control port (UDP)', numIn('control_port', { min: 1, max: 65535, placeholder: 'detected automatically' }), 'The port_down of this gateway. Used for downlinks and remote settings.'), field('Status port (TCP)', numIn('status_port', { min: 1, max: 65535, placeholder: '5557' })), h('div'))) : null,
+      h('div', { class: 'form-section stack' }, h('h3', null, 'Monitoring'),
+        h('div', { class: 'grid g3' }, field('Offline after (s)', numIn('offline_after_s', { min: 10, placeholder: 'global setting' })), h('div'), h('div')),
+        field('Attributes', attrs, 'key=value per line, for your own notes and integrations.')),
       h('div', { class: 'form-section stack' }, h('div', { class: 'row between' }, h('h3', { style: { margin: 0 } }, 'Upstream forwarding (Semtech UDP)'), h('button', { class: 'btn sm', onclick: () => { st.forwarders.push({ name: '', address: '', enabled: true, downlink: false }); renderFw(); } }, icon('plus'), 'Add upstream')), fwHolder),
       h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
         st.location = lat.value && lon.value ? { latitude: Number(lat.value), longitude: Number(lon.value), altitude: Number(alt.value || 0), source: 'user' } : null;
         st.downlink_enabled = dl.input.checked; st.disabled = dis.input.checked;
+        st.min_snr = minSnr.value === '' ? null : Number(minSnr.value);
+        st.attributes = {}; attrs.value.split('\n').forEach((l) => { const i = l.indexOf('='); if (i > 0) st.attributes[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
         try { await api('PUT', '/gateways/' + id, st); toast('Gateway saved'); App.dispatch(); } catch (e) { errToast(e); }
       } }, 'Save changes')))),
     h('div', { class: 'card card-body' }, h('h2', null, 'Delete gateway'), h('p', { class: 'muted' }, 'If auto-registration is enabled the gateway re-appears the next time it connects.'),
@@ -574,19 +572,13 @@ App.route('/live', async () => {
   return h('div', { class: 'stack' }, pageHead([['Live data']], 'Live data', ['Everything received by all gateways']), onboarding, liveView({}));
 });
 
-// ======================= Payload lab =======================
-App.route('/lab', async () => {
-  return h('div', { class: 'stack' }, pageHead([['Decoder lab']], 'Decoder lab', ['Try decoders on the data bytes of a packet (everything after NODE_ID + SERIAL_ID).']),
-    h('div', { class: 'card card-body' }, formatterEditor({ type: 'cayenne_lpp' }, { samplePayload: '0102014A0271FFF500170429036700FC0488000000000000000000050048060004' })),
-    h('div', { class: 'callout small' }, 'When it works, set the same decoder on the node group\'s ', h('b', null, 'Decoder'), ' tab.'));
-});
-
 // ======================= Concentrator =======================
 // ======================= Settings =======================
 async function settingsPage(tab) {
+  if (tab === 'integrations') { location.replace('#/integrations'); return h('div'); }
   const s = await GET('/settings');
   const base = '#/settings';
-  const head = [pageHead([['Settings']], 'Settings'), tabs(base, [['', 'Network server'], ['integrations', 'MQTT & Home Assistant'], ['keys', 'API keys'], ['account', 'Account'], ['system', 'System']], tab)];
+  const head = [pageHead([['Settings']], 'Settings'), tabs(base, [['', 'Network server'], ['keys', 'API keys'], ['account', 'Account'], ['system', 'System']], tab)];
   const save = async (patch) => { try { await api('PUT', '/settings', Object.assign({}, s, patch)); toast('Settings saved'); } catch (e) { errToast(e); } };
   const card = (...k) => h('div', { class: 'card card-body' }, h('div', { class: 'form' }, ...k));
   if (tab === '') {
@@ -616,21 +608,6 @@ async function settingsPage(tab) {
         dedup_window_ms: Number(dedup.value), default_frequency_plan: band.value, net_id: netid.value, dev_addr_prefix: prefix.value, dev_addr_prefix_bits: Number(bits.value), rx1_delay_s: Number(rx1.value),
         auto_register_gateways: auto.input.checked, drop_crc_errors: crc.input.checked, store_gateway_raw_events: raw.input.checked,
         event_retention_hours: Number(ret.value), event_max_rows: Number(rows.value), gateway_offline_after_s: Number(off.value) }) }, 'Save settings'))));
-  }
-  if (tab === 'integrations') {
-    const prefix = inp(s.mqtt_topic_prefix, { class: 'mono' });
-    const ext = s.external_mqtt;
-    const en = checkbox(ext.enabled, 'Publish to an external MQTT broker');
-    const url = inp(ext.url, { class: 'mono', placeholder: 'tcp://192.168.1.10:1883' }), user = inp(ext.username), pass = h('input', { type: 'password', value: ext.password || '' }), cid = inp(ext.client_id, { placeholder: 'lorahub' });
-    const ha = checkbox(s.home_assistant.enabled, 'Home Assistant MQTT discovery', 'Publishes retained discovery configs so every decoded field appears as a sensor in Home Assistant.');
-    const haPrefix = inp(s.home_assistant.discovery_prefix, { class: 'mono' });
-    return h('div', { class: 'stack' }, head, card(
-      field('MQTT topic prefix', prefix, 'Uplinks are published to <prefix>/<application>/devices/<device>/up.'),
-      h('div', { class: 'form-section stack' }, en.el, h('div', { class: 'grid g2' }, field('Broker URL', url), field('Client ID', cid)), h('div', { class: 'grid g2' }, field('Username', user), field('Password', pass))),
-      h('div', { class: 'form-section stack' }, ha.el, field('Discovery prefix', haPrefix)),
-      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: () => save({ mqtt_topic_prefix: prefix.value,
-        external_mqtt: { enabled: en.input.checked, url: url.value, username: user.value, password: pass.value, client_id: cid.value },
-        home_assistant: { enabled: ha.input.checked, discovery_prefix: haPrefix.value } }) }, 'Save settings'))));
   }
   if (tab === 'keys') {
     const keys = await GET('/keys');

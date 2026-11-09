@@ -154,6 +154,9 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 	if freq == 0 || datr == "" {
 		return p.downFailed(d, "no frequency / data rate known yet: wait for a packet from the node or set them in the group settings")
 	}
+	if !g.Downlink || g.Disabled {
+		return p.downFailed(d, "downlinks are turned off for gateway "+g.ID)
+	}
 	dl := p.downlinker(g.Kind)
 	if dl == nil || !dl.CanSend(g.EUI) {
 		return p.downFailed(d, "gateway "+g.ID+" cannot send downlinks right now")
@@ -166,7 +169,7 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 	if power == 0 {
 		power = 14
 	}
-	tx := model.TxPacket{Payload: item.Payload, Frequency: freq, DataRate: datr, CodingRate: cr, Power: power,
+	tx := model.TxPacket{Payload: item.Payload, Frequency: freq, DataRate: datr, CodingRate: cr, Power: TxPowerFor(g, power),
 		InvertPol: cfg.InvertPol, Immediate: fr == nil}
 	if fr != nil {
 		delay := cfg.DelayMs
@@ -174,6 +177,9 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 			delay = 1000
 		}
 		tx.Timestamp = tmst + uint32(delay*1000)
+	}
+	if err := p.reserveAirtime(g, tx); err != nil {
+		return p.downFailed(d, err.Error())
 	}
 	if err := dl.Send(g.EUI, tx); err != nil {
 		return p.downFailed(d, err.Error())

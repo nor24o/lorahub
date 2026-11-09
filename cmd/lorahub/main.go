@@ -106,6 +106,12 @@ func main() {
 			}
 			return ""
 		}
+		srv.ResolvePort = func(eui string) int {
+			if g, err := st.GatewayByEUI(eui); err == nil {
+				return g.ControlPort
+			}
+			return 0
+		}
 		defer srv.Close()
 		proc.RegisterDownlinker("bobcat", srv)
 		log.Info("raw_lora_app (Bobcat) listener", "addr", cfg.Bobcat.Listen, "downlink_port", cfg.Bobcat.DownlinkPort)
@@ -122,6 +128,14 @@ func main() {
 	}
 	defer mq.Close()
 	mq.Device = st.Device
+	mq.Devices = func() []*model.Device { return st.Devices("") }
+	mq.Gateways = func() []string {
+		var ids []string
+		for _, g := range st.Gateways() {
+			ids = append(ids, g.ID)
+		}
+		return ids
+	}
 	go mq.Run(bus, stop)
 
 	report := func(e *model.Event) {
@@ -133,6 +147,7 @@ func main() {
 	go proc.Housekeeping(stop)
 
 	srv := &api.Server{Cfg: cfg, Store: st, Bus: bus, Proc: proc, MQTT: mq, Log: log, Web: web.FS()}
+	go srv.ProbeControlPorts(stop)
 	httpSrv := &http.Server{Addr: cfg.HTTP.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Info("web console listening", "addr", cfg.HTTP.Listen, "version", version)

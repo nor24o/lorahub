@@ -16,10 +16,10 @@ function valueChips(dec) {
 function pollWhileVisible(root, ms, fn) {
   const t = setInterval(() => { if (!root.isConnected) { clearInterval(t); return; } if (!document.hidden) fn(); }, ms);
 }
-function modal(title, body) {
+function modal(title, body, opts = {}) {
   const close = () => bg.remove();
   const bg = h('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) close(); } },
-    h('div', { class: 'modal' }, h('div', { class: 'card-head' }, h('h2', null, title)), h('div', { class: 'card-body' }, body(close))));
+    h('div', { class: 'modal' + (opts.wide ? ' wide' : '') }, h('div', { class: 'card-head' }, h('h2', null, title), h('button', { class: 'icon-btn', title: 'Close', onclick: () => close() }, '✕')), h('div', { class: 'card-body' }, body(close))));
   document.body.append(bg);
 }
 
@@ -94,10 +94,9 @@ App.route('/applications/:app/devices/:dev/messages', async ({ app, dev }) => {
 });
 
 // ======================= Decoder Studio =======================
-const SCHEME_FIELD_TYPES = ['uint8', 'int8', 'uint16_be', 'uint16_le', 'int16_be', 'int16_le', 'uint24_be', 'int24_be', 'uint32_be', 'uint32_le', 'int32_be', 'int32_le', 'float32_be', 'float32_le', 'bool', 'hex', 'ascii'];
-const typeBytes = (t) => (/8/.test(t) && !/float/.test(t) ? 1 : /16/.test(t) ? 2 : /24/.test(t) ? 3 : /32/.test(t) ? 4 : 1);
+const SCHEME_FIELD_TYPES = FIELD_TYPES;
 const MATCH_TYPES = [['prefix', 'Starts with (hex)'], ['size', 'Exact size (bytes)'], ['regex', 'Hex regular expression'], ['condition', 'JavaScript rule'], ['default', 'Catch-all']];
-const DEC_TYPES = [['fields', 'Byte fields'], ['ctv', 'Channel / type / value'], ['cayenne_lpp', 'Cayenne LPP'], ['js', 'JavaScript'], ['javascript', 'JavaScript (decodeUplink)'], ['ascii', 'ASCII text']];
+const DEC_TYPES = [['fields', 'Byte fields'], ['ctv', 'Channel / type / value'], ['cayenne_lpp', 'Cayenne LPP'], ['js', 'JavaScript'], ['javascript', 'JavaScript (decodeUplink)'], ['ascii', 'ASCII text'], ...METHOD_TYPES];
 const JS_TEMPLATE = 'function decodeUplink(input) {\n  // input.bytes starts at the data offset; input.payload is the whole packet\n  return { data: { value: input.bytes[0] } };\n}\n';
 const FIELD_COLORS = ['#1a73e8', '#188038', '#e37400', '#a142f4', '#d93025', '#129eaf', '#b06000', '#c5221f'];
 
@@ -176,13 +175,14 @@ App.route('/decoders', async () => {
     const fieldsBox = h('div');
     const drawFields = () => {
       fieldsBox.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 't compact' },
-        h('thead', null, h('tr', null, ['', 'Name', 'Offset', 'Type', 'Bytes', 'Scale', 'Unit', ''].map((x) => h('th', null, x)))),
+        h('thead', null, h('tr', null, ['', 'Name', 'Offset', 'Type', 'Bytes', 'Scale', 'Add', 'Unit', '', ''].map((x) => h('th', null, x)))),
         h('tbody', null, (s.fields || []).map((f, i) => {
           const type = sel(f.type, SCHEME_FIELD_TYPES);
-          type.addEventListener('change', () => { f.type = type.value; f.length = typeBytes(f.type); drawFields(); touch(); });
+          type.addEventListener('change', () => { f.type = type.value; f.length = f.type === 'checksum' ? 0 : typeBytes(f.type); drawFields(); touch(); });
           const num = (key, step) => { const el = inp(f[key] ?? '', { type: 'number', step, style: { width: '70px' } }); el.addEventListener('input', () => { f[key] = parseFloat(el.value) || 0; touch(); }); return el; };
           const txt = (key, w) => { const el = inp(f[key] ?? '', { style: { width: w } }); el.addEventListener('input', () => { f[key] = el.value; touch(); }); return el; };
-          return h('tr', null, h('td', null, h('i', { class: 'swatch', style: { background: FIELD_COLORS[i % FIELD_COLORS.length] } })), h('td', null, txt('name', '120px')), h('td', null, num('offset', '1')), h('td', null, type), h('td', null, num('length', '1')), h('td', null, num('scale', 'any')), h('td', null, txt('unit', '60px')),
+          return h('tr', null, h('td', null, h('i', { class: 'swatch', style: { background: FIELD_COLORS[i % FIELD_COLORS.length] } })), h('td', null, txt('name', '120px')), h('td', null, num('offset', '1')), h('td', null, type), h('td', null, num('length', '1')), h('td', null, num('scale', 'any')), h('td', null, num('add', 'any')), h('td', null, txt('unit', '60px')),
+            h('td', null, fieldOptionsButton(f, () => { drawFields(); touch(); })),
             h('td', null, h('button', { class: 'icon-btn', title: 'Remove', onclick: () => { s.fields.splice(i, 1); drawFields(); touch(); } }, icon('trash'))));
         })))),
       h('div', { class: 'form-actions', style: { flexWrap: 'wrap', marginTop: '8px' } },
@@ -210,11 +210,13 @@ App.route('/decoders', async () => {
     const code = bind(h('textarea', { rows: 9, class: 'mono', value: s.code || JS_TEMPLATE }), 'code');
     const matchSel = sel(s.matchType, MATCH_TYPES), typeSel = sel(s.type === 'tlv' ? 'ctv' : s.type, DEC_TYPES);
     const mvField = field('Value', matchValue), condField = field('Rule', cond, 'JavaScript returning true. Receives bytes and hex.');
-    const fieldsWrap = h('div', null, h('h3', null, 'Byte fields'), h('p', { class: 'small muted' }, 'Offsets count from the first byte of the packet.'), fieldsBox);
+    const fieldsWrap = h('div', null, h('h3', null, 'Byte fields'), h('p', { class: 'small muted' }, 'Offsets count from the first byte of the packet; a negative offset counts from the end. Bytes -1 reads to the end.'), fieldsBox);
     const codeWrap = field('decodeUplink', code);
     const jsBody = bind(h('textarea', { rows: 9, class: 'mono', value: s.jsCode || 'return { value: bytes[6] };' }), 'jsCode');
     if (!s.jsCode && s.type === 'js') s.jsCode = jsBody.value;
     const jsWrap = field('Decoder', jsBody, 'Receives bytes (whole packet) and hex. Return an object with your values.');
+    const methodBox = h('div');
+    const preBox = h('div', { style: { marginTop: '12px' } }, preEditor(s, touch));
     const sync = () => {
       mvField.style.display = ['prefix', 'size', 'regex'].includes(s.matchType) ? '' : 'none';
       condField.style.display = s.matchType === 'condition' ? '' : 'none';
@@ -222,6 +224,7 @@ App.route('/decoders', async () => {
       codeWrap.style.display = s.type === 'javascript' ? '' : 'none';
       jsWrap.style.display = s.type === 'js' ? '' : 'none';
       if (s.type === 'js' && !s.jsCode) s.jsCode = jsBody.value;
+      methodBox.replaceChildren(...(isMethod(s.type) ? [h('h3', null, 'Method settings'), decodeMethodEditor(s, touch)] : []));
     };
     matchSel.addEventListener('change', () => { s.matchType = matchSel.value; sync(); touch(); });
     typeSel.addEventListener('change', () => { s.type = typeSel.value; sync(); touch(); });
@@ -236,7 +239,7 @@ App.route('/decoders', async () => {
         h('div', { class: 'grid g2' }, field('Applies to packets', matchSel), h('div', null, mvField, condField)),
         h('div', { class: 'grid g2' }, field('Decode as', typeSel), field('Data starts at byte', bind(inp(s.dataOffset ?? 0, { type: 'number', min: 0 }), 'dataOffset', (v) => parseInt(v, 10) || 0))),
         field('Node identity', serialSel, 'Automatic treats a scheme for one NODE_ID with data before byte 6 as having no serial.'),
-        fieldsWrap, codeWrap, jsWrap,
+        fieldsWrap, codeWrap, jsWrap, methodBox, preBox,
         h('div', { class: 'form-actions', style: { marginTop: '12px' } },
           h('button', { class: 'btn', onclick: () => addScheme(Object.assign(JSON.parse(JSON.stringify(s)), { id: '', name: s.name + ' copy' })) }, icon('copy'), 'Duplicate'),
           h('button', { class: 'btn danger', onclick: async () => {

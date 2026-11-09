@@ -50,6 +50,8 @@ type Server struct {
 	MQTT  *integration.MQTT
 	Log   *slog.Logger
 	Web   fs.FS
+
+	tx txState
 }
 
 const cookieName = "lorahub_session"
@@ -124,16 +126,13 @@ func (s *Server) Handler() http.Handler {
 	p("POST /api/concentrator/restart", s.restartConcentrator)
 	p("POST /api/concentrator/service", s.concentratorService)
 	p("POST /api/concentrator/tx", s.concentratorTX)
+	p("GET /api/concentrator/tx/job", s.txJobStatus)
+	p("GET /api/ha/entities", s.haEntities)
+	p("POST /api/ha/republish", s.haRepublish)
+	p("POST /api/ha/remove", s.haRemove)
 	p("GET /api/logs", s.getLogs)
-	p("GET /api/hardware", s.getHardware)
-	p("POST /api/hardware/led", s.setLED)
-	p("POST /api/hardware/gpio", s.setGPIO)
-	p("GET /api/remote/key", s.remoteKey)
 	p("GET /api/gateways/{id}/remote", s.getRemote)
-	p("PUT /api/gateways/{id}/remote", s.putRemote)
 	p("PUT /api/gateways/{id}/remote/config", s.putRemoteConfig)
-	p("POST /api/gateways/{id}/remote/service", s.remoteService)
-	p("GET /api/gateways/{id}/remote/logs", s.remoteLogs)
 
 	// Static web console (SPA)
 	files := http.FileServer(http.FS(s.Web))
@@ -301,7 +300,11 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 // ---------------- overview / system / settings ----------------
 
 func (s *Server) gatewayOnline(g *model.Gateway) bool {
-	return g.LastSeen != nil && time.Since(*g.LastSeen) < time.Duration(s.Proc.Settings().GatewayOfflineSec)*time.Second
+	after := g.OfflineAfter
+	if after <= 0 {
+		after = s.Proc.Settings().GatewayOfflineSec
+	}
+	return g.LastSeen != nil && time.Since(*g.LastSeen) < time.Duration(after)*time.Second
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
@@ -395,7 +398,8 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
-	st := s.Proc.Settings()
+	before := s.Proc.Settings()
+	st := before
 	if err := readJSON(r, &st); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -403,6 +407,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if err := s.Proc.SetSettings(st); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if s.MQTT != nil {
+		go s.MQTT.ReconcileHA(before, s.Proc.Settings())
 	}
 	writeJSON(w, 200, s.Proc.Settings())
 }
@@ -437,6 +444,23 @@ func (s *Server) getGateway(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateGateway(g *model.Gateway) error {
+	for _, p := range []int{g.ControlPort, g.StatusPort} {
+		if p < 0 || p > 65535 {
+			return fmt.Errorf("ports must be between 1 and 65535")
+		}
+	}
+	if g.DutyCyclePct < 0 || g.DutyCyclePct > 100 {
+		return fmt.Errorf("duty cycle must be between 0 and 100 percent")
+	}
+	if g.AntennaGain < 0 || g.AntennaGain > 30 {
+		return fmt.Errorf("antenna gain must be between 0 and 30 dBi")
+	}
+	if g.MinRSSI > 0 {
+		return fmt.Errorf("minimum RSSI must be negative, or 0 for no limit")
+	}
+	if g.OfflineAfter < 0 {
+		return fmt.Errorf("offline timeout cannot be negative")
+	}
 	if !idRe.MatchString(g.ID) {
 		return fmt.Errorf("gateway ID must be 2-36 lowercase letters, digits or dashes")
 	}
@@ -1166,14 +1190,8 @@ func (s *Server) getConcentrator(w http.ResponseWriter, r *http.Request) {
 		out["config_error"] = err.Error()
 	}
 	if s.Cfg.Concentrator.StatusAddr != "" {
-		if c, err := net.DialTimeout("tcp", s.Cfg.Concentrator.StatusAddr, time.Second); err == nil {
-			c.SetDeadline(time.Now().Add(2 * time.Second))
-			b, _ := io.ReadAll(io.LimitReader(c, 8192))
-			c.Close()
-			var st any
-			if json.Unmarshal(b, &st) == nil {
-				out["status"] = st
-			}
+		if st, err := readStatus(s.Cfg.Concentrator.StatusAddr); err == nil {
+			out["status"] = st
 		} else {
 			out["status_error"] = "raw_lora_app status server unreachable: " + err.Error()
 		}

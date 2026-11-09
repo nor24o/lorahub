@@ -29,7 +29,7 @@ mqtt_broker:
   # username: lorahub
   # password: change-me
 
-# Local concentrator management (Concentrator page)
+# Local concentrator management (Radio config page)
 concentrator:
   config_path: /etc/lora/config.json
   restart_command: "systemctl restart raw-lora"
