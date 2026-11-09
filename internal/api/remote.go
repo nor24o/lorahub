@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nor24o/lorahub/internal/ingest"
 	"github.com/nor24o/lorahub/internal/model"
 )
 
@@ -41,27 +42,69 @@ func readStatus(addr string) (json.RawMessage, error) {
 	return b, nil
 }
 
+// linkInfo is what a gateway last reported about its link.
+type linkInfo struct {
+	Link int  `json:"link"`
+	Auth bool `json:"auth"`
+}
+
+func linkOf(g *model.Gateway) linkInfo {
+	var l linkInfo
+	if len(g.LastStatus) > 0 {
+		json.Unmarshal(g.LastStatus, &l)
+	}
+	return l
+}
+
+// linkWire builds a command for a gateway, signing it when the gateway is
+// paired. The result is called again if the gateway asks for a fresh nonce.
+func (s *Server) linkWire(g *model.Gateway, req map[string]any) func(nonce string) []byte {
+	l := linkOf(g)
+	if l.Link >= ingest.LinkVersion {
+		req["request_id"] = ingest.NewRequestID()
+	}
+	payload, _ := json.Marshal(req)
+	key := s.Proc.Settings().LinkKey
+	return func(nonce string) []byte {
+		if l.Link >= ingest.LinkVersion && l.Auth && key != "" {
+			return ingest.SignLink(key, nonce, payload)
+		}
+		return payload
+	}
+}
+
 // controlExchange sends one command and waits for the reply of type want.
-func controlExchange(host string, port int, req any, want string, timeout time.Duration) (map[string]any, error) {
+func controlExchange(host string, port int, wire func(nonce string) []byte, want string, timeout time.Duration) (map[string]any, error) {
 	c, err := net.Dial("udp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
 	defer c.Close()
-	b, _ := json.Marshal(req)
-	if _, err := c.Write(b); err != nil {
+	if _, err := c.Write(wire(ingest.StubNonce)); err != nil {
 		return nil, err
 	}
 	c.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 8192)
+	retried := false
+	buf := make([]byte, 16384)
 	for {
 		n, err := c.Read(buf)
 		if err != nil {
 			return nil, fmt.Errorf("no answer from raw_lora_app on UDP port %d", port)
 		}
 		var m map[string]any
-		if json.Unmarshal(buf[:n], &m) == nil && m["msg_type"] == want {
+		if json.Unmarshal(buf[:n], &m) != nil {
+			continue
+		}
+		switch m["msg_type"] {
+		case want:
 			return m, nil
+		case "auth_required":
+			nonce, _ := m["nonce"].(string)
+			if retried || nonce == "" {
+				return nil, errors.New("the gateway rejected LoRaHub's link key")
+			}
+			retried = true
+			c.Write(wire(nonce))
 		}
 	}
 }
@@ -128,7 +171,7 @@ func (s *Server) discoverControl(g *model.Gateway, t remoteTarget) (map[string]a
 	}
 	var last error
 	for _, p := range ports {
-		m, err := controlExchange(t.host, p, map[string]string{"cmd": "get_config"}, "config_resp", controlTimeout)
+		m, err := controlExchange(t.host, p, s.linkWire(g, map[string]any{"cmd": "get_config", "full": true}), "config_resp", controlTimeout)
 		if err != nil {
 			last = err
 			continue
@@ -170,6 +213,7 @@ func (s *Server) getRemote(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		out["config"] = cfg
+		out["link"] = linkOf(g)
 	case out["status"] != nil:
 		out["error"] = "This gateway reports its status but does not answer remote settings commands. Its raw_lora_app build is too old for this, or its control port is wrong (see the gateway's Settings tab). Live status and TX test still work if the port is right."
 	default:
@@ -178,8 +222,9 @@ func (s *Server) getRemote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// validateRemote checks the settings raw_lora_app accepts over set_config.
-func validateRemote(cfg map[string]any) error {
+// validateRemote checks settings for a gateway. Current engines take any
+// setting of their config file; older ones only the original few.
+func validateRemote(cfg map[string]any, full bool) error {
 	allowed := map[string]bool{"rf0_freq": true, "rf1_freq": true, "tx_default_freq": true, "tx_default_power": true, "sync_word": true, "target_ip": true, "port_up": true}
 	if len(cfg) == 0 {
 		return errors.New("nothing to change")
@@ -194,7 +239,7 @@ func validateRemote(cfg map[string]any) error {
 	for k := range cfg {
 		var err error
 		switch {
-		case !allowed[k]:
+		case k == "link_key", !allowed[k] && !full:
 			err = fmt.Errorf("%s cannot be changed remotely", k)
 		case k == "rf0_freq", k == "rf1_freq", k == "tx_default_freq":
 			err = num(k, 100e6, 1100e6)
@@ -234,11 +279,11 @@ func (s *Server) putRemoteConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := validateRemote(cfg); err != nil {
+	if err := validateRemote(cfg, linkOf(g).Link >= ingest.LinkVersion); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	ack, err := controlExchange(t.host, t.controlPort, map[string]any{"cmd": "set_config", "config": cfg}, "config_ack", applyTimeout)
+	ack, err := controlExchange(t.host, t.controlPort, s.linkWire(g, map[string]any{"cmd": "set_config", "config": cfg}), "config_ack", applyTimeout)
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return

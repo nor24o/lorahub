@@ -1,7 +1,7 @@
 /* LoRaHub console — pages. */
 'use strict';
 
-const KIND_LABEL = { bobcat: 'Bobcat (raw_lora_app)', semtech_udp: 'Semtech UDP', http: 'HTTP', simulated: 'Simulated' };
+const KIND_LABEL = { bobcat: 'LoRaHub link (raw_lora_app)', semtech_udp: 'Semtech UDP', http: 'HTTP', simulated: 'Simulated' };
 
 // ======================= Overview =======================
 App.route('/', async () => {

@@ -3,6 +3,7 @@ package processor
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nor24o/lorahub/internal/model"
 )
@@ -63,5 +64,47 @@ func TestDutyCycleLimit(t *testing.T) {
 	}
 	if err := p.reserveAirtime(&model.Gateway{ID: "free"}, tx); err != nil {
 		t.Fatalf("no limit configured: %v", err)
+	}
+}
+
+func TestReverseEUI(t *testing.T) {
+	if got := reverseEUI("0016C001F1225507"); got != "075522F101C01600" {
+		t.Fatal(got)
+	}
+	if reverseEUI("ABC") != "" {
+		t.Fatal("short EUI")
+	}
+}
+
+func TestLinkStatusCorrectsGateway(t *testing.T) {
+	p, st, _, _ := setup(t)
+	now := time.Now().UTC()
+	if err := st.SaveGateway(&model.Gateway{ID: "eui-075522f101c01600", EUI: "075522F101C01600", Name: "Bobcat C01600", Kind: "bobcat", Downlink: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.HandleStatus("0016C001F1225507", "bobcat", "192.168.1.17", map[string]any{"port_down": 1700.0, "status_port": 5557.0, "model": "dragino-lps8"}) {
+		t.Fatal("status refused")
+	}
+	g, err := st.Gateway("eui-075522f101c01600")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.EUI != "0016C001F1225507" || g.ControlPort != 1700 || g.StatusPort != 5557 || g.Name != "Dragino LPS8 225507" {
+		t.Fatalf("%+v", g)
+	}
+	if n := len(st.Gateways()); n != 1 {
+		t.Fatalf("%d gateways", n)
+	}
+	st.UpdateGateway(g.ID, true, func(x *model.Gateway) { x.Name = "Roof" })
+	p.HandleStatus("0016C001F1225507", "bobcat", "192.168.1.17", map[string]any{"model": "dragino-lps8"})
+	if g, _ := st.Gateway(g.ID); g.Name != "Roof" {
+		t.Fatalf("a name the owner chose must stay: %s", g.Name)
+	}
+}
+
+func TestLinkKeyIsGenerated(t *testing.T) {
+	p, _, _, _ := setup(t)
+	if len(p.Settings().LinkKey) != 48 || !p.Settings().LinkAutoPair {
+		t.Fatalf("%q", p.Settings().LinkKey)
 	}
 }

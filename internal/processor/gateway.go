@@ -3,6 +3,7 @@ package processor
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/nor24o/lorahub/internal/band"
@@ -80,4 +81,66 @@ func (p *Processor) reserveAirtime(g *model.Gateway, tx model.TxPacket) error {
 	}
 	p.duty[g.ID] = append(kept, dutyEntry{now, ms})
 	return nil
+}
+
+func reverseEUI(eui string) string {
+	if len(eui) != 16 {
+		return ""
+	}
+	var b strings.Builder
+	for i := 14; i >= 0; i -= 2 {
+		b.WriteString(eui[i : i+2])
+	}
+	return b.String()
+}
+
+// adoptReversedEUI corrects a gateway registered from a big-endian binary
+// heartbeat, which older engines sent, so it keeps its identity and history.
+func (p *Processor) adoptReversedEUI(eui, kind string) *model.Gateway {
+	if kind != "bobcat" {
+		return nil
+	}
+	eui = strings.ToUpper(eui)
+	g, err := p.store.GatewayByEUI(reverseEUI(eui))
+	if err != nil {
+		return nil
+	}
+	if err := p.store.UpdateGateway(g.ID, true, func(x *model.Gateway) { x.EUI = eui }); err != nil {
+		p.log.Warn("correct gateway EUI", "gateway", g.ID, "err", err)
+		return nil
+	}
+	p.log.Info("corrected gateway EUI", "gateway", g.ID, "eui", eui)
+	g.EUI = eui
+	return g
+}
+
+var modelNames = map[string]string{"dragino-lps8": "Dragino LPS8", "bobcat-300": "Bobcat 300"}
+
+// applyLinkStatus takes the ports and model a gateway reports about itself.
+func (p *Processor) applyLinkStatus(g *model.Gateway, status map[string]any) {
+	if status == nil {
+		return
+	}
+	down, _ := num(status["port_down"])
+	stat, _ := num(status["status_port"])
+	name := g.Name
+	if label := modelNames[fmt.Sprint(status["model"])]; label != "" && len(g.EUI) == 16 {
+		// Only a name LoRaHub chose itself when it first saw the gateway.
+		if i := strings.LastIndexByte(g.Name, ' '); i > 0 && len(g.Name)-i == 7 && g.Name[:i] == kindLabel("bobcat") {
+			name = label + " " + g.EUI[10:]
+		}
+	}
+	wantDown, wantStat := int(down), int(stat)
+	if name == g.Name && (wantDown == 0 || wantDown == g.ControlPort) && (wantStat == 0 || wantStat == g.StatusPort) {
+		return
+	}
+	p.store.UpdateGateway(g.ID, true, func(x *model.Gateway) {
+		x.Name = name
+		if wantDown > 0 {
+			x.ControlPort = wantDown
+		}
+		if wantStat > 0 {
+			x.StatusPort = wantStat
+		}
+	})
 }

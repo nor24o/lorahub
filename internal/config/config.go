@@ -105,6 +105,8 @@ type Settings struct {
 	EventMaxRows         int    `json:"event_max_rows"`
 	StoreGatewayRaw      bool   `json:"store_gateway_raw_events"`
 	GatewayOfflineSec    int    `json:"gateway_offline_after_s"`
+	LinkKey              string `json:"link_key"`       // shared with paired raw_lora_app gateways
+	LinkAutoPair         bool   `json:"link_auto_pair"` // give the key to gateways that have none
 
 	MQTTTopicPrefix string `json:"mqtt_topic_prefix"`
 	ExternalMQTT    struct {
@@ -163,6 +165,7 @@ func DefaultSettings() Settings {
 		EventMaxRows:         200000,
 		StoreGatewayRaw:      true,
 		GatewayOfflineSec:    120,
+		LinkAutoPair:         true,
 		MQTTTopicPrefix:      "lorahub",
 		PacketFormat:         PacketFormat{NodeIDOffset: 0, NodeIDLength: 2, SerialOffset: 2, SerialLength: 4, DataOffset: 6},
 	}

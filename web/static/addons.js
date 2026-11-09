@@ -5,7 +5,8 @@ function statTile(label, value) { return h('div', { class: 'card stat' }, h('div
 function statusTiles(st) {
   return h('div', { class: 'grid g4' }, statTile('Uptime', fmtDur(st.uptime_s)), statTile('Received', st.rx), statTile('Transmitted', st.tx), statTile('CRC errors', st.crc_err),
     statTile('TX errors', st.tx_err), statTile('Queue / dropped', `${st.q_depth} / ${st.q_drop}`), statTile('Chip temperature', st.temp_ok ? st.temp_c + ' °C' : '—'), statTile('Sync word', st.sync),
-    statTile('RX state', st.rx_status), statTile('TX state', st.tx_status), statTile('Radio 0', st.rf0_mhz + ' MHz'), statTile('Radio 1', st.rf1_mhz + ' MHz'));
+    statTile('RX state', st.rx_status), statTile('TX state', st.tx_status), statTile('Radio 0', st.rf0_mhz + ' MHz'), statTile('Radio 1', st.rf1_mhz + ' MHz'),
+    ...(st.link ? [statTile('Link to hub', (st.link_peer ? 'Reliable' : 'Waiting') + (st.auth ? ', signed' : ', not paired')), statTile('Repeated / lost', `${st.link_retx} / ${st.link_lost}`), statTile('Engine', `${st.engine} · ${st.model}`)] : []));
 }
 function channelBars(st) {
   const counts = st.ch_detect || [], peak = Math.max(1, ...counts);
@@ -53,7 +54,7 @@ App.route('/status', async () => {
 });
 
 // ======================= Radio configuration =======================
-function radioEditor(cfg, save) {
+function radioEditor(cfg, save, opts = {}) {
   const st = JSON.parse(JSON.stringify(cfg));
   const holder = h('div');
   let raw = false;
@@ -104,7 +105,8 @@ function radioEditor(cfg, save) {
     return h('div', null, h('div', { class: 'table-wrap card' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, [...['Power (dBm)', 'PA gain', 'Power index', 'DAC gain', 'Mixer gain', 'Digital gain'], ''].map((x) => h('th', null, x)))), body)),
       h('button', { class: 'btn sm', style: { marginTop: '8px' }, disabled: st.tx_gain_lut.length >= 16, onclick: () => { st.tx_gain_lut.push({ rf_power: 14, pa_gain: 0, pwr_idx: 0, dac_gain: 0, mix_gain: 0, dig_gain: 0 }); draw(); } }, icon('plus'), 'Add row'));
   };
-  const saveBtn = (getter) => h('div', { class: 'form-actions' },
+  const saveBtn = (getter) => opts.remote ? h('div', { class: 'form-actions' },
+    h('button', { class: 'btn primary', onclick: async () => { try { await save(getter(), true); } catch (e) { errToast(e); } } }, 'Apply to gateway')) : h('div', { class: 'form-actions' },
     h('button', { class: 'btn', onclick: async () => { try { await save(getter(), false); toast('Saved. Restart to apply.'); } catch (e) { errToast(e); } } }, 'Save'),
     h('button', { class: 'btn primary', onclick: async () => { try { await save(getter(), true); toast('Saved and restarting'); } catch (e) { errToast(e); } } }, 'Save and restart'));
   const draw = () => {
@@ -312,7 +314,20 @@ async function radioPanel(g) {
       return;
     }
     const facts = h('dl', { class: 'kv small' }, h('dt', null, 'Address'), h('dd', { class: 'mono' }, r.host), h('dt', null, 'Control port'), h('dd', { class: 'mono' }, 'UDP ' + r.control_port), h('dt', null, 'Status port'), h('dd', { class: 'mono' }, 'TCP ' + r.status_port));
-    body.replaceChildren(h('div', { class: 'card card-body' }, h('h2', null, 'Connection'), facts), r.config ? remoteForm(g, r, () => load().catch(errToast)) : h('div', { class: 'callout warn' }, r.error || 'The gateway did not answer.'));
+    const full = r.config && r.config.config;
+    const applyFull = async (cfg) => {
+      const d = {};
+      Object.keys(cfg).forEach((k) => { if (JSON.stringify(cfg[k]) !== JSON.stringify(full[k])) d[k] = cfg[k]; });
+      if (!Object.keys(d).length) { toast('Nothing changed'); return; }
+      const leaves = d.target_ip !== undefined || d.port_up !== undefined;
+      const text = leaves ? 'The gateway will send its packets to the new address. If that address is wrong, it disappears from LoRaHub and has to be fixed on the gateway itself.' : 'The radio restarts to apply this, so reception pauses for a moment. If the radio will not start with these settings, the gateway restores the previous ones.';
+      if (!(await confirmModal('Apply to ' + (g.name || g.gateway_id), text, 'Apply', Boolean(leaves)))) return;
+      await api('PUT', `/gateways/${g.gateway_id}/remote/config`, d);
+      toast('Applied by the gateway');
+      load().catch(errToast);
+    };
+    body.replaceChildren(h('div', { class: 'card card-body' }, h('h2', null, 'Connection'), facts),
+      full ? radioEditor(full, applyFull, { remote: true }) : r.config ? remoteForm(g, r, () => load().catch(errToast)) : h('div', { class: 'callout warn' }, r.error || 'The gateway did not answer.'));
   };
   await load();
   const root = h('div', { class: 'stack' }, live, body);

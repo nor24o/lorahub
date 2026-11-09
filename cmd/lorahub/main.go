@@ -106,6 +106,8 @@ func main() {
 			}
 			return ""
 		}
+		srv.LinkKey = func() string { return proc.Settings().LinkKey }
+		srv.AutoPair = func() bool { return proc.Settings().LinkAutoPair }
 		srv.ResolvePort = func(eui string) int {
 			if g, err := st.GatewayByEUI(eui); err == nil {
 				return g.ControlPort

@@ -65,11 +65,21 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 ## Addon pages (web/static/addons.js, integrations.js, lab.js, internal/api/addons.go, remote.go)
 Realtime status, Radio config, TX test, Remote config, Logs, Decoder lab, MQTT & Home Assistant (publishing, commands,
 per-entity exposure). GPIO and Pinout pages were removed on request.
-Remote config does NOT use SSH (owner's requirement). It uses raw_lora_app's own commands: `{"cmd":"get_config"}` and
-`{"cmd":"set_config","config":{...}}` on the UDP downlink port, status JSON on TCP 5557. set_config only accepts rf0_freq,
-rf1_freq, sync_word, tx_default_power, tx_default_freq, target_ip, port_up. The Dragino at .17 got these commands on 2026-11-09 (previous
-binary kept at /etc/lora/raw_lora_app.before-remote). Its source is targets/sx1302/src in ~/2027_Latest_LORA/custom-lps8-firmware
-on WSL Ubuntu-18.04, toolchain ~/openwrt/openwrt/staging_dir/toolchain-mips_24kc_gcc-7.5.0_musl. Its port_down is 1700; the hub detects it.
+Remote config does NOT use SSH (owner's requirement); it uses the raw_lora_app link below.
+
+## Gateway roles and link
+The Bobcat is the main server: LoRaHub plus its own raw_lora_app. The Dragino LPS8 at .17 is only a satellite: it runs
+raw_lora_app, sends uplinks to the Bobcat and receives config and downlinks. Decoding, MQTT and Home Assistant are on the Bobcat.
+One raw_lora_app.c serves both (GATEWAY_MODEL comes from the CPU); keep the copies in both firmware trees identical:
+~/bobcat-miner-300/sx1302_hal (built natively on the Bobcat) and ~/2027_Latest_LORA/custom-lps8-firmware/targets/sx1302/src
+(WSL Ubuntu-18.04, toolchain ~/openwrt/openwrt/staging_dir/toolchain-mips_24kc_gcc-7.5.0_musl).
+Link protocol 2 (internal/ingest/link.go), UDP for latency: uplink and status datagrams carry seq and boot, the hub replies
+`{"msg_type":"ack","seq":N}`, the engine repeats unacknowledged ones for about 12 s, the hub drops duplicates. Hub to gateway
+commands are `L2:<nonce>:<hmac-sha256>:<json>`, nonce published in status; link_key is in config.json on the gateway and
+Settings.LinkKey on the hub, paired automatically with `set_link_key` when the gateway has none. To re-pair after losing the hub's key,
+remove link_key from the gateway's config.json and restart raw_lora_app. get_config with full:true returns the config file;
+set_config merges any settings and restores the previous ones if the radio will not start. Downlinks are confirmed with tx_ack.
+Engines without link 2 keep working with plain datagrams.
 
 ## Deploying
 Windows PC has Go 1.27 in `C:/Program Files/Go/bin`. Key login works on .15 and .17 (.17 needs

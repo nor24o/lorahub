@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nor24o/lorahub/internal/ingest"
 	"github.com/nor24o/lorahub/internal/model"
 	"github.com/nor24o/lorahub/internal/processor"
 )
@@ -218,6 +219,32 @@ func udpSend(addr string, msg map[string]any) error {
 	return err
 }
 
+// sendTX hands a transmission to the engine. A current engine confirms that
+// it has the packet, so a failure is reported instead of silently lost.
+func (s *Server) sendTX(g *model.Gateway, addr string, msg map[string]any) error {
+	if g == nil || linkOf(g).Link < ingest.LinkVersion {
+		return udpSend(addr, msg)
+	}
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	port, _ := strconv.Atoi(portText)
+	m := map[string]any{}
+	for k, v := range msg {
+		m[k] = v
+	}
+	ack, err := controlExchange(host, port, s.linkWire(g, m), "tx_ack", 1500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	switch ack["status"] {
+	case "queued", "sent", "aborted":
+		return nil
+	}
+	return fmt.Errorf("the gateway refused the transmission: %v", ack["status"])
+}
+
 // concentratorTX hands a test transmission straight to raw_lora_app, on this
 // machine or on a satellite, once or as a timed sequence.
 func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +265,7 @@ func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
 			s.tx.running = false
 		}
 		s.tx.Unlock()
-		if err := udpSend(addr, map[string]any{"abort": true, "rfch": req.RFChain}); err != nil {
+		if err := s.sendTX(g, addr, map[string]any{"abort": true, "rfch": req.RFChain}); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -265,8 +292,8 @@ func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Count == 1 && req.DelayMs == 0 {
 		msg := txMessage(&req, payload(0))
-		if err := udpSend(addr, msg); err != nil {
-			writeErr(w, 500, err.Error())
+		if err := s.sendTX(g, addr, msg); err != nil {
+			writeErr(w, 502, err.Error())
 			return
 		}
 		writeJSON(w, 200, map[string]any{"sent": msg})
@@ -281,11 +308,11 @@ func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
 	stop := make(chan struct{})
 	s.tx.running, s.tx.sent, s.tx.total, s.tx.lastErr, s.tx.stop = true, 0, req.Count, "", stop
 	s.tx.Unlock()
-	go s.runTXJob(addr, req, payload, stop)
+	go s.runTXJob(g, addr, req, payload, stop)
 	writeJSON(w, 200, map[string]any{"job": true, "total": req.Count, "power": req.Power})
 }
 
-func (s *Server) runTXJob(addr string, req txRequest, payload func(int) []byte, stop <-chan struct{}) {
+func (s *Server) runTXJob(g *model.Gateway, addr string, req txRequest, payload func(int) []byte, stop <-chan struct{}) {
 	wait := func(ms int) bool {
 		select {
 		case <-stop:
@@ -298,7 +325,7 @@ func (s *Server) runTXJob(addr string, req txRequest, payload func(int) []byte, 
 		return
 	}
 	for i := 0; i < req.Count; i++ {
-		err := udpSend(addr, txMessage(&req, payload(i)))
+		err := s.sendTX(g, addr, txMessage(&req, payload(i)))
 		s.tx.Lock()
 		if err != nil {
 			s.tx.lastErr = err.Error()

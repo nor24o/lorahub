@@ -70,6 +70,12 @@ func New(st *store.Store, bus *events.Bus, log *slog.Logger) *Processor {
 		dedup: map[string]*dedupEntry{}, forwarders: map[string][]*ingest.Forwarder{}, Started: time.Now()}
 	s := config.DefaultSettings()
 	st.GetSetting("settings", &s)
+	if s.LinkKey == "" {
+		s.LinkKey = store.NewToken(24)
+		if err := st.SetSetting("settings", s); err != nil {
+			log.Warn("save link key", "err", err)
+		}
+	}
 	p.settings = s
 	p.loadPipeline()
 	return p
@@ -148,6 +154,9 @@ func (p *Processor) resolveGateway(eui, kind, addr string) (*model.Gateway, bool
 	if err == nil {
 		return g, !g.Disabled
 	}
+	if g := p.adoptReversedEUI(eui, kind); g != nil {
+		return g, !g.Disabled
+	}
 	if !p.Settings().AutoRegisterGateways {
 		return nil, false
 	}
@@ -215,6 +224,7 @@ func (p *Processor) HandleStatus(eui, kind, addr string, status map[string]any) 
 			Summary: fmt.Sprintf("Gateway connected via %s from %s", kindLabel(kind), addr),
 			Data:    map[string]any{"gateway_id": g.ID, "eui": g.EUI, "addr": addr, "kind": kind}}, true)
 	}
+	p.applyLinkStatus(g, status)
 	if status != nil {
 		p.emit(&model.Event{Name: "gs.status", Gateways: []string{g.ID}, Summary: "Gateway status", Data: status}, false)
 		p.forwardStatus(g, status)
