@@ -55,6 +55,7 @@ App.route('/lab', async () => {
   let bytes = hexToBytes((packets[0] && packets[0].hex) || 'CAFE96B840EB0102014A0271FFF500170429036700FC');
   let sel0 = Math.min(pf.data_offset, Math.max(bytes.length - 1, 0)), sel1 = sel0;
   let mode = 'pipeline';
+  const coarse = matchMedia('(pointer: coarse)').matches;
 
   const hexIn = h('textarea', { class: 'mono', rows: 2, spellcheck: 'false', value: bytesToHex(bytes) });
   const picker = sel('', [['', packets.length ? 'Recent packets…' : 'No recent packets'], ...packets.map((p, i) => [i, p.label])], { onchange: (e) => { if (e.target.value !== '') setPacket(packets[Number(e.target.value)].hex); } });
@@ -87,13 +88,13 @@ App.route('/lab', async () => {
   function paintMap() {
     const lo = Math.min(sel0, sel1), hi = Math.max(sel0, sel1);
     map.replaceChildren(...bytes.map((b, i) => h('button', { class: `lab-byte ${region(i)}${i >= lo && i <= hi ? ' sel' : ''}`, title: `Byte ${i}`, onclick: (e) => {
-      if (e.shiftKey) sel1 = i; else sel0 = sel1 = i;
+      if (e.shiftKey || (coarse && sel0 === sel1 && i !== sel0)) sel1 = i; else sel0 = sel1 = i;
       paintMap(); paintInspector();
     } }, h('small', null, i), b.toString(16).padStart(2, '0').toUpperCase())));
     const node = bytesToHex(bytes.slice(pf.node_id_offset, pf.node_id_offset + pf.node_id_length));
     const serial = bytesToHex(bytes.slice(pf.serial_offset, pf.serial_offset + pf.serial_length));
     facts.replaceChildren(h('span', { class: 'chip' }, h('b', null, 'length '), bytes.length + ' B'), h('span', { class: 'chip c-node' }, h('b', null, 'NODE_ID '), node || '—'), h('span', { class: 'chip c-serial' }, h('b', null, 'SERIAL '), serial || '—'), h('span', { class: 'chip c-data' }, h('b', null, 'data '), Math.max(0, bytes.length - pf.data_offset) + ' B'),
-      h('span', { class: 'small muted' }, 'Click a byte to inspect it. Shift-click selects a range.'));
+      h('span', { class: 'small muted' }, coarse ? 'Tap a byte to inspect it. Tap another to select the range between them.' : 'Click a byte to inspect it. Shift-click selects a range.'));
   }
 
   function paintInspector() {

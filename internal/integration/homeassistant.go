@@ -7,7 +7,9 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nor24o/lorahub/internal/config"
 	"github.com/nor24o/lorahub/internal/model"
@@ -32,23 +34,113 @@ func (m *MQTT) handleSet(appID, devID string, payload []byte) {
 	if err := m.downlink(appID, devID, 1, b, nil, false, false); err != nil {
 		m.log.Warn("mqtt set", "group", appID, "node", devID, "err", err)
 	}
+	m.flashCommandBox(appID, devID, cmd)
 }
 
-// nodeState publishes the flat retained state of a node and keeps its Home
-// Assistant entities up to date. raw is the JSON of the as.up message.
-func (m *MQTT) nodeState(e *model.Event, s config.Settings, raw []byte) {
-	var msg struct {
-		Decoded      map[string]any   `json:"decoded"`
-		Gateways     []map[string]any `json:"gateways"`
-		Radio        map[string]any   `json:"radio"`
-		PayloadHex   string           `json:"payload_hex"`
-		Size         int              `json:"size"`
-		GatewayCount int              `json:"gateway_count"`
-		ReceivedAt   string           `json:"received_at"`
+// commandBoxHold is how long a sent command stays visible in the Send downlink box.
+const commandBoxHold = 1500 * time.Millisecond
+
+func commandBoxTopic(s config.Settings, appID, devID string) string {
+	return fmt.Sprintf("%s/%s/%s/command_box", s.MQTTTopicPrefix, appID, devID)
+}
+
+func commandBoxValue(v string) []byte {
+	b, _ := json.Marshal(map[string]string{"value": v})
+	return b
+}
+
+// flashCommandBox shows a command in the Send downlink box, then empties it.
+// Home Assistant only sends a value that differs from the entity's state, so
+// the box has to return to empty before the same command can be sent again.
+func (m *MQTT) flashCommandBox(appID, devID, value string) {
+	s := m.settings()
+	if s.HomeAssistant.Enabled {
+		m.flash(commandBoxTopic(s, appID, devID), value)
 	}
-	if err := json.Unmarshal(raw, &msg); err != nil {
+}
+
+func (m *MQTT) flash(topic, value string) {
+	m.publish(topic, commandBoxValue(value), true)
+	time.AfterFunc(commandBoxHold, func() { m.publish(topic, commandBoxValue(""), true) })
+}
+
+func controlTopic(s config.Settings, appID, devID, key string) string {
+	return fmt.Sprintf("%s/%s/%s/cmd/%s", s.MQTTTopicPrefix, appID, devID, key)
+}
+
+func findControl(d *model.Device, key string) *model.HACommand {
+	for i := range d.HACommands {
+		if c := &d.HACommands[i]; c.Dynamic() && c.Key() == key {
+			return c
+		}
+	}
+	return nil
+}
+
+// controlValue is what a dynamic command shows: its last value, or the minimum
+// so a number never starts out unknown.
+func controlValue(d *model.Device, c *model.HACommand) string {
+	if c.Kind != "number" {
+		return ""
+	}
+	last := d.HAValues[c.Key()]
+	if v, err := strconv.ParseFloat(last, 64); err == nil && v >= c.Min && v <= c.Max {
+		return last
+	}
+	return strconv.FormatFloat(c.Min, 'f', -1, 64)
+}
+
+// handleControl sends a value given to a dynamic command on
+// <prefix>/<group>/<node>/cmd/<key>. Only class C nodes have these: they
+// listen all the time, so the value takes effect when it is set.
+func (m *MQTT) handleControl(appID, devID, key string, payload []byte) {
+	if m.Device == nil {
 		return
 	}
+	d, err := m.Device(appID, devID)
+	if err != nil {
+		m.log.Warn("mqtt control", "group", appID, "node", devID, "err", err)
+		return
+	}
+	c := findControl(d, key)
+	if c == nil || d.Class != "C" {
+		m.log.Warn("mqtt control: no such control on a class C node", "group", appID, "node", devID, "control", key)
+		return
+	}
+	topic := controlTopic(m.settings(), appID, devID, key) + "/state"
+	value := strings.TrimSpace(string(payload))
+	b, err := c.Render(value)
+	if err == nil {
+		err = m.downlink(appID, devID, 1, b, nil, false, false)
+	}
+	if err != nil {
+		m.log.Warn("mqtt control", "group", appID, "node", devID, "control", key, "err", err)
+		m.publish(topic, commandBoxValue(controlValue(d, c)), true) // back to what the node last got
+		return
+	}
+	if c.Kind == "text" {
+		m.flash(topic, value)
+		return
+	}
+	m.publish(topic, commandBoxValue(value), true)
+	if m.SaveControlValue != nil {
+		m.SaveControlValue(appID, devID, key, value)
+	}
+}
+
+type upMessage struct {
+	Decoded      map[string]any   `json:"decoded"`
+	Gateways     []map[string]any `json:"gateways"`
+	Radio        map[string]any   `json:"radio"`
+	PayloadHex   string           `json:"payload_hex"`
+	Size         int              `json:"size"`
+	GatewayCount int              `json:"gateway_count"`
+	ReceivedAt   string           `json:"received_at"`
+	Simulated    bool             `json:"simulated"`
+}
+
+// flatState builds a node's flat state from an as.up message.
+func flatState(msg *upMessage) ([]byte, string) {
 	state := map[string]any{}
 	for k, v := range flatten(msg.Decoded) {
 		state[k] = v
@@ -65,9 +157,24 @@ func (m *MQTT) nodeState(e *model.Event, s config.Settings, raw []byte) {
 	}
 	state["datr"] = msg.Radio["data_rate"]
 	b, _ := json.Marshal(state)
+	return b, gateway
+}
+
+func stateTopic(s config.Settings, appID, devID string) string {
+	return fmt.Sprintf("%s/%s/%s/state", s.MQTTTopicPrefix, appID, devID)
+}
+
+// nodeState publishes the flat retained state of a node and keeps its Home
+// Assistant entities up to date. raw is the JSON of the as.up message.
+func (m *MQTT) nodeState(e *model.Event, s config.Settings, raw []byte) {
+	var msg upMessage
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Simulated { // test packets never reach Home Assistant
+		return
+	}
+	b, gateway := flatState(&msg)
 	// Home Assistant's node entities read this topic.
 	if s.MQTTPublish.State || s.HomeAssistant.Enabled {
-		m.publish(fmt.Sprintf("%s/%s/%s/state", s.MQTTTopicPrefix, e.AppID, e.DevID), b, s.MQTTPublish.StateRetain || s.HomeAssistant.Enabled)
+		m.publish(stateTopic(s, e.AppID, e.DevID), b, s.MQTTPublish.StateRetain || s.HomeAssistant.Enabled)
 	}
 
 	if !s.HomeAssistant.Enabled || m.Device == nil || len(msg.Decoded) == 0 {
@@ -124,12 +231,21 @@ func hiddenReason(d *model.Device, e haEntity, s config.Settings) string {
 	}
 	switch e.category {
 	case "diagnostic":
+		if e.key == "hex" {
+			if !ha.LastPayload {
+				return "last payload turned off"
+			}
+			return ""
+		}
 		if !slices.Contains(ha.Diagnostics, e.key) {
 			return "diagnostic turned off"
 		}
-	case "control":
+	case "control", "dynamic":
 		if !ha.Switches || !s.MQTTCommands.AcceptSet {
-			return "switches turned off"
+			return "commands turned off"
+		}
+		if e.category == "dynamic" && d.Class != "C" {
+			return "class C nodes only"
 		}
 	default:
 		for _, pat := range ha.ExcludeFields {
@@ -193,10 +309,20 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	isSwitch := d.Class == "C" || strings.Contains(strings.ToLower(d.Model), "valve") ||
+	isSwitch := d.Class == "C" || d.HASwitch || strings.Contains(strings.ToLower(d.Model), "valve") ||
 		strings.Contains(strings.ToLower(d.Model), "relay") || strings.Contains(strings.ToLower(d.Model), "actuator")
 	_, hasState := flat["state"]
 	cmd := fmt.Sprintf("%s/%s/%s/set", s.MQTTTopicPrefix, d.AppID, d.ID)
+	command := func(component, key, name string, extra map[string]any) {
+		cfg := map[string]any{"name": name, "has_entity_name": true, "unique_id": sanitize(id + "_" + key), "command_topic": cmd}
+		for k, v := range extra {
+			cfg[k] = v
+		}
+		if ov := d.HAFields[sanitize(key)]; ov.Name != "" {
+			cfg["name"] = ov.Name
+		}
+		out = append(out, haEntity{component, sanitize(key), "control", cfg})
+	}
 	for _, k := range keys {
 		switch {
 		case k == "node_class", k == "capability", k == "device_type", channelState.MatchString(k):
@@ -221,9 +347,13 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 			add("sensor", k, strings.ReplaceAll(k, "_", " "), val(k), extra)
 		}
 	}
-	if isSwitch {
+	switch {
+	case isSwitch && hasState:
 		add("switch", "switch", "Output", "{{ value_json['state'] | default('OFF') }}", map[string]any{"command_topic": cmd,
-			"payload_on": "ON", "payload_off": "OFF", "state_on": "ON", "state_off": "OFF", "optimistic": !hasState})
+			"payload_on": "ON", "payload_off": "OFF", "state_on": "ON", "state_off": "OFF", "optimistic": false})
+	case isSwitch:
+		// The node reports no state: reading the state topic would turn the switch off at every uplink.
+		command("switch", "switch", "Output", map[string]any{"payload_on": "ON", "payload_off": "OFF", "optimistic": true})
 	}
 	diag := func(extra map[string]any) map[string]any {
 		extra["entity_category"] = "diagnostic"
@@ -235,6 +365,34 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 	add("sensor", "datr", "Data rate", val("datr"), diag(map[string]any{"icon": "mdi:antenna"}))
 	add("sensor", "gateway_count", "Gateways", val("gateway_count"), diag(map[string]any{"icon": "mdi:access-point-network"}))
 	add("sensor", "last_seen", "Last seen", val("last_seen"), diag(map[string]any{"device_class": "timestamp"}))
+	// A short preview fits Home Assistant's value field; the entity's details carry the whole payload.
+	add("sensor", "hex", "Last payload", "{% set h = value_json['hex'] | default('') %}{{ h[:16] ~ ('…' if h | length > 16 else '') }}", diag(map[string]any{
+		"icon": "mdi:hexadecimal", "json_attributes_topic": stateTopic,
+		"json_attributes_template": "{{ {'payload': value_json['hex'] | default(''), 'bytes': value_json['size'] | default(0)} | tojson }}"}))
+	command("text", "downlink", "Send downlink", map[string]any{"mode": "text", "pattern": "^([0-9A-Fa-f]{2})*$", "max": 250, "icon": "mdi:send",
+		"state_topic": commandBoxTopic(s, d.AppID, d.ID), "value_template": "{{ value_json['value'] }}"})
+	for i := range d.HACommands {
+		c := &d.HACommands[i]
+		if !c.Dynamic() {
+			command("button", c.Key(), c.Name, map[string]any{"payload_press": c.PayloadHex, "icon": "mdi:gesture-tap-button"})
+			continue
+		}
+		topic := controlTopic(s, d.AppID, d.ID, c.Key())
+		extra := map[string]any{"command_topic": topic, "state_topic": topic + "/state", "value_template": "{{ value_json['value'] }}"}
+		if c.Kind == "number" {
+			extra["min"], extra["max"], extra["step"], extra["icon"] = c.Min, c.Max, c.Step, "mdi:tune-variant"
+			if c.Unit != "" {
+				extra["unit_of_measurement"] = c.Unit
+			}
+		} else {
+			extra["mode"], extra["max"], extra["icon"] = "text", 200, "mdi:form-textbox"
+			if c.Encoding == "hex" {
+				extra["pattern"] = "^([0-9A-Fa-f]{2})*$"
+			}
+		}
+		command(c.Kind, c.Key(), c.Name, extra)
+		out[len(out)-1].category = "dynamic"
+	}
 	return out
 }
 
@@ -267,6 +425,12 @@ func (m *MQTT) publishEntities(d *model.Device, decoded map[string]any, gateway 
 		}
 		// Retract the entity an earlier version published under another topic.
 		m.publish(fmt.Sprintf("%s/sensor/%s/config", s.HomeAssistant.DiscoveryPrefix, sanitize(id+"_"+e.key)), []byte{}, true)
+		// Values are retained and sent first, so controls never start out unknown.
+		if e.key == "downlink" {
+			m.publish(commandBoxTopic(s, d.AppID, d.ID), commandBoxValue(""), true)
+		} else if c := findControl(d, e.key); e.category == "dynamic" && c != nil {
+			m.publish(controlTopic(s, d.AppID, d.ID, c.Key())+"/state", commandBoxValue(controlValue(d, c)), true)
+		}
 		e.cfg["device"] = device
 		b, _ := json.Marshal(e.cfg)
 		m.publish(topic, b, true)
@@ -304,6 +468,17 @@ func (m *MQTT) syncNode(before *model.Device, bs config.Settings, after *model.D
 			m.publish(t, []byte{}, true)
 		}
 	}
+	if before != nil && len(current) == 0 {
+		m.publish(commandBoxTopic(bs, before.AppID, before.ID), []byte{}, true)
+	}
+	if before != nil {
+		for i := range before.HACommands {
+			c := &before.HACommands[i]
+			if c.Dynamic() && !current[entityTopic(as, before, haEntity{component: c.Kind, key: c.Key()})] {
+				m.publish(controlTopic(bs, before.AppID, before.ID, c.Key())+"/state", []byte{}, true)
+			}
+		}
+	}
 	for _, d := range []*model.Device{before, after} {
 		if d == nil {
 			continue
@@ -317,14 +492,158 @@ func (m *MQTT) syncNode(before *model.Device, bs config.Settings, after *model.D
 		m.mu.Unlock()
 	}
 	if len(current) > 0 {
+		// Values first and retained, so entities never start out unknown. Once
+		// more shortly after, for a Home Assistant still subscribing.
+		m.publishLastState(after, as)
 		m.publishEntities(after, normalize(after.LastDecoded), after.LastGateway, as)
+		time.AfterFunc(3*time.Second, func() { m.publishLastState(after, as) })
 	}
+}
+
+// publishLastState sends a node's most recent values as retained state.
+func (m *MQTT) publishLastState(d *model.Device, s config.Settings) {
+	var b []byte
+	if m.LastMessage != nil {
+		var msg upMessage
+		if raw := m.LastMessage(d.AppID, d.ID); raw != nil && json.Unmarshal(raw, &msg) == nil {
+			b, _ = flatState(&msg)
+		}
+	}
+	if b == nil {
+		b = deviceState(d)
+	}
+	m.publish(stateTopic(s, d.AppID, d.ID), b, true)
+}
+
+// deviceState is the state known from the node record alone, used when its
+// last message has aged out of the history.
+func deviceState(d *model.Device) []byte {
+	state := map[string]any{}
+	for k, v := range flatten(normalize(d.LastDecoded)) {
+		state[k] = v
+	}
+	state["rssi"], state["snr"], state["gateway"], state["datr"] = d.LastRSSI, d.LastSNR, d.LastGateway, d.LastDataRate
+	if d.LastFreq != 0 {
+		state["freq"] = float64(d.LastFreq) / 1e6
+	}
+	if d.LastSeen != nil {
+		state["last_seen"] = d.LastSeen.Format(time.RFC3339)
+	}
+	b, _ := json.Marshal(state)
+	return b
 }
 
 // NodeChanged applies an edit or deletion (after == nil) to Home Assistant.
 func (m *MQTT) NodeChanged(before, after *model.Device) {
 	s := m.settings()
+	m.syncMu.Lock()
 	m.syncNode(before, s, after, s)
+	m.syncMu.Unlock()
+	m.SweepHA(false)
+}
+
+// ourDiscovery splits a discovery topic that LoRaHub published into
+// component, object and (for current topics) entity key.
+func ourDiscovery(prefix, topic string) ([]string, bool) {
+	rest, ok := strings.CutPrefix(topic, prefix+"/")
+	if !ok {
+		return nil, false
+	}
+	parts := strings.Split(rest, "/")
+	if (len(parts) != 3 && len(parts) != 4) || parts[len(parts)-1] != "config" || !strings.HasPrefix(parts[1], "lorahub_") {
+		return nil, false
+	}
+	return parts[:len(parts)-1], true
+}
+
+func (m *MQTT) noteRetained(topic string, payload []byte) {
+	if _, ours := ourDiscovery(m.settings().HomeAssistant.DiscoveryPrefix, topic); !ours {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.extRetained == nil {
+		m.extRetained = map[string]bool{}
+	}
+	if len(payload) == 0 {
+		delete(m.extRetained, topic)
+	} else {
+		m.extRetained[topic] = true
+	}
+}
+
+var diagnosticKeys = map[string]bool{"rssi": true, "snr": true, "freq": true, "datr": true, "gateway_count": true, "last_seen": true, "hex": true, "seq": true}
+
+// SweepHA withdraws discovery messages LoRaHub no longer stands behind: nodes
+// and groups that were deleted or are no longer exposed, removed commands,
+// and anything turned off. Unless strict, a field sensor of an exposed node
+// stays even when the last packet lacked it, because nodes send different
+// fields in different packets. It returns how many entities it withdrew.
+func (m *MQTT) SweepHA(strict bool) int {
+	return len(m.sweep(strict))
+}
+
+func (m *MQTT) sweep(strict bool) []string {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	s := m.settings()
+	prefix := s.HomeAssistant.DiscoveryPrefix
+	expected := map[string]bool{}
+	nodes := map[string]*model.Device{}
+	if m.Devices != nil {
+		for _, d := range m.Devices() {
+			for t := range nodeTopics(d, s) {
+				expected[t] = true
+			}
+			if s.HomeAssistant.Enabled && exposed(d, s) {
+				nodes[sanitize("lorahub_"+d.AppID+"_"+d.ID)] = d
+			}
+		}
+	}
+	if m.Gateways != nil {
+		for _, id := range m.Gateways() {
+			for _, k := range gatewayFields {
+				if gatewayExposes(s, k.key) {
+					expected[gatewayTopic(s, id, k.key)] = true
+				}
+			}
+		}
+	}
+	candidates := map[string]bool{}
+	if m.broker != nil {
+		for _, pk := range m.broker.Topics.Messages(prefix + "/#") {
+			if len(pk.Payload) > 0 {
+				candidates[pk.TopicName] = true
+			}
+		}
+	}
+	m.mu.Lock()
+	for t := range m.extRetained {
+		candidates[t] = true
+	}
+	m.mu.Unlock()
+	var removed []string
+	for t := range candidates {
+		parts, ours := ourDiscovery(prefix, t)
+		if !ours || expected[t] {
+			continue
+		}
+		if !strict && len(parts) == 3 && (parts[0] == "sensor" || parts[0] == "binary_sensor") && !diagnosticKeys[parts[2]] {
+			if d := nodes[parts[1]]; d != nil && hiddenReason(d, haEntity{component: parts[0], key: parts[2], category: "field"}, s) == "" {
+				continue
+			}
+		}
+		m.publish(t, []byte{}, true)
+		m.mu.Lock()
+		delete(m.extRetained, t)
+		delete(m.haSent, t)
+		m.mu.Unlock()
+		removed = append(removed, t)
+	}
+	if len(removed) > 0 {
+		m.log.Info("withdrew stale Home Assistant entities", "count", len(removed))
+	}
+	return removed
 }
 
 // gatewayField is a value a gateway can expose to Home Assistant.
@@ -380,10 +699,13 @@ func (m *MQTT) gatewayDiscovery(gatewayID string, data any, s config.Settings) {
 
 // ReconcileHA applies a settings change to what Home Assistant already has.
 func (m *MQTT) ReconcileHA(before, after config.Settings) {
+	defer m.SweepHA(false)
 	if m.Devices != nil {
+		m.syncMu.Lock()
 		for _, d := range m.Devices() {
 			m.syncNode(d, before, d, after)
 		}
+		m.syncMu.Unlock()
 	}
 	if m.Gateways != nil {
 		for _, id := range m.Gateways() {
@@ -471,8 +793,14 @@ func (m *MQTT) EntityReport() map[string]any {
 						Reason: reason, DeviceClass: e.cfg["device_class"], Unit: e.cfg["unit_of_measurement"]})
 				}
 			}
-			nodes = append(nodes, map[string]any{"group": d.AppID, "node": d.ID, "name": d.Name, "adopted": d.Adopted, "ha_enabled": d.HAEnabled, "exposed": exposed(d, s),
-				"has_data": d.LastDecoded != nil, "ha_fields": d.HAFields, "entities": views})
+			node := map[string]any{"group": d.AppID, "node": d.ID, "name": d.Name, "adopted": d.Adopted, "ha_enabled": d.HAEnabled, "exposed": exposed(d, s),
+				"has_data": d.LastDecoded != nil, "ha_fields": d.HAFields, "ha_commands": d.HACommands, "ha_switch": d.HASwitch, "class": d.Class, "class_from_firmware": d.Profile != nil, "serial": d.Serial, "entities": views}
+			if m.Group != nil {
+				if app, err := m.Group(d.AppID); err == nil {
+					node["node_id"], node["downlink_header"], node["downlink_control"] = app.NodeID, app.NodeHeaderOn(d), app.NodeControlOn(d)
+				}
+			}
+			nodes = append(nodes, node)
 		}
 	}
 	return map[string]any{"enabled": s.HomeAssistant.Enabled, "nodes": nodes}

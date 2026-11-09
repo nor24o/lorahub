@@ -333,7 +333,7 @@ func (p *Processor) scheduleClassA(fr *Frame, b *band.Band, phy []byte, delay ti
 	}
 	tx := model.TxPacket{Payload: phy, Frequency: f1, DataRate: dr1.String(), CodingRate: "4/5", Power: power, InvertPol: true,
 		Timestamp: g.meta.Timestamp + uint32(delay/time.Microsecond), RFChain: 0, NoCRC: true}
-	if err := g.dl.Send(g.gw.EUI, tx); err == nil {
+	if err := p.send(g.dl, g.gw.EUI, tx); err == nil {
 		p.countTx(g.gw.ID)
 		return g.gw.ID, nil
 	}
@@ -343,7 +343,7 @@ func (p *Processor) scheduleClassA(fr *Frame, b *band.Band, phy []byte, delay ti
 		tx.Power = g.gw.TxPower
 	}
 	tx.Timestamp = g.meta.Timestamp + uint32((delay+time.Second)/time.Microsecond)
-	if err := g.dl.Send(g.gw.EUI, tx); err != nil {
+	if err := p.send(g.dl, g.gw.EUI, tx); err != nil {
 		return g.gw.ID, err
 	}
 	p.countTx(g.gw.ID)

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -124,10 +125,22 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 	cfg := downlinkCfg(app, d)
 	var g *model.Gateway
 	var tmst uint32
-	freq := uint64(cfg.Frequency * 1e6)
+	instead := ""
+	freq := uint64(math.Round(cfg.Frequency * 1e6))
 	datr := cfg.DataRate
 	if fr != nil {
 		gws := p.pickGateways(fr.Meta)
+		if cfg.Gateway != "" {
+			chosen := gws[:0]
+			for _, c := range gws {
+				if c.gw.ID == cfg.Gateway {
+					chosen = append(chosen, c)
+				}
+			}
+			if gws = chosen; len(gws) == 0 {
+				return p.downFailed(d, "gateway "+cfg.Gateway+" did not hear this packet")
+			}
+		}
 		if len(gws) == 0 {
 			return p.downFailed(d, "no gateway with downlink capability heard the device")
 		}
@@ -139,10 +152,26 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 			datr = fr.Settings.DataRate
 		}
 	} else {
+		id := d.LastGateway
+		if cfg.Gateway != "" {
+			id = cfg.Gateway
+		}
 		var err error
-		g, err = p.store.Gateway(d.LastGateway)
+		g, err = p.store.Gateway(id)
 		if err != nil {
+			if cfg.Gateway != "" {
+				return p.downFailed(d, "gateway "+cfg.Gateway+" does not exist")
+			}
 			return p.downFailed(d, "device has not been heard by any gateway yet")
+		}
+		if !p.gatewayAlive(g) {
+			if cfg.Gateway != "" {
+				return p.downFailed(d, "gateway "+g.ID+" has not reported for a while; its radio may be down")
+			}
+			if alt := p.aliveGateway(g.ID); alt != nil {
+				instead = " instead of " + g.ID + ", which has stopped reporting"
+				g = alt
+			}
 		}
 	}
 	if freq == 0 {
@@ -170,7 +199,7 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 		power = 14
 	}
 	tx := model.TxPacket{Payload: item.Payload, Frequency: freq, DataRate: datr, CodingRate: cr, Power: TxPowerFor(g, power),
-		InvertPol: cfg.InvertPol, Immediate: fr == nil}
+		InvertPol: cfg.InvertPol, Immediate: fr == nil, Preamble: cfg.Preamble, NoCRC: cfg.NoCRC, NoHeader: cfg.NoHeader}
 	if fr != nil {
 		delay := cfg.DelayMs
 		if delay <= 0 {
@@ -181,7 +210,7 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 	if err := p.reserveAirtime(g, tx); err != nil {
 		return p.downFailed(d, err.Error())
 	}
-	if err := dl.Send(g.EUI, tx); err != nil {
+	if err := p.send(dl, g.EUI, tx); err != nil {
 		return p.downFailed(d, err.Error())
 	}
 	p.countTx(g.ID)
@@ -192,9 +221,44 @@ func (p *Processor) sendRawDown(d *model.Device, fr *Frame) error {
 		return nil
 	})
 	p.emit(&model.Event{Name: "ns.down.sent", AppID: d.AppID, DevID: d.ID, Gateways: []string{g.ID},
-		Summary: fmt.Sprintf("Raw downlink via %s · %.3f MHz %s · %s", g.ID, float64(freq)/1e6, datr, truncHex(item.Payload, 16)),
+		Summary: fmt.Sprintf("Raw downlink via %s%s · %.3f MHz %s · %s", g.ID, instead, float64(freq)/1e6, datr, truncHex(item.Payload, 16)),
 		Data:    map[string]any{"gateway_id": g.ID, "frm_payload_hex": strings.ToUpper(hex.EncodeToString(item.Payload)), "tx": tx}}, true)
 	return nil
+}
+
+// immediateMaxAge is how long a command for an always-listening node stays
+// valid. Older ones were queued under other settings and are out of date.
+const immediateMaxAge = 30 * time.Second
+
+// drainRaw sends, in order, everything queued for a node that listens all the
+// time. A command that cannot be sent is dropped: left in the queue it would
+// block the next one and go out much later than it was pressed.
+func (p *Processor) drainRaw(appID, devID string) {
+	unlock := p.lockDevice(appID, devID)
+	defer unlock()
+	drop := func(id string) {
+		p.store.UpdateDevice(appID, devID, func(dv *model.Device) error {
+			if len(dv.Queue) > 0 && dv.Queue[0].ID == id {
+				dv.Queue = dv.Queue[1:]
+			}
+			return nil
+		})
+	}
+	for {
+		d, err := p.store.Device(appID, devID)
+		if err != nil || len(d.Queue) == 0 {
+			return
+		}
+		item := d.Queue[0]
+		if time.Since(item.CreatedAt) > immediateMaxAge {
+			drop(item.ID)
+			p.downFailed(d, "dropped a command that had waited too long: "+truncHex(item.Payload, 16))
+			continue
+		}
+		if p.sendRawDown(d, nil) != nil {
+			drop(item.ID)
+		}
+	}
 }
 
 func (p *Processor) downFailed(d *model.Device, msg string) error {
@@ -224,16 +288,14 @@ func (p *Processor) EnqueueDownlink(appID, devID string, fport int, payload []by
 			return nil, fmt.Errorf("encodeDownlink: %w", err)
 		}
 	}
+	var nodeApp *model.Application
 	if d.Mode == "node" {
-		if app, err := p.store.Application(appID); err == nil {
-			payload = p.NodeDownlinkPayload(app, d, payload)
+		if a, err := p.store.Application(appID); err == nil {
+			nodeApp = a
 		}
 	}
 	if (d.Mode == "otaa" || d.Mode == "abp") && (fport < 1 || fport > 223) {
 		return nil, fmt.Errorf("f_port must be 1..223")
-	}
-	if len(payload) > 242 {
-		return nil, fmt.Errorf("payload too long (%d bytes)", len(payload))
 	}
 	item := model.QueuedDownlink{ID: store.NewToken(6), FPort: fport, Payload: payload, Confirmed: confirmed, CreatedAt: time.Now().UTC(), Decoded: decoded}
 	updated, err := p.store.UpdateDevice(appID, devID, func(dv *model.Device) error {
@@ -243,12 +305,19 @@ func (p *Processor) EnqueueDownlink(appID, devID string, fport int, payload []by
 		if len(dv.Queue) >= 16 {
 			return fmt.Errorf("downlink queue full")
 		}
+		if nodeApp != nil {
+			item.Payload = p.frameNodeDownlink(nodeApp, dv, payload, confirmed)
+		}
+		if len(item.Payload) > 242 {
+			return fmt.Errorf("payload too long (%d bytes)", len(item.Payload))
+		}
 		dv.Queue = append(dv.Queue, item)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	payload = item.Payload
 	p.emit(&model.Event{Name: "as.down.queued", AppID: appID, DevID: devID,
 		Summary: fmt.Sprintf("Downlink queued · FPort %d · %s", fport, truncHex(payload, 16)),
 		Data:    map[string]any{"id": item.ID, "f_port": fport, "frm_payload_hex": strings.ToUpper(hex.EncodeToString(payload)), "confirmed": confirmed, "decoded_payload": decoded}}, true)
@@ -256,7 +325,7 @@ func (p *Processor) EnqueueDownlink(appID, devID string, fport int, payload []by
 	isRaw := updated.Mode == "raw" || updated.Mode == "node"
 	app, _ := p.store.Application(appID)
 	if isRaw && downlinkCfg(app, updated).Mode != "after_uplink" {
-		go p.sendRawDown(updated, nil)
+		go p.drainRaw(appID, devID)
 	} else if !isRaw && updated.Class == "C" && updated.Session != nil {
 		go p.sendClassC(updated)
 	}
@@ -294,7 +363,7 @@ func (p *Processor) sendClassC(d *model.Device) {
 	}
 	tx := model.TxPacket{Payload: phy, Frequency: b.RX2Freq, DataRate: b.RX2DataRate.String(), CodingRate: "4/5", Power: power,
 		InvertPol: true, Immediate: true, NoCRC: true}
-	if err := dl.Send(g.EUI, tx); err != nil {
+	if err := p.send(dl, g.EUI, tx); err != nil {
 		p.downFailed(d, err.Error())
 		return
 	}

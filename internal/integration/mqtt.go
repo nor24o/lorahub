@@ -36,13 +36,23 @@ type MQTT struct {
 	// Device looks up a node; set once before Run.
 	Device func(appID, devID string) (*model.Device, error)
 	// Devices and Gateways list what can be exposed; set once before Run.
-	Devices  func() []*model.Device
-	Gateways func() []string
+	Devices func() []*model.Device
+	// LastMessage returns a node's latest as.up message as JSON, or nil.
+	LastMessage func(appID, devID string) []byte
+	Gateways    func() []string
+	// Group looks up a node group; SaveControlValue remembers the last value
+	// of a dynamic command. Both are set once before Run.
+	Group            func(appID string) (*model.Application, error)
+	SaveControlValue func(appID, devID, key, value string)
 
 	mu     sync.Mutex
 	ext    paho.Client
 	extKey string
 	haSent map[string]bool
+	// extRetained holds LoRaHub's discovery topics seen on the external broker.
+	extRetained map[string]bool
+	// syncMu keeps node changes and the stale-entity sweep from overlapping.
+	syncMu sync.Mutex
 }
 
 // NewMQTT creates the MQTT integration; the embedded broker is started if
@@ -85,6 +95,9 @@ func NewMQTT(cfg *config.Config, settings func() config.Settings, dl DownlinkFun
 		})
 		srv.Subscribe(settings().HomeAssistant.DiscoveryPrefix+"/status", 3, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
 			m.handleBirth(pk.Payload)
+		})
+		srv.Subscribe(prefix+"/+/+/cmd/+", 4, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
+			m.handleDown(pk.TopicName, pk.Payload)
 		})
 		log.Info("embedded MQTT broker listening", "addr", cfg.MQTTBroker.Listen)
 	}
@@ -140,6 +153,12 @@ func (m *MQTT) ensureExternal() paho.Client {
 			handler := func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload()) }
 			c.Subscribe(prefix+"/+/+/down", 0, handler)
 			c.Subscribe(prefix+"/+/+/set", 0, handler)
+			c.Subscribe(prefix+"/+/+/cmd/+", 0, handler)
+			// What Home Assistant's broker holds from LoRaHub, so stale entities can be withdrawn.
+			disc := m.settings().HomeAssistant.DiscoveryPrefix
+			note := func(_ paho.Client, msg paho.Message) { m.noteRetained(msg.Topic(), msg.Payload()) }
+			c.Subscribe(disc+"/+/+/+/config", 0, note)
+			c.Subscribe(disc+"/+/+/config", 0, note)
 			c.Subscribe(m.settings().HomeAssistant.DiscoveryPrefix+"/status", 0, func(_ paho.Client, msg paho.Message) { m.handleBirth(msg.Payload()) })
 		})
 	c := paho.NewClient(o)
@@ -153,11 +172,17 @@ func (m *MQTT) ensureExternal() paho.Client {
 // "f_port", "confirmed", "replace".
 func (m *MQTT) handleDown(topic string, payload []byte) {
 	parts := strings.Split(topic, "/")
+	cmds := m.settings().MQTTCommands
+	if len(parts) == 5 && parts[3] == "cmd" {
+		if cmds.AcceptSet {
+			m.handleControl(parts[1], parts[2], parts[4], payload)
+		}
+		return
+	}
 	if len(parts) != 4 {
 		return
 	}
 	appID, devID := parts[1], parts[2]
-	cmds := m.settings().MQTTCommands
 	if parts[3] == "set" {
 		if cmds.AcceptSet {
 			m.handleSet(appID, devID, payload)
@@ -215,6 +240,7 @@ func (m *MQTT) Run(bus *events.Bus, stop <-chan struct{}) {
 			return
 		case <-tick.C:
 			m.ensureExternal()
+			m.SweepHA(false)
 		case e, ok := <-ch:
 			if !ok {
 				return

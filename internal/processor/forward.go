@@ -35,7 +35,7 @@ func (p *Processor) ReloadForwarders() {
 					if dl == nil {
 						return
 					}
-					if err := dl.Send(gw.EUI, tx); err == nil {
+					if err := p.send(dl, gw.EUI, tx); err == nil {
 						p.countTx(gw.ID)
 						p.emit(&model.Event{Name: "gs.down.forwarded", Gateways: []string{gw.ID},
 							Summary: fmt.Sprintf("Downlink from upstream %s · %.3f MHz %s", fc.Name, float64(tx.Frequency)/1e6, tx.DataRate),
@@ -219,7 +219,7 @@ func (p *Processor) SendRaw(gwID string, tx model.TxPacket) error {
 	if err := p.reserveAirtime(g, tx); err != nil {
 		return err
 	}
-	if err := dl.Send(g.EUI, tx); err != nil {
+	if err := p.send(dl, g.EUI, tx); err != nil {
 		return err
 	}
 	p.countTx(g.ID)

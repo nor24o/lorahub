@@ -357,8 +357,9 @@ func (s *Server) haEntities(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) haRepublish(w http.ResponseWriter, r *http.Request) {
+	removed := s.MQTT.SweepHA(true) // also sensors for fields the nodes no longer send
 	s.MQTT.RepublishHA()
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true, "removed": removed})
 }
 
 func (s *Server) haRemove(w http.ResponseWriter, r *http.Request) {

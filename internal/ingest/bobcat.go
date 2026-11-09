@@ -82,6 +82,9 @@ func NewBobcatServer(addr string, downlinkPort int, static map[string]string, re
 // Close stops the server.
 func (s *BobcatServer) Close() error { return s.conn.Close() }
 
+// LocalAddr is the address the server listens on.
+func (s *BobcatServer) LocalAddr() net.Addr { return s.conn.LocalAddr() }
+
 func (s *BobcatServer) loop() {
 	buf := make([]byte, 65535)
 	for {
@@ -291,6 +294,9 @@ func (s *BobcatServer) Send(eui string, tx model.TxPacket) error {
 	}
 	if tx.Preamble > 0 {
 		m["prea"] = tx.Preamble
+	}
+	if tx.NoHeader {
+		m["nhdr"] = true
 	}
 	port := s.downlinkPort
 	if s.ResolvePort != nil {

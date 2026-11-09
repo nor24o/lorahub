@@ -317,6 +317,40 @@ function encodeDownlink(input) {
 `,
 };
 const FIELD_TYPES = ['uint8', 'int8', 'uint16_be', 'uint16_le', 'int16_be', 'int16_le', 'uint24_be', 'uint24_le', 'int24_be', 'int24_le', 'uint32_be', 'uint32_le', 'int32_be', 'int32_le', 'uint40_be', 'uint48_be', 'uint64_be', 'uint64_le', 'int64_be', 'int64_le', 'float32_be', 'float32_le', 'float64_be', 'float64_le', 'bool', 'bit', 'bits', 'bits_le', 'bits_signed', 'bcd', 'unix_s_be', 'unix_s_le', 'unix_ms_be', 'unix_ms_le', 'hex', 'hex_le', 'ascii', 'utf8', 'base64', 'checksum'];
+// How a table column appears as a compact row on a phone.
+const M_HIDE = new Set(['ID', 'EUI', 'Engine', 'Created', 'Model', 'Area', 'Class', 'Decoder', 'New nodes', 'Serials', 'Sample packet']);
+const M_RIGHT = new Set(['Last seen', 'Last heard', 'Time', 'State', 'Entities', 'Status']);
+const M_WIDE = new Set(['Latest values', 'Last data', 'Topic', 'Content']);
+const M_PLAIN = new Set(['Link', 'Signal', 'Address', 'NODE_ID', 'SERIAL_ID', 'Node', 'Group / ID', 'Direction']);
+
+function mobileRole(head, i, heads, td) {
+  const text = td.textContent.trim();
+  if (head === '') return 'action';
+  if (text === '—' || text === '') { if (!td.querySelector('.dot, .signal, svg, input')) return 'hide'; }
+  if (head === 'Status' && td.querySelector('.dot') && !text) return 'lead';
+  const named = ['Name', 'Gateway', 'Rule'].find((h2) => heads.includes(h2));
+  if (i === (named ? heads.indexOf(named) : heads[0] === 'Status' ? 1 : 0)) return 'title';
+  if (M_HIDE.has(head)) return 'hide';
+  if (M_RIGHT.has(head)) return 'right';
+  if (M_WIDE.has(head)) return 'wide';
+  return M_PLAIN.has(head) ? 'plain' : 'labelled';
+}
+
+/** Marks table cells, so a phone can show each row as a compact two-line item. */
+function labelTables(root) {
+  root.querySelectorAll('table.t:not(.compact)').forEach((t) => {
+    const heads = [...t.querySelectorAll(':scope > thead th')].map((th) => th.textContent.trim());
+    if (!heads.length) return;
+    t.classList.add('stackable');
+    t.querySelectorAll(':scope > tbody > tr').forEach((tr) => [...tr.children].forEach((td, i) => {
+      if (heads[i] === undefined) return;
+      if (td.getAttribute('data-label') !== heads[i]) td.setAttribute('data-label', heads[i]);
+      const role = mobileRole(heads[i], i, heads, td);
+      if (td.getAttribute('data-m') !== role) td.setAttribute('data-m', role);
+    }));
+  });
+}
+
 function typeBytes(t) {
   const m = /^u?int(\d+)/.exec(t || '');
   if (m) return Number(m[1]) / 8;
@@ -611,6 +645,7 @@ const App = {
         navItem('#/nodes', 'device', 'Nodes'),
         navItem('#/applications', 'app', 'Node groups'),
         navItem('#/gateways', 'gateway', 'Gateways'),
+        navItem('#/vpn', 'key', 'WireGuard & Tailscale'),
         h('div', { class: 'nav-section' }, 'Data'),
         navItem('#/decoders', 'wand', 'Decoder Studio'),
         navItem('#/lab', 'code', 'Decoder lab'),
@@ -625,6 +660,8 @@ const App = {
         navItem('#/settings', 'gear', 'Settings')));
     this.sidebar.addEventListener('click', (e) => { if (e.target.closest('a')) this.sidebar.classList.remove('open'); });
     this.main = h('main', { class: 'main' });
+    this.main.addEventListener('click', () => this.sidebar.classList.remove('open'));
+    new MutationObserver(() => labelTables(this.main)).observe(this.main, { childList: true, subtree: true });
     const theme = () => {
       const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       const next = cur === 'dark' ? 'light' : 'dark';
@@ -639,7 +676,13 @@ const App = {
         h('button', { class: 'tb-btn', title: 'Toggle theme', onclick: theme }, icon('moon')),
         h('span', { class: 'tb-btn tb-hide', style: { cursor: 'default' } }, this.user),
         h('button', { class: 'tb-btn', title: 'Sign out', onclick: async () => { await api('POST', '/auth/logout'); location.reload(); } }, icon('logout'), h('span', { class: 'tb-hide' }, 'Sign out'))),
-      h('div', { class: 'layout' }, this.sidebar, this.main));
+      h('div', { class: 'layout' }, this.sidebar, this.main),
+      h('nav', { class: 'bottom-nav' },
+        h('a', { href: '#/', 'data-nav': '#/' }, icon('home'), 'Home'),
+        h('a', { href: '#/pipeline', 'data-nav': '#/pipeline' }, icon('link'), 'Pipeline'),
+        h('a', { href: '#/nodes', 'data-nav': '#/nodes' }, icon('device'), 'Nodes'),
+        h('a', { href: '#/gateways', 'data-nav': '#/gateways' }, icon('gateway'), 'Gateways'),
+        h('button', { type: 'button', onclick: () => this.sidebar.classList.toggle('open') }, icon('menu'), 'More')));
   },
   leave() { for (const f of this.leaveHandlers) { try { f(); } catch (e) { /* ignore */ } } this.leaveHandlers = []; },
   async dispatch() {
@@ -657,7 +700,12 @@ const App = {
       this.main.replaceChildren(h('div', { class: 'muted' }, 'Loading…'));
       try {
         const view = await r.handler(params);
-        if (view) { this.main.replaceChildren(view); window.scrollTo(0, 0); }
+        if (view) {
+          this.main.replaceChildren(view);
+          const tab = this.main.querySelector('.tabs a.active');
+          if (tab) tab.scrollIntoView({ block: 'nearest', inline: 'center' });
+          window.scrollTo(0, 0);
+        }
       } catch (e) {
         if (e.message !== 'authentication required') this.main.replaceChildren(h('div', { class: 'card card-body' }, h('h2', null, 'Something went wrong'), h('p', { class: 'muted' }, e.message)));
       }

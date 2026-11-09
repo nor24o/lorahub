@@ -3,6 +3,7 @@ package processor
 import (
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +18,9 @@ type NodeHeader struct {
 	NodeID string // upper-case hex
 	Serial string // upper-case hex
 	Data   []byte
+
+	Profile      *model.NodeProfile // set when the group's nodes send a profile
+	ProfileError string             // the profile could not be read; Data is left as received
 }
 
 // ParseNodeHeader splits a payload according to the packet format.
@@ -59,9 +63,14 @@ func (p *Processor) handleNode(fr *Frame) bool {
 			return false
 		}
 	}
+	// A test packet from the console is decoded and shown, but changes nothing.
+	simulated := len(fr.Meta) > 0
+	for _, m := range fr.Meta {
+		simulated = simulated && m.Source == "simulated"
+	}
 	app := p.groupByNodeID(hdr.NodeID)
 	if app == nil {
-		if !s.AutoCreateGroups {
+		if !s.AutoCreateGroups || simulated {
 			return false
 		}
 		now := time.Now().UTC()
@@ -73,6 +82,18 @@ func (p *Processor) handleNode(fr *Frame) bool {
 		p.emit(&model.Event{Name: "as.group.created", AppID: app.ID, Summary: "Node group " + hdr.NodeID + " created automatically",
 			Data: map[string]any{"node_id": hdr.NodeID}}, true)
 	}
+	if app.NodeProfile && hdr.Serial != "" {
+		prof, n, err := model.ParseNodeProfile(hdr.Data)
+		if err != nil {
+			hdr.ProfileError = err.Error()
+		} else {
+			head := fr.Payload[:len(fr.Payload)-len(hdr.Data)]
+			hdr.Profile, hdr.Data = prof, hdr.Data[n:]
+			if scheme != nil { // schemes read fixed positions, so they must not see the profile
+				scheme = p.Schemes().Decode(append(append([]byte{}, head...), hdr.Data...), fr.At, nil, false)
+			}
+		}
+	}
 	devs := p.store.FindDevices(func(d *model.Device) bool {
 		return d.AppID == app.ID && d.Mode == "node" && strings.EqualFold(d.Serial, hdr.Serial)
 	})
@@ -80,7 +101,7 @@ func (p *Processor) handleNode(fr *Frame) bool {
 	if len(devs) > 0 {
 		d = devs[0]
 	} else {
-		if !app.AutoRegister {
+		if !app.AutoRegister || simulated {
 			p.emit(&model.Event{Name: "ns.up.unmatched", AppID: app.ID, Gateways: gatewayIDs(fr.Meta),
 				Summary: fmt.Sprintf("Unknown serial %s in group %s (auto-register is off)", hdr.Serial, hdr.NodeID),
 				Data:    p.unmatchedData(fr, &hdr)}, true)
@@ -104,6 +125,15 @@ func (p *Processor) handleNode(fr *Frame) bool {
 	unlock := p.lockDevice(d.AppID, d.ID)
 	defer unlock()
 	msg := p.buildNodeMessage(app, d, &hdr, fr, scheme)
+	if simulated {
+		msg["simulated"] = true
+		summary := fmt.Sprintf("Test packet · %s / %s · %s", hdr.NodeID, hdr.Serial, truncHex(hdr.Data, 16))
+		if dec, ok := msg["decoded"]; ok {
+			summary += " · " + compactJSON(dec, 140)
+		}
+		p.emit(&model.Event{Name: "as.up", AppID: d.AppID, DevID: d.ID, Gateways: gatewayIDs(fr.Meta), Summary: summary, Data: msg}, true)
+		return true
+	}
 	decoded, _ := msg["decoded"].(map[string]any)
 	updated, err := p.store.UpdateDevice(d.AppID, d.ID, func(dv *model.Device) error {
 		p.touchDevice(dv, fr, msg["decoded"])(dv)
@@ -121,6 +151,11 @@ func (p *Processor) handleNode(fr *Frame) bool {
 				dv.Model = "LoRa " + c
 			}
 		}
+		if hdr.Profile != nil { // the firmware is the authority once the group opts in
+			dv.Profile, dv.Class = hdr.Profile, hdr.Profile.Class
+		} else if !app.NodeProfile {
+			dv.Profile = nil
+		}
 		return nil
 	})
 	if err != nil {
@@ -131,6 +166,7 @@ func (p *Processor) handleNode(fr *Frame) bool {
 		summary += " · " + compactJSON(dec, 140)
 	}
 	p.emit(&model.Event{Name: "as.up", AppID: d.AppID, DevID: d.ID, Gateways: gatewayIDs(fr.Meta), Summary: summary, Data: msg}, true)
+	updated = p.dropExpired(updated)
 	if len(updated.Queue) > 0 {
 		if cfg := downlinkCfg(app, updated); cfg.Mode == "after_uplink" {
 			p.sendRawDown(updated, fr)
@@ -144,13 +180,20 @@ func downlinkCfg(app *model.Application, d *model.Device) model.RawDownlink {
 	if d != nil && d.RawDownlink != nil {
 		return *d.RawDownlink
 	}
-	if app != nil && app.RawDownlink != nil {
-		return *app.RawDownlink
+	cfg := model.RawDownlink{Mode: "immediate", Power: 14}
+	switch {
+	case app != nil && app.RawDownlink != nil:
+		cfg = *app.RawDownlink
+		if d != nil && d.Class == "C" { // always listening: the group's radio settings apply, but not its waiting for an uplink
+			cfg.Mode = "immediate"
+		}
+	case d != nil && d.Adopted && d.Class == "A": // a sleeping node only listens right after it transmits
+		cfg.Mode = "after_uplink"
 	}
-	if d != nil && d.Adopted && d.Class == "A" { // a sleeping node only listens right after it transmits
-		return model.RawDownlink{Mode: "after_uplink", Power: 14}
+	if d != nil && d.Profile != nil && (app == nil || app.NodeProfile) {
+		d.Profile.Apply(&cfg)
 	}
-	return model.RawDownlink{Mode: "immediate", Power: 14}
+	return cfg
 }
 
 // gatewayInfo is the per-gateway metadata in node messages.
@@ -201,6 +244,12 @@ func (p *Processor) buildNodeMessage(app *model.Application, d *model.Device, hd
 	}
 	if d.Location != nil {
 		msg["location"] = d.Location
+	}
+	if hdr.Profile != nil {
+		msg["profile"] = hdr.Profile
+	}
+	if hdr.ProfileError != "" {
+		msg["profile_error"] = hdr.ProfileError
 	}
 	f := d.Uplink
 	if f.Type == "" || f.Type == "inherit" {
@@ -255,9 +304,39 @@ func (p *Processor) unmatchedData(fr *Frame, hdr *NodeHeader) map[string]any {
 	return data
 }
 
-// NodeDownlinkPayload prepends NODE_ID+SERIAL when the group requests it.
+// frameNodeDownlink builds the bytes sent to one node. When the control byte
+// is in use it also moves the node on to its next sequence number.
+func (p *Processor) frameNodeDownlink(app *model.Application, d *model.Device, data []byte, confirmed bool) []byte {
+	if app.NodeControlOn(d) {
+		seq := d.DownSeq & 0x0F
+		d.DownSeq = (seq + 1) & 0x0F
+		data = append([]byte{model.ControlByte(model.ControlUnicast, confirmed, seq)}, data...)
+	}
+	return p.NodeDownlinkPayload(app, d, data)
+}
+
+// dropExpired removes queued broadcasts whose time has run out.
+func (p *Processor) dropExpired(d *model.Device) *model.Device {
+	now := time.Now()
+	expired := func(q model.QueuedDownlink) bool { return q.ExpiresAt != nil && now.After(*q.ExpiresAt) }
+	if !slices.ContainsFunc(d.Queue, expired) {
+		return d
+	}
+	updated, err := p.store.UpdateDevice(d.AppID, d.ID, func(dv *model.Device) error {
+		dv.Queue = slices.DeleteFunc(dv.Queue, expired)
+		return nil
+	})
+	if err != nil {
+		return d
+	}
+	p.downFailed(d, "a broadcast expired before this node opened a receive window")
+	return updated
+}
+
+// NodeDownlinkPayload prepends NODE_ID+SERIAL when the node's own settings or
+// else its group request it.
 func (p *Processor) NodeDownlinkPayload(app *model.Application, d *model.Device, data []byte) []byte {
-	if d.Mode != "node" || !app.DownlinkHeader {
+	if d.Mode != "node" || !app.NodeHeaderOn(d) {
 		return data
 	}
 	nid, _ := hex.DecodeString(app.NodeID)

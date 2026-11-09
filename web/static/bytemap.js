@@ -61,7 +61,8 @@ function byteMapper(opts) {
   const strip = h('div', { class: 'bm-strip' });
   const picker = h('div');
   const cards = h('div', { class: 'bm-cards' });
-  const hint = h('div', { class: 'small muted' }, 'Drag across the bytes that belong together, then choose what they mean.');
+  const hint = h('div', { class: 'small muted' }, matchMedia('(pointer: coarse)').matches ? 'Tap the first and the last byte of a value, then choose what it means.' : 'Drag across the bytes that belong together, then choose what they mean.');
+  let lastPointer = 'mouse';
   let values = {};
   let drag = null;
   let focusIndex = -1;
@@ -134,10 +135,36 @@ function byteMapper(opts) {
     return cellEl ? Number(cellEl.getAttribute('data-i')) : null;
   }
   if (!opts.readonly) {
-    strip.addEventListener('pointerdown', (e) => {
+    const focusField = (seg) => {
+      focusIndex = Number(seg.getAttribute('data-f'));
+      drawStrip(); drawCards();
+      const c = cards.querySelector(`[data-card="${focusIndex}"]`);
+      if (c) c.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    };
+    strip.addEventListener('click', (e) => {   // touch: tap the first byte, then the last
+      if (lastPointer !== 'touch') return;
       const seg = e.target.closest('.bm-seg');
       if (!seg) return;
-      if (seg.hasAttribute('data-f')) { focusIndex = Number(seg.getAttribute('data-f')); drawStrip(); drawCards(); const c = cards.querySelector(`[data-card="${focusIndex}"]`); if (c) c.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); return; }
+      if (seg.hasAttribute('data-f')) { focusField(seg); return; }
+      const cellEl = e.target.closest('.bm-byte');
+      if (!cellEl) return;
+      const i = Number(cellEl.getAttribute('data-i'));
+      const total = opts.bytes().length;
+      const extending = drag && drag.a === drag.b && i !== drag.a;
+      let clear = extending;
+      if (extending) for (let k = Math.min(drag.a, i); k <= Math.max(drag.a, i); k++) if (owner(k, total) >= 0) clear = false;
+      if (clear) drag.b = i;
+      else if (drag && drag.a === i && drag.b === i) { drag = null; picker.replaceChildren(); drawStrip(); return; }
+      else drag = { a: i, b: i, active: false };
+      drawStrip();
+      showPicker(drag.a, drag.b);
+    });
+    strip.addEventListener('pointerdown', (e) => {
+      lastPointer = e.pointerType || 'mouse';
+      if (lastPointer === 'touch') return;
+      const seg = e.target.closest('.bm-seg');
+      if (!seg) return;
+      if (seg.hasAttribute('data-f')) { focusField(seg); return; }
       const i = byteAt(e);
       if (i === null) return;
       e.preventDefault();

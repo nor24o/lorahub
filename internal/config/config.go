@@ -146,6 +146,7 @@ type Settings struct {
 		Gateways         bool     `json:"gateways"`
 		GatewayFields    []string `json:"gateway_fields"`
 		RepublishOnBirth bool     `json:"republish_on_birth"`
+		LastPayload      bool     `json:"last_payload"`
 	} `json:"home_assistant"`
 }
 
@@ -177,7 +178,7 @@ func DefaultSettings() Settings {
 	ha := &s.HomeAssistant
 	ha.DiscoveryPrefix, ha.ExposeMode = "homeassistant", "adopted"
 	ha.Diagnostics = []string{"rssi", "snr", "freq", "datr", "gateway_count", "last_seen", "seq"}
-	ha.Switches, ha.Gateways, ha.RepublishOnBirth = true, true, true
+	ha.Switches, ha.Gateways, ha.RepublishOnBirth, ha.LastPayload = true, true, true, true
 	ha.GatewayFields = []string{"rx", "tx", "crc_err", "tx_err", "uptime_s", "temp_c"}
 	return s
 }

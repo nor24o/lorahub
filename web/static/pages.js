@@ -26,7 +26,7 @@ App.route('/', async () => {
       h('div', { class: 'card card-body' }, h('h2', null, 'Traffic — last 24 hours'), barChart(series, buckets)),
       h('div', { class: 'card' },
         h('div', { class: 'card-head' }, h('h2', null, 'Gateways'), h('a', { class: 'btn sm', href: '#/gateways' }, 'View all')),
-        gws.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('tbody', null, gws.slice(0, 6).map((g) =>
+        gws.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't overview-gw' }, h('tbody', null, gws.slice(0, 6).map((g) =>
           h('tr', { class: 'click', onclick: () => { location.hash = '#/gateways/' + g.gateway_id; } },
             h('td', null, h('div', { class: 'row', style: { gap: '8px' } }, h('span', { class: 'dot ' + (g.online ? 'on' : 'off') }), h('b', null, g.name || g.gateway_id))),
             h('td', { class: 'small muted' }, KIND_LABEL[g.kind] || g.kind),
@@ -102,7 +102,7 @@ function appHeader(a, active) {
   const base = '#/applications/' + a.application_id;
   return [pageHead([['Node groups', '#/applications'], [a.node_id || a.application_id]], a.name || a.application_id,
     [a.node_id ? h('span', null, 'NODE_ID ', h('span', { class: 'val' }, a.node_id)) : null, a.description ? h('span', null, a.description) : null]),
-  tabs(base, [['', 'Overview'], ['devices', 'Nodes'], ['live', 'Live data'], ['formatters', 'Decoder'], ['integrations', 'Integrations'], ['settings', 'Settings']], active)];
+  tabs(base, [['', 'Overview'], ['devices', 'Nodes'], ['live', 'Live data'], ['broadcast', 'Broadcast'], ['formatters', 'Decoder'], ['integrations', 'Integrations'], ['settings', 'Settings']], active)];
 }
 
 function deviceTable(appID, devs) {
@@ -225,16 +225,32 @@ App.route('/applications/:app/integrations', async ({ app }) => {
       } }, 'Save webhooks'))));
 });
 
-function radioFields(dl) {
+// node: { gateways } adds the settings that only make sense for a single node.
+function radioFields(dl, node) {
+  const check = (key, label, help) => { const c = checkbox(dl[key], label, help); c.input.onchange = () => { dl[key] = c.input.checked; }; return c.el; };
+  const rate = /^SF(\d+)BW(\d+)$/.exec(dl.data_rate || '');
+  const setRate = () => { dl.data_rate = sf.value ? sf.value + 'BW' + bw.value : ''; bw.disabled = !sf.value; };
+  const sf = sel(rate ? 'SF' + rate[1] : '', [['', 'Same as last packet'], ...[5, 6, 7, 8, 9, 10, 11, 12].map((n) => 'SF' + n)], { onchange: setRate });
+  const bw = sel(rate ? rate[2] : '125', [['125', '125 kHz'], ['250', '250 kHz'], ['500', '500 kHz']], { onchange: setRate });
+  bw.disabled = !rate;
   return [h('div', { class: 'grid g3' },
     field('When to send', sel(dl.mode || 'immediate', [['immediate', 'Immediately'], ['after_uplink', 'After the node\'s next packet']], { onchange: (e) => { dl.mode = e.target.value; } })),
     field('Delay after packet (ms)', inp(dl.delay_ms || 1000, { type: 'number', min: 0, oninput: (e) => { dl.delay_ms = Number(e.target.value); } })),
     field('TX power (dBm)', inp(dl.power || 14, { type: 'number', min: 0, max: 27, oninput: (e) => { dl.power = Number(e.target.value); } }))),
   h('div', { class: 'grid g3' },
     field('Frequency (MHz)', inp(dl.frequency || '', { type: 'number', step: 'any', placeholder: 'same as last packet', oninput: (e) => { dl.frequency = Number(e.target.value); } })),
-    field('Data rate', inp(dl.data_rate || '', { class: 'mono', placeholder: 'SF7BW125 (same as last packet)', oninput: (e) => { dl.data_rate = e.target.value.toUpperCase(); } })),
-    field('Coding rate', sel(dl.coding_rate || '4/5', ['4/5', '4/6', '4/7', '4/8'], { onchange: (e) => { dl.coding_rate = e.target.value; } }))),
-  (() => { const c = checkbox(dl.invert_polarity, 'Invert IQ', 'Only if your nodes listen with inverted IQ.'); c.input.onchange = () => { dl.invert_polarity = c.input.checked; }; return c.el; })()];
+    field('Spreading factor', sf),
+    field('Bandwidth', bw)),
+  h('div', { class: 'grid g3' },
+    field('Coding rate', sel(dl.coding_rate || '4/5', ['4/5', '4/6', '4/7', '4/8'], { onchange: (e) => { dl.coding_rate = e.target.value; } })),
+    field('Preamble (symbols)', inp(dl.preamble || '', { type: 'number', min: 6, placeholder: 'gateway default', oninput: (e) => { dl.preamble = Number(e.target.value); } })),
+    node ? field('Send through', sel(dl.gateway || '', [['', 'Gateway that heard it best'], ...node.gateways.map((g) => [g.gateway_id, g.name || g.gateway_id])], { onchange: (e) => { dl.gateway = e.target.value; } })) : h('span')),
+  node ? h('div', { class: 'grid g2' },
+    field('NODE_ID + SERIAL_ID in front of the data', sel(dl.node_header || '', [['', 'Same as the group'], ['on', 'Always add'], ['off', 'Never add']], { onchange: (e) => { dl.node_header = e.target.value; } })),
+    field('Control byte (adds NODE_ID + SERIAL_ID too)', sel(dl.node_control || '', [['', 'Same as the group'], ['on', 'Always add'], ['off', 'Never add']], { onchange: (e) => { dl.node_control = e.target.value; } }))) : null,
+  check('invert_polarity', 'Invert IQ', 'Only for nodes that listen with inverted IQ. Gateways cannot hear inverted packets, so they no longer pick up these downlinks.'),
+  check('no_crc', 'Send without CRC', 'Only if the node does not expect a CRC on downlinks.'),
+  check('implicit_header', 'Implicit header', 'Leaves out the LoRa header. The node must already know the length and coding rate.')];
 }
 
 App.route('/applications/:app/settings', async ({ app }) => {
@@ -242,13 +258,26 @@ App.route('/applications/:app/settings', async ({ app }) => {
   const name = inp(a.name), desc = h('textarea', { rows: 2, value: a.description || '' }), nodeId = inp(a.node_id, { class: 'mono' });
   const auto = checkbox(a.auto_register_nodes, 'Add new nodes automatically');
   const hdr = checkbox(a.downlink_header, 'Prepend NODE_ID + SERIAL_ID to downlinks');
+  const prof = checkbox(a.node_profile, 'Nodes send a profile after SERIAL_ID', 'Only turn this on once the firmware of every node in this group sends it, because the bytes after SERIAL_ID stop being read as data.');
+  const ctrl = checkbox(a.downlink_control, 'Add a control byte after SERIAL_ID in downlinks', 'Also adds NODE_ID + SERIAL_ID, since the control byte refers to them. Needed for broadcasts. Only turn this on once the firmware of the nodes in this group expects it.');
+  const syncHdr = () => { if (ctrl.input.checked) hdr.input.checked = true; hdr.input.disabled = ctrl.input.checked; };
+  ctrl.input.addEventListener('change', syncHdr);
+  syncHdr();
+  const ctrlHelp = h('pre', { class: 'mono small', style: { margin: 0, whiteSpace: 'pre-wrap' } },
+    'Downlink: NODE_ID | SERIAL_ID | control | data\n\nControl byte\n  bit 7    1 = from the hub\n  bit 6-5  00 one node, 01 whole group, 10 everyone\n  bit 4    1 = please confirm\n  bit 3-0  sequence number 0-15\n\n' +
+    'Accept a packet when bit 7 is set, NODE_ID is yours or FFFF, and SERIAL_ID is yours or FFFFFFFF.');
   const dl = Object.assign({ mode: 'immediate', power: 14, delay_ms: 1000 }, a.downlink_radio || {});
+  const profHelp = h('pre', { class: 'mono small', style: { margin: 0, whiteSpace: 'pre-wrap' } },
+    'NODE_ID | SERIAL_ID | profile (1 byte) | radio block (4 bytes, optional) | data\n\n' +
+    'Profile byte\n  bit 7-6  class: 00 A, 01 B, 10 C\n  bit 5    1 = node listens with inverted IQ\n  bit 4    1 = radio block follows\n  bit 3-0  free for your firmware\n\n' +
+    'Radio block (how the node listens for downlinks)\n  byte 0-2  frequency in 100 Hz, MSB first, 0 = same as uplink\n  byte 3    bit 7-4 SF 5-12, 0 = same as uplink\n            bit 3-2 bandwidth: 0 125, 1 250, 2 500 kHz\n            bit 1-0 coding rate: 0 4/5, 1 4/6, 2 4/7, 3 4/8\n\n' +
+    'Class C, 869.525 MHz, SF9, 125 kHz, 4/5:  90 84ADD2 90');
   return h('div', { class: 'stack' }, appHeader(a, 'settings'),
     h('div', { class: 'card card-body' }, h('div', { class: 'form' },
-      field('NODE_ID (hex)', nodeId), field('Name', name), field('Description', desc), auto.el, hdr.el,
+      field('NODE_ID (hex)', nodeId), field('Name', name), field('Description', desc), auto.el, hdr.el, ctrl.el, ctrlHelp, prof.el, profHelp,
       h('div', { class: 'form-section stack' }, h('h3', null, 'Downlink radio settings'), ...radioFields(dl)),
       h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await api('PUT', '/applications/' + app, { name: name.value, description: desc.value, node_id: cleanHex(nodeId.value), auto_register_nodes: auto.input.checked, downlink_header: hdr.input.checked, downlink_radio: dl }); toast('Saved'); App.dispatch(); } catch (e) { errToast(e); }
+        try { await api('PUT', '/applications/' + app, { name: name.value, description: desc.value, node_id: cleanHex(nodeId.value), auto_register_nodes: auto.input.checked, downlink_header: hdr.input.checked, downlink_control: ctrl.input.checked, node_profile: prof.input.checked, downlink_radio: dl }); toast('Saved'); App.dispatch(); } catch (e) { errToast(e); }
       } }, 'Save changes')))),
     h('div', { class: 'card card-body' }, h('h2', null, 'Delete node group'), h('p', { class: 'muted' }, 'Deletes the group and all of its nodes.'),
       h('button', { class: 'btn danger', onclick: async () => {
@@ -349,7 +378,9 @@ App.route('/applications/:app/devices/:dev/messaging', async ({ app, dev }) => {
     payloadHolder.replaceChildren(mode === 'hex' ? field('Data (hex)', payload) : field('Data as JSON', json, 'Converted to bytes by the group\'s downlink encoder.'));
   };
   renderMode();
-  const dl = Object.assign({ mode: 'immediate' }, a.downlink_radio || {});
+  const dl = d.raw_downlink || Object.assign({ mode: d.adopted && d.class === 'A' ? 'after_uplink' : 'immediate' }, a.downlink_radio || {}, d.class === 'C' ? { mode: 'immediate' } : {}, d.profile ? { mode: d.class === 'C' ? 'immediate' : 'after_uplink' } : {});
+  const controlOn = d.raw_downlink && d.raw_downlink.node_control ? d.raw_downlink.node_control === 'on' : a.downlink_control;
+  const headerOn = controlOn || (d.raw_downlink && d.raw_downlink.node_header ? d.raw_downlink.node_header === 'on' : a.downlink_header);
   const queue = h('div');
   const renderQueue = (q) => {
     queue.replaceChildren(q && q.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['#', 'Bytes sent on air', 'Queued'].map((x) => h('th', null, x)))),
@@ -375,7 +406,7 @@ App.route('/applications/:app/devices/:dev/messaging', async ({ app, dev }) => {
     h('div', { class: 'grid g2' },
       h('div', { class: 'card card-body stack' }, h('div', { class: 'row between' }, h('h2', { style: { margin: 0 } }, 'Send downlink'), seg),
         h('div', { class: 'callout info small' }, (dl.mode === 'after_uplink' ? 'Sent right after this node\'s next packet' : 'Sent immediately via the gateway that heard this node best') +
-          (a.downlink_header ? `. On air: ${a.node_id} ${d.serial} + your data.` : '. Your data is sent as-is (no header).'), ' ', h('a', { href: `#/applications/${app}/settings` }, 'Change')),
+          (headerOn ? `. On air: ${a.node_id} ${d.serial} ${controlOn ? '+ control byte ' : ''}+ your data.` : controlOn ? '. On air: control byte + your data.' : '. Your data is sent as-is (no header).'), d.raw_downlink ? ' Uses this node\'s own settings below.' : [' ', h('a', { href: `#/applications/${app}/settings` }, 'Change for the group')]),
         payloadHolder, repl.el,
         h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: send }, icon('send'), 'Send'))),
       h('div', { class: 'stack' },
@@ -383,8 +414,76 @@ App.route('/applications/:app/devices/:dev/messaging', async ({ app, dev }) => {
         h('div', { class: 'card card-body stack' }, h('h2', { style: { margin: 0 } }, 'Inject test packet'),
           h('p', { class: 'small muted', style: { margin: 0 } }, `Pretends this node sent ${a.node_id} ${d.serial} + the data below (for testing decoders without hardware).`),
           gws.length ? [field('Gateway', simGw), field('Data (hex, after header)', simPayload), h('div', null, h('button', { class: 'btn', onclick: simulate }, icon('play'), 'Inject'))] : h('div', { class: 'muted small' }, 'No gateway registered yet.')))),
+    nodeRadioCard(a, d, gws),
     liveView({ app, dev, short: true, title: 'Live data', hideGatewayRaw: true }));
 });
+
+App.route('/applications/:app/broadcast', async ({ app }) => {
+  const [a, gws, s] = await Promise.all([GET('/applications/' + app), GET('/gateways'), GET('/settings')]);
+  const group = a.downlink_radio || {};
+  const radio = { frequency: group.frequency || 0, data_rate: group.data_rate || 'SF9BW125', coding_rate: group.coding_rate || '4/5', power: group.power || 14, invert_polarity: !!group.invert_polarity, preamble: group.preamble || 0 };
+  const scope = sel('group', [['group', `This group only (${a.node_id})`], ['all', 'Everyone, all groups']]);
+  const data = inp('', { class: 'mono', placeholder: '0101', spellcheck: 'false' });
+  const rate = /^SF(\d+)BW(\d+)$/.exec(radio.data_rate);
+  const setRate = () => { radio.data_rate = sf.value + 'BW' + bw.value; };
+  const sf = sel('SF' + rate[1], [5, 6, 7, 8, 9, 10, 11, 12].map((n) => 'SF' + n), { onchange: setRate });
+  const bw = sel(rate[2], [['125', '125 kHz'], ['250', '250 kHz'], ['500', '500 kHz']], { onchange: setRate });
+  const iq = checkbox(radio.invert_polarity, 'Invert IQ', 'Only if the nodes listen with inverted IQ.');
+  const picks = gws.map((g) => ({ id: g.gateway_id, box: checkbox(g.downlink_enabled && !g.disabled, g.name || g.gateway_id) }));
+  const classA = checkbox(true, 'Also deliver to class A nodes', 'Each one gets it in its next receive window, right after it transmits.');
+  const minutes = inp(60, { type: 'number', min: 1, max: 10080 });
+  const air = h('div', { class: 'mono small muted' });
+  const nodeIdLen = s.packet_format.node_id_length, serialLen = s.packet_format.serial_length;
+  const showAir = () => { air.textContent = `On air: ${scope.value === 'all' ? 'FF'.repeat(nodeIdLen) : a.node_id} ${'FF'.repeat(serialLen)} [control] ${cleanHex(data.value) || '…'}`; };
+  scope.onchange = showAir; data.oninput = showAir; showAir();
+  const needsControl = !a.downlink_control;
+  return h('div', { class: 'stack' }, ...appHeader(a, 'broadcast'),
+    needsControl ? h('div', { class: 'callout warn' }, 'A broadcast to this group needs the control byte. ', h('a', { href: `#/applications/${app}/settings` }, 'Turn it on in Settings'), ' once your firmware expects it. "Everyone" still works.') : null,
+    h('div', { class: 'card card-body stack' },
+      h('div', { class: 'grid g2' }, field('Send to', scope), field('Data (hex)', data)), air,
+      h('h3', { style: { margin: 0 } }, 'Radio'),
+      h('p', { class: 'small muted', style: { margin: 0 } }, 'All listening nodes must use these settings, so a frequency is required.'),
+      h('div', { class: 'grid g3' },
+        field('Frequency (MHz)', inp(radio.frequency || '', { type: 'number', step: 'any', placeholder: '869.525', oninput: (e) => { radio.frequency = Number(e.target.value); } })),
+        field('Spreading factor', sf), field('Bandwidth', bw)),
+      h('div', { class: 'grid g3' },
+        field('Coding rate', sel(radio.coding_rate, ['4/5', '4/6', '4/7', '4/8'], { onchange: (e) => { radio.coding_rate = e.target.value; } })),
+        field('TX power (dBm)', inp(radio.power, { type: 'number', min: 0, max: 27, oninput: (e) => { radio.power = Number(e.target.value); } })),
+        field('Preamble (symbols)', inp(radio.preamble || '', { type: 'number', min: 6, placeholder: 'gateway default', oninput: (e) => { radio.preamble = Number(e.target.value); } }))),
+      iq.el,
+      h('h3', { style: { margin: 0 } }, 'Gateways'),
+      h('p', { class: 'small muted', style: { margin: 0 } }, 'Each ticked gateway transmits in turn, so they do not talk over each other.'),
+      h('div', { class: 'stack' }, picks.map((p) => p.box.el)),
+      h('h3', { style: { margin: 0 } }, 'Class A nodes'),
+      classA.el, field('Keep waiting for (minutes)', minutes),
+      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
+        radio.invert_polarity = iq.input.checked;
+        const gateways = picks.filter((p) => p.box.input.checked).map((p) => p.id);
+        if (!gateways.length) { toast('Tick at least one gateway'); return; }
+        try {
+          const r = await api('POST', `/applications/${app}/broadcast`, { scope: scope.value, data_hex: cleanHex(data.value), radio, gateways, class_a_minutes: classA.input.checked ? Number(minutes.value || 0) : 0 });
+          toast(`Sending through ${r.gateways.length} gateway${r.gateways.length === 1 ? '' : 's'}, queued for ${r.class_a_queued} class A node${r.class_a_queued === 1 ? '' : 's'}`);
+        } catch (e) { errToast(e); }
+      } }, icon('send'), 'Send broadcast'))),
+    liveView({ app, short: true, title: 'Live data', hideGatewayRaw: true }));
+});
+
+function nodeRadioCard(a, d, gws) {
+  const group = a.downlink_radio || {};
+  const dl = Object.assign({ power: 14, delay_ms: 1000 }, group, d.raw_downlink || {});
+  if (!d.raw_downlink) dl.mode = d.class === 'C' ? 'immediate' : (group.mode || 'after_uplink');
+  const own = checkbox(!!d.raw_downlink, 'Use separate settings for this node', 'Off: this node follows the settings of its group. Other nodes are not affected.');
+  const holder = h('div', { class: 'stack' });
+  const paint = () => holder.replaceChildren(...(own.input.checked ? radioFields(dl, { gateways: gws }).filter(Boolean) : []));
+  own.input.onchange = paint;
+  paint();
+  const p = d.profile;
+  const fromFirmware = p ? h('div', { class: 'callout info small' }, `Firmware says: class ${p.class}, ${p.invert_iq ? 'inverted' : 'normal'} IQ` + (p.frequency ? `, ${p.frequency} MHz` : '') + (p.data_rate ? `, ${p.data_rate}` : '') + (p.coding_rate ? `, ${p.coding_rate}` : '') + '. Separate settings below override this.') : null;
+  return h('div', { class: 'card card-body stack' }, h('h2', { style: { margin: 0 } }, 'Downlink settings for this node'), fromFirmware, own.el, holder,
+    h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', onclick: async () => {
+      try { await api('PUT', `/applications/${d.application_id}/devices/${d.device_id}`, { raw_downlink: own.input.checked ? dl : null }); toast('Saved'); App.dispatch(); } catch (e) { errToast(e); }
+    } }, 'Save settings')));
+}
 
 function b64hex(b64) {
   try { return Array.from(atob(b64 || ''), (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('').toUpperCase() || '(empty)'; } catch (e) { return b64; }
@@ -426,7 +525,7 @@ App.route('/gateways', async () => {
         h('td', { class: 'mono small' }, g.eui), h('td', null, linkBadge(g)), h('td', { class: 'small nowrap' }, engineLabel(g)), h('td', { class: 'mono small' }, g.last_addr || '—'),
         h('td', { class: 'nowrap' }, `${g.rx_count} / ${g.tx_count}`), h('td', { class: 'small muted nowrap' }, ago(g.last_seen))))))) :
       h('div', { class: 'empty' }, icon('gateway'), 'No gateways yet. Gateways auto-register when they connect (see Settings), or register one manually.')),
-    connectionHelp());
+    h('details', { open: !matchMedia('(max-width: 820px)').matches }, h('summary', { class: 'small muted' }, 'How to connect a gateway'), connectionHelp()));
 });
 
 function linkBadge(g) {
@@ -648,4 +747,4 @@ async function settingsPage(tab) {
 App.route('/settings', () => settingsPage(''));
 App.route('/settings/:tab', ({ tab }) => settingsPage(tab));
 
-App.start();
+document.addEventListener('DOMContentLoaded', () => App.start()); // after every page script has registered its routes

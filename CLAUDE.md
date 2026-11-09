@@ -43,11 +43,15 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 
 ## Commands
 - `make test` (vet + race tests) · `make run` (dev on :8080) · `make sim` · `make arm64`
+- End to end: `go test -run TestEndToEnd ./cmd/lorahub` starts the whole hub (`startHub` in `cmd/lorahub/hub.go`) against two
+  simulated link-2 engines, MQTT and the HTTP API. Packet formats for firmware: `docs/node-protocol.md`.
+- Echo guard (`internal/processor/echo.go`): every transmission goes through `p.send`; the same bytes received within 20 s are ignored.
+  Console test packets (`Source: simulated`) are published with `"simulated": true` but never touch the node, HA or rules.
 - Go ≥ 1.26 (go.mod). Cross-compile is pure Go (CGO_ENABLED=0).
 
 ## Status / open items
-- Verified only in a cloud sandbox with the simulator + headless browser; **not yet run
-  on the real Bobcat** (check downlink timing, raw_lora_app port 5556, sync word `private`).
+- Running on the real Bobcat (LoRaHub 0.8.16) with the LPS8 as satellite; current state, open items and
+  owner preferences are in SESSION_LOG.md section 1.
 - Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
 
@@ -71,6 +75,11 @@ Pipeline page (web/static/pipeline.js): live flow of packets through gateways, m
 as.up and gs.up events and the current settings. Graphical decoder (web/static/bytemap.js): drag across bytes to create fields,
 used by Decoder Studio, Decoder lab and the node and group Decoder tabs.
 
+Home Assistant: exposing a node publishes its last values (retained) before discovery, so entities never start unknown. Every exposed
+node gets a Last payload sensor and a Send downlink text box; Device.HACommands become buttons and Device.HASwitch adds a switch. All send to `/set`.
+The text box reads the retained `{prefix}/{group}/{node}/command_box` topic: empty at rest, the sent hex for 1.5 s, then empty again, because HA will not send a value equal to the entity's state.
+Per-node commands are defined in LoRaHub (Device.HACommands, exposure popup) and announced to HA. Kinds (`internal/model/hacommand.go`): button (fixed payload, any class), number and text (class C only, payload contains `{value}`). Dynamic ones use `{prefix}/{group}/{node}/cmd/{key}` and `.../state`; the last number is kept in Device.HAValues.
+
 ## Gateway roles and link
 The Bobcat is the main server: LoRaHub plus its own raw_lora_app. The Dragino LPS8 at .17 is only a satellite: it runs
 raw_lora_app, sends uplinks to the Bobcat and receives config and downlinks. Decoding, MQTT and Home Assistant are on the Bobcat.
@@ -84,6 +93,26 @@ Settings.LinkKey on the hub, paired automatically with `set_link_key` when the g
 remove link_key from the gateway's config.json and restart raw_lora_app. get_config with full:true returns the config file;
 set_config merges any settings and restores the previous ones if the radio will not start. Downlinks are confirmed with tx_ack.
 Engines without link 2 keep working with plain datagrams.
+
+Stale entities: `SweepHA` (every 15 s, after node edits, group deletes and settings changes) withdraws `lorahub_*` discovery topics on both
+brokers that no node or gateway stands behind. Field sensors of exposed nodes are kept even if the last packet lacked them; "Clean up and
+announce again" (strict) removes those too. HA is on the external broker 192.168.1.13; LoRaHub also publishes to its own.
+Edits use `mergeJSON` (`internal/api/merge.go`): fields sent are replaced whole, and the stored copy used as "before" is never mutated.
+
+## Downlink settings and node profile
+Effective settings (`downlinkCfg`, `internal/processor/node.go`): Device.RawDownlink (node's Downlink tab: mode, delay, gateway, frequency, SF, BW, CR, power, IQ, preamble, CRC, implicit header, NODE_ID+SERIAL) wins outright; otherwise group `downlink_radio`, class C forcing immediate, then the firmware's profile on top.
+Group option `node_profile` (`internal/model/profile.go`): after SERIAL_ID comes 1 profile byte (bits 7-6 class 00 A/01 B/10 C, bit 5 inverted IQ, bit 4 radio block follows, bits 3-0 free) and an optional 4-byte radio block (frequency in 100 Hz MSB first, 0 = uplink's; then SF nibble, 2-bit BW, 2-bit CR). Removed from `data_hex` before decoding; reported as `profile`, or `profile_error` with the data left intact. Class B is handled like A (no ping slots).
+
+Group option `downlink_control` (node override `node_control`, and it always turns the NODE_ID+SERIAL header on): downlink is `NODE_ID | SERIAL_ID | control | data`, control = bit 7 from hub, bits 6-5 audience (00 one node, 01 group, 10 everyone), bit 4 confirm, bits 3-0 sequence (Device.DownSeq). Broadcast tab (`SendBroadcast`, `internal/processor/broadcast.go`): SERIAL_ID FFFFFFFF, NODE_ID FFFF for everyone; sent once per chosen gateway in turn; class A nodes get a copy in their queue with ExpiresAt, for their next receive window.
+
+## Tunnel between gateways
+WireGuard subnet 10.77.0.0/24: Bobcat 10.77.0.1 (`wg-quick@wg0`, UDP 51820), LPS8 10.77.0.2 (OpenWrt `network.wg0`). The LPS8's raw_lora_app sends to `target_ip` 10.77.0.1. `/usr/bin/wg_roam.sh` (cron, each minute) alternates the Bobcat's LAN and public endpoints while there is no recent handshake; off-network use needs UDP 51820 forwarded to the Bobcat on the home router. Tailscale is on the Bobcat only, advertising 10.77.0.0/24; it does not fit on the LPS8 (36.7 MB download, 9.7 MB free flash, 60 MB RAM).
+Pages: LoRaHub `#/vpn` with WireGuard and Tailscale tabs (`web/static/vpn.js`, `internal/api/vpn.go`; local `wg`, `systemctl`, `tailscale` only, private keys never leave the parser). LPS8: LuCI LoRa Gateway → WireGuard VPN (`view/lora/vpn.htm`, `action_vpn` in `controller/lora.lua`), which edits `network.bobcat.lan_endpoint` and `wan_endpoint` read by `wg_roam.sh`.
+
+Radio config "apply" (`POST /api/concentrator/apply`) restarts raw-lora and puts the previous config.json back when the radio is not
+LISTENING within 25 s (the failed one is kept as config.json.failed). Neither board supports `full_duplex`: it stops the Bobcat with
+"FDD mode of Radio A has not been set properly". Class C downlinks avoid a gateway whose link-2 engine has not reported for 45 s.
+Measured 2026-11-10: LPS8 scheduled TX goes out on time (16 of 16 probes, `scratchpad engine17/txprobe.py`); each SX1302 hears its own TX on its other radio.
 
 ## Deploying
 Windows PC has Go 1.27 in `C:/Program Files/Go/bin`. Key login works on .15 and .17 (.17 needs

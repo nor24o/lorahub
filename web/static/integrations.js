@@ -96,7 +96,7 @@ App.route('/integrations/homeassistant', async () => {
       h('h3', null, 'Nodes'),
       field('Which nodes', mode),
       field('Hide decoded fields', exclude, 'One name or pattern per line, * matches anything. Fine-tune single entities on the Exposed entities tab.'),
-      toggles(ha, [['switches', 'Create switches for relays and valves', 'Needs "Accept simple commands" on the Commands tab.']]),
+      toggles(ha, [['switches', 'Offer commands to nodes', 'A send-downlink box on every node, switches for relays and valves, and your own buttons. Needs "Accept simple commands" on the Commands tab.'], ['last_payload', 'Show the last raw payload as a sensor']]),
       h('h3', null, 'Diagnostics shown for each node'), diag.el,
       h('h3', null, 'Gateways'),
       toggles(ha, [['gateways', 'Expose gateways as devices']]), gwFields.el,
@@ -104,8 +104,19 @@ App.route('/integrations/homeassistant', async () => {
       toggles(ha, [['republish_on_birth', 'Announce everything again when Home Assistant starts']]),
       saveRow(() => saveSettings(s, { home_assistant: Object.assign(ha, { enabled: en.input.checked, discovery_prefix: prefix.value.trim(), expose_mode: mode.value, expire_after_s: Number(expire.value || 0),
         exclude_fields: exclude.value.split('\n').map((x) => x.trim()).filter(Boolean), diagnostics: diag.values(), gateway_fields: gwFields.values() }) })))),
-    h('div', { class: 'card card-body' }, h('h2', null, 'Maintenance'), h('div', { class: 'row' }, action('Announce everything again', '/ha/republish', 'Discovery sent'), action('Remove from Home Assistant', '/ha/remove', 'Entities removed', true))));
+    h('div', { class: 'card card-body' }, h('h2', null, 'Maintenance'), h('div', { class: 'row' }, action('Clean up and announce again', '/ha/republish', 'Old entities removed, discovery sent'), action('Remove from Home Assistant', '/ha/remove', 'Entities removed', true))));
 });
+
+const CMD_FORMATS = [['u8', '1 byte'], ['i8', '1 byte, signed'], ['u16be', '2 bytes, big endian'], ['u16le', '2 bytes, little endian'], ['i16be', '2 bytes signed, big endian'], ['i16le', '2 bytes signed, little endian'],
+  ['u32be', '4 bytes, big endian'], ['u32le', '4 bytes, little endian'], ['i32be', '4 bytes signed, big endian'], ['i32le', '4 bytes signed, little endian']];
+const cmdPayload = (c) => (c.payload_hex || '').replace(/[\s:-]/g, '').toUpperCase().replace('{VALUE}', '{value}');
+const cmdField = (label, control) => h('label', { class: 'cmd-field' }, h('span', { class: 'small muted' }, label), control);
+function cmdOut(c) {
+  const out = { name: c.name, kind: c.kind || 'button', payload_hex: cmdPayload(c) };
+  if (out.kind === 'number') Object.assign(out, { min: Number(c.min || 0), max: Number(c.max || 0), step: Number(c.step || 1), unit: c.unit || '', encoding: c.encoding || 'u8', scale: Number(c.scale || 1) });
+  if (out.kind === 'text') out.encoding = c.encoding || 'hex';
+  return out;
+}
 
 function openNodeExposure(n, reload) {
   const overrides = JSON.parse(JSON.stringify(n.ha_fields || {}));
@@ -124,11 +135,53 @@ function openNodeExposure(n, reload) {
     } }, n.ha_enabled ? 'Stop exposing this node' : 'Expose this node') : h('a', { class: 'btn', href: '#/nodes', onclick: close }, 'Adopt this node first');
     const save = h('button', { class: 'btn primary', onclick: async () => {
       Object.keys(overrides).forEach((k) => { const o = overrides[k]; if (!o.disabled && !o.name && !o.device_class && !o.unit) delete overrides[k]; });
-      try { await api('PUT', `/applications/${n.group}/devices/${n.node}`, { ha_fields: overrides }); toast('Saved'); close(); reload(); } catch (e) { errToast(e); }
+      try { await api('PUT', `/applications/${n.group}/devices/${n.node}`, { ha_fields: overrides, ha_commands: commands.filter((c) => c.name.trim() || cmdPayload(c)).map(cmdOut), ha_switch: outputBox.input.checked, class: classSel.value }); toast('Saved'); close(); reload(); } catch (e) { errToast(e); }
     } }, 'Save');
+    const commands = JSON.parse(JSON.stringify(n.ha_commands || []));
+    const outputBox = checkbox(n.ha_switch, 'This node has an on/off output', 'Adds a switch to Home Assistant.');
+    const cmdBox = h('div', { class: 'stack' });
+    const classSel = sel(n.class || 'A', [['A', 'A: listens only after sending'], ['B', 'B: handled like class A'], ['C', 'C: always listening']], { onchange: () => paintCommands() });
+    if (n.class_from_firmware) { classSel.disabled = true; classSel.title = 'Set by the node\'s firmware'; }
+    const header = (n.downlink_header ? `${n.node_id} ${n.serial} ` : '') + (n.downlink_control ? '[control] ' : '');
+    const setKind = (c, kind) => {
+      c.kind = kind;
+      if (kind === 'number') Object.assign(c, { min: c.min ?? 0, max: c.max || 100, step: c.step || 1, scale: c.scale || 1, encoding: CMD_FORMATS.some((f) => f[0] === c.encoding) ? c.encoding : 'u8' });
+      if (kind === 'text') c.encoding = ['hex', 'ascii'].includes(c.encoding) ? c.encoding : 'hex';
+      if (kind !== 'button' && !cmdPayload(c).includes('{value}')) c.payload_hex = cmdPayload(c) + '{value}';
+      if (kind === 'button') c.payload_hex = cmdPayload(c).replace('{value}', '');
+      paintCommands();
+    };
+    const cmdRow = (c, i) => {
+      const kind = c.kind || 'button';
+      const air = h('div', { class: 'small muted mono' });
+      const showAir = () => { air.textContent = `On air: ${header}${cmdPayload(c) || '…'}`; };
+      showAir();
+      const num = (key, label, attrs) => cmdField(label, inp(c[key] ?? '', Object.assign({ type: 'number', step: 'any', oninput: (e) => { c[key] = e.target.value; } }, attrs)));
+      const extra = kind === 'number' ? h('div', { class: 'cmd-extra' }, num('min', 'Minimum'), num('max', 'Maximum'), num('step', 'Step'),
+        cmdField('Unit', inp(c.unit || '', { placeholder: '%', oninput: (e) => { c.unit = e.target.value; } })),
+        cmdField('Value is sent as', sel(c.encoding || 'u8', CMD_FORMATS, { onchange: (e) => { c.encoding = e.target.value; } })),
+        num('scale', 'Multiply value by'))
+        : kind === 'text' ? h('div', { class: 'cmd-extra' }, cmdField('Value is typed as', sel(c.encoding || 'hex', [['hex', 'Hex'], ['ascii', 'Plain text']], { onchange: (e) => { c.encoding = e.target.value; } }))) : null;
+      return h('div', { class: 'cmd-item' },
+        h('div', { class: 'cmd-row' },
+          inp(c.name, { placeholder: kind === 'number' ? 'Dimmer' : 'Open valve', oninput: (e) => { c.name = e.target.value; } }),
+          sel(kind, classSel.value === 'C' || kind !== 'button' ? [['button', 'Button'], ['number', 'Number'], ['text', 'Text']] : [['button', 'Button']], { onchange: (e) => setKind(c, e.target.value) }),
+          inp(c.payload_hex, { class: 'mono', placeholder: kind === 'button' ? '0101' : '02{value}', spellcheck: 'false', oninput: (e) => { c.payload_hex = e.target.value; showAir(); } }),
+          kind === 'button' ? h('button', { class: 'btn sm', type: 'button', title: 'Send this downlink now', onclick: async () => {
+            try { await api('POST', `/applications/${n.group}/devices/${n.node}/down`, { f_port: 1, frm_payload_hex: cmdPayload(c) }); toast('Downlink sent to the queue'); } catch (e) { errToast(e); }
+          } }, 'Send') : h('span'),
+          h('button', { class: 'icon-btn', type: 'button', title: 'Remove', onclick: () => { commands.splice(i, 1); paintCommands(); } }, icon('trash'))),
+        extra, air,
+        kind !== 'button' && classSel.value !== 'C' ? h('div', { class: 'small', style: { color: 'var(--warning)' } }, 'Hidden from Home Assistant until this node is class C.') : null);
+    };
+    const paintCommands = () => cmdBox.replaceChildren(...commands.map(cmdRow));
+    paintCommands();
     return h('div', { class: 'stack' },
       h('div', { class: 'row between' }, h('span', { class: 'mono small muted' }, `${n.group} / ${n.node}`), h('span', { class: 'badge ' + (n.exposed ? 'ok' : '') }, n.exposed ? 'exposed' : 'not exposed')),
       n.entities.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, ['On', 'Field', 'Type', 'Name', 'Class', 'Unit', 'State'].map((x) => h('th', null, x)))), h('tbody', null, n.entities.map(row)))) : h('div', { class: 'empty' }, 'No decoded data yet, so there is nothing to expose.'),
+      n.entities.length ? h('div', { class: 'stack' }, h('h3', { style: { margin: 0 } }, 'Commands to this node'), h('p', { class: 'small muted', style: { margin: 0 } }, 'Define them here and LoRaHub shows them in Home Assistant, for this node only. A Button sends a fixed payload. On class C nodes, Number adds a slider and Text adds a value box; put {value} in the payload where the value goes.'),
+        cmdField('Node class', classSel), cmdBox,
+        h('div', { class: 'row between' }, h('button', { class: 'btn sm', type: 'button', onclick: () => { commands.push({ name: '', kind: 'button', payload_hex: '' }); paintCommands(); } }, icon('plus'), 'Add command'), outputBox.el)) : null,
       h('div', { class: 'form-actions', style: { justifyContent: 'space-between' } }, toggle, n.entities.length ? h('div', { class: 'row' }, h('button', { class: 'btn', onclick: close }, 'Cancel'), save) : h('button', { class: 'btn', onclick: close }, 'Close')));
   }, { wide: true });
 }

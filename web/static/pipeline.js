@@ -34,6 +34,7 @@ App.route('/pipeline', async () => {
   const schemeMap = {}; (doc.schemes || []).forEach((s) => { schemeMap[s.id] = s; });
   const gwName = (id) => { const g = gws.find((x) => x.gateway_id === id); return (g && g.name) || id; };
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const narrow = matchMedia('(max-width: 760px)');
   const packets = [];
   const counts = {}, edgeCounts = {};
   let selected = null, pinned = null;
@@ -160,14 +161,18 @@ App.route('/pipeline', async () => {
     svg.setAttribute('viewBox', `0 0 ${r.width} ${r.height}`);
     svg.setAttribute('width', r.width);
     svg.setAttribute('height', r.height);
-    const point = (key, right) => { const b = boxes[key].getBoundingClientRect(); return [(right ? b.right : b.left) - r.left, b.top - r.top + b.height / 2]; };
+    const vertical = narrow.matches;
+    const point = (key, out) => {
+      const b = boxes[key].getBoundingClientRect();
+      return vertical ? [b.left - r.left + b.width / 2, (out ? b.bottom : b.top) - r.top] : [(out ? b.right : b.left) - r.left, b.top - r.top + b.height / 2];
+    };
     const on = activeEdges();
     paths = {};
     svg.classList.toggle('dim', Boolean(on));
     svg.replaceChildren(...edgeList().map(([a, b]) => {
-      const [x1, y1] = point(a, true), [x2, y2] = point(b, false), mid = (x1 + x2) / 2;
+      const [x1, y1] = point(a, true), [x2, y2] = point(b, false), midX = (x1 + x2) / 2, midY = (y1 + y2) / 2;
       const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      p.setAttribute('d', `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`);
+      p.setAttribute('d', vertical ? `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}` : `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`);
       const n = edgeCounts[a + '>' + b] || 0;
       p.setAttribute('stroke-width', on && on.has(a + '>' + b) ? 2.5 : Math.min(1 + Math.log2(n + 1) * 0.6, 4));
       p.setAttribute('class', 'pipe-edge' + (on && on.has(a + '>' + b) ? ' on' : ''));
@@ -205,9 +210,11 @@ App.route('/pipeline', async () => {
     const a = boxes['node:' + e.application_id + '/' + e.device_id], g = boxes['gw:' + (e.gateway_ids || [])[0]];
     if (!a || !g) return;
     const r = wrap.getBoundingClientRect(), s = a.getBoundingClientRect(), t = g.getBoundingClientRect();
-    const x1 = s.left - r.left, y1 = s.top - r.top + s.height / 2, x2 = t.right - r.left, y2 = t.top - r.top + t.height / 2;
+    const vertical = narrow.matches;
+    const x1 = vertical ? s.left - r.left + s.width / 2 : s.left - r.left, y1 = vertical ? s.top - r.top : s.top - r.top + s.height / 2;
+    const x2 = vertical ? t.left - r.left + t.width / 2 : t.right - r.left, y2 = vertical ? t.bottom - r.top : t.top - r.top + t.height / 2;
     const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    p.setAttribute('d', `M${x1},${y1} C${x1 - 80},${y1 + 60} ${x2 + 80},${y2 + 60} ${x2},${y2}`);
+    p.setAttribute('d', vertical ? `M${x1},${y1} C${x1 + 90},${y1 - 80} ${x2 + 90},${y2 + 80} ${x2},${y2}` : `M${x1},${y1} C${x1 - 80},${y1 + 60} ${x2 + 80},${y2 + 60} ${x2},${y2}`);
     p.setAttribute('class', 'pipe-edge down');
     svg.append(p);
     flyAlong(p, 'down').then(() => { p.remove(); pulse('gw:' + (e.gateway_ids || [])[0]); });
@@ -272,10 +279,15 @@ App.route('/pipeline', async () => {
     filterNote.replaceChildren(...(selected ? [h('div', { class: 'row', style: { padding: '8px 14px' } }, h('span', { class: 'small muted' }, 'Only packets passing through the selected box'), h('button', { class: 'btn sm', onclick: () => { selected = null; render(); } }, 'Show all'))] : []));
     listBox.replaceChildren(...(list.length ? list.map((e) => {
       const m = e.data || {}, d = devMap[e.application_id + '/' + e.device_id];
-      return h('div', { class: 'pipe-row' + (pinned === e ? ' on' : ''), onclick: () => { pinned = pinned === e ? null : e; render(); if (pinned) replay(e); } },
+      return h('div', { class: 'pipe-row' + (pinned === e ? ' on' : ''), onclick: () => { pinned = pinned === e && !narrow.matches ? null : e; render(); if (pinned) replay(e); if (narrow.matches) openJourney(); } },
         h('span', { class: 'small muted nowrap' }, fmtTime(e.time)), h('b', null, (d && d.name) || e.device_id || 'Unknown'), h('span', { class: 'small muted nowrap' }, (m.gateways || []).length + ' gw'),
         h('div', { class: 'pipe-row-vals' }, flatValues(m.decoded).filter(([k]) => !/^ch\d+_/.test(k)).slice(0, 3).map(([k, v]) => h('span', { class: 'chip' }, h('b', null, k + ' '), String(v)))));
     }) : [h('div', { class: 'empty' }, 'No packets yet.')]));
+  }
+
+  const journeyHome = h('div', { class: 'card-body' }, journey);
+  function openJourney() {
+    modal('Packet journey', () => journey, { wide: true, onClose: () => { pinned = null; journeyHome.append(journey); render(); } });
   }
 
   function render() { buildBoxes(); renderList(); renderJourney(); requestAnimationFrame(drawEdges); }
@@ -319,10 +331,10 @@ App.route('/pipeline', async () => {
 
   render();
   return h('div', { class: 'stack' },
-    pageHead([['Pipeline']], 'Pipeline', ['Where every packet goes, live. Click a box to follow it, or a packet to see its journey.'], [statusEl, followBtn]),
+    pageHead([['Pipeline']], 'Pipeline', ['Where every packet goes, live. Select a box to follow it, or a packet to see its journey.'], [statusEl, followBtn]),
     h('div', { class: 'card' }, h('div', { class: 'pipe-scroll' }, wrap),
       h('div', { class: 'pipe-legend small muted' }, h('span', null, h('i', { class: 'lg up' }), 'packet moving up to the hub'), h('span', null, h('i', { class: 'lg down' }), 'downlink to a gateway'), h('span', null, 'Numbers cover the recent packets on this page.'))),
     h('div', { class: 'pipe-detail' },
       h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Packets')), filterNote, listBox),
-      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Packet journey')), h('div', { class: 'card-body' }, journey))));
+      h('div', { class: 'card pipe-journey' }, h('div', { class: 'card-head' }, h('h2', null, 'Packet journey')), journeyHome)));
 });

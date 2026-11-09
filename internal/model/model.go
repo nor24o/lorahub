@@ -124,12 +124,14 @@ type Application struct {
 	Webhooks    []Webhook         `json:"webhooks"`
 	Attributes  map[string]string `json:"attributes,omitempty"`
 	// Node group: packets whose NODE_ID header equals NodeID belong here.
-	NodeID         string       `json:"node_id"`
-	AutoRegister   bool         `json:"auto_register_nodes"`
-	DownlinkHeader bool         `json:"downlink_header"` // prepend NODE_ID+SERIAL to downlinks
-	RawDownlink    *RawDownlink `json:"downlink_radio,omitempty"`
-	CreatedAt      time.Time    `json:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at"`
+	NodeID          string       `json:"node_id"`
+	AutoRegister    bool         `json:"auto_register_nodes"`
+	DownlinkHeader  bool         `json:"downlink_header"` // prepend NODE_ID+SERIAL to downlinks
+	RawDownlink     *RawDownlink `json:"downlink_radio,omitempty"`
+	NodeProfile     bool         `json:"node_profile,omitempty"`     // nodes send a profile after SERIAL_ID
+	DownlinkControl bool         `json:"downlink_control,omitempty"` // downlinks carry a control byte after SERIAL_ID
+	CreatedAt       time.Time    `json:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at"`
 }
 
 // Webhook posts events to an HTTP endpoint.
@@ -162,6 +164,12 @@ type RawDownlink struct {
 	CodingRate string  `json:"coding_rate"`
 	Power      int     `json:"power"`
 	InvertPol  bool    `json:"invert_polarity"`
+	Preamble   int     `json:"preamble,omitempty"` // symbols, 0 = the gateway's default
+	NoCRC      bool    `json:"no_crc,omitempty"`
+	NoHeader   bool    `json:"implicit_header,omitempty"`
+	Gateway    string  `json:"gateway,omitempty"`      // gateway ID, empty = the one that heard the node best
+	Header     string  `json:"node_header,omitempty"`  // on | off, empty = as the group says
+	Control    string  `json:"node_control,omitempty"` // on | off, empty = as the group says
 }
 
 // Session is the LoRaWAN session state.
@@ -183,6 +191,8 @@ type QueuedDownlink struct {
 	Confirmed bool      `json:"confirmed"`
 	CreatedAt time.Time `json:"created_at"`
 	Decoded   any       `json:"decoded_payload,omitempty"`
+	// ExpiresAt is set on broadcasts waiting for a class A receive window.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // Device is an end device.
@@ -198,6 +208,11 @@ type Device struct {
 	Area          string             `json:"area,omitempty"`
 	HAEnabled     bool               `json:"ha_enabled"`
 	HAFields      map[string]HAField `json:"ha_fields,omitempty"`
+	HACommands    []HACommand        `json:"ha_commands,omitempty"`
+	HAValues      map[string]string  `json:"ha_values,omitempty"`    // last value of each dynamic command, by key
+	HASwitch      bool               `json:"ha_switch,omitempty"`    // node has an on/off output
+	Profile       *NodeProfile       `json:"profile,omitempty"`      // what the firmware last declared
+	DownSeq       uint8              `json:"downlink_seq,omitempty"` // next sequence number in the control byte
 	Band          string             `json:"frequency_plan"`
 	Class         string             `json:"class"` // A | C
 	DevEUI        string             `json:"dev_eui,omitempty"`
@@ -316,6 +331,7 @@ type TxPacket struct {
 	RFChain    int    `json:"rf_chain"`
 	Preamble   int    `json:"preamble,omitempty"`
 	NoCRC      bool   `json:"no_crc"`
+	NoHeader   bool   `json:"implicit_header,omitempty"`
 }
 
 // Event is published on the event bus, stored, and shown in live data.

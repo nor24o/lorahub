@@ -136,7 +136,7 @@ function radioEditor(cfg, save, opts = {}) {
       field('Heartbeat (s)', num('heartbeat_interval_s')),
       h('h3', null, 'Hardware'),
       h('div', { class: 'grid g4' }, field('SPI device', txt('spi_path', 'mono')), field('Reset GPIO', txt('reset_gpio', 'mono')), field('PA GPIO', txt('pa_gpio', 'mono')), field('Clock source', pick('clksrc', [[0, 'Radio 0'], [1, 'Radio 1']]))),
-      h('div', { class: 'grid g4' }, field('RX LED', txt('led_rx', 'mono')), field('TX LED', txt('led_tx', 'mono')), h('div', null, bool('full_duplex', 'Full duplex'), bool('ftime_enable', 'Fine timestamps')), h('div', null, bool('temp_monitor_enable', 'Temperature monitor'), bool('mcu_health_check', 'MCU health check'))),
+      h('div', { class: 'grid g4' }, field('RX LED', txt('led_rx', 'mono')), field('TX LED', txt('led_tx', 'mono')), h('div', null, bool('full_duplex', 'Full duplex (special radio boards only, not the Bobcat or LPS8)'), bool('ftime_enable', 'Fine timestamps')), h('div', null, bool('temp_monitor_enable', 'Temperature monitor'), bool('mcu_health_check', 'MCU health check'))),
       ...otherSettings(),
       saveBtn(() => st)));
   };
@@ -151,9 +151,9 @@ App.route('/radio', async () => {
   const c = await GET('/concentrator');
   const head = pageHead([['Radio config']], 'Radio config', [h('span', { class: 'mono small' }, c.config_path)]);
   if (!c.config) return h('div', { class: 'stack' }, head, h('div', { class: 'callout warn' }, 'Cannot read the configuration: ' + (c.config_error || 'unknown error')));
+  // Applying restarts the engine and puts the old settings back if the radio does not start with the new ones.
   return h('div', { class: 'stack' }, head, radioEditor(c.config, async (cfg, restart) => {
-    await api('PUT', '/concentrator', cfg);
-    if (restart) await api('POST', '/concentrator/service', { cmd: 'restart' });
+    if (restart) await api('POST', '/concentrator/apply', cfg); else await api('PUT', '/concentrator', cfg);
   }));
 });
 
@@ -310,7 +310,7 @@ async function radioPanel(g) {
     paintLive(r);
     if (r.local) {
       const c = await GET('/concentrator');
-      body.replaceChildren(c.config ? radioEditor(c.config, async (cfg, restart) => { await api('PUT', '/concentrator', cfg); if (restart) await api('POST', '/concentrator/service', { cmd: 'restart' }); }) : h('div', { class: 'callout warn' }, 'Cannot read the configuration: ' + (c.config_error || 'unknown error')));
+      body.replaceChildren(c.config ? radioEditor(c.config, async (cfg, restart) => { if (restart) await api('POST', '/concentrator/apply', cfg); else await api('PUT', '/concentrator', cfg); }) : h('div', { class: 'callout warn' }, 'Cannot read the configuration: ' + (c.config_error || 'unknown error')));
       return;
     }
     const facts = h('dl', { class: 'kv small' }, h('dt', null, 'Address'), h('dd', { class: 'mono' }, r.host), h('dt', null, 'Control port'), h('dd', { class: 'mono' }, 'UDP ' + r.control_port), h('dt', null, 'Status port'), h('dd', { class: 'mono' }, 'TCP ' + r.status_port));

@@ -17,7 +17,7 @@ function pollWhileVisible(root, ms, fn) {
   const t = setInterval(() => { if (!root.isConnected) { clearInterval(t); return; } if (!document.hidden) fn(); }, ms);
 }
 function modal(title, body, opts = {}) {
-  const close = () => bg.remove();
+  const close = () => { bg.remove(); if (opts.onClose) opts.onClose(); };
   const bg = h('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) close(); } },
     h('div', { class: 'modal' + (opts.wide ? ' wide' : '') }, h('div', { class: 'card-head' }, h('h2', null, title), h('button', { class: 'icon-btn', title: 'Close', onclick: () => close() }, '✕')), h('div', { class: 'card-body' }, body(close))));
   document.body.append(bg);
@@ -27,7 +27,7 @@ function modal(title, body, opts = {}) {
 function adoptModal(d, onDone) {
   modal(d.adopted ? 'Edit node' : 'Adopt node', (close) => {
     const name = inp(d.name), model = inp(d.model, { placeholder: 'e.g. Soil sensor' }), area = inp(d.area, { placeholder: 'e.g. Greenhouse' });
-    const cls = sel(d.class || 'A', [['A', 'A: battery, listens only after sending'], ['C', 'C: mains powered, always listening']]);
+    const cls = sel(d.class || 'A', [['A', 'A: battery, listens only after sending'], ['B', 'B: handled like class A'], ['C', 'C: mains powered, always listening']]);
     const ha = checkbox(d.ha_enabled, 'Expose to Home Assistant', d.last_decoded ? null : 'Available once this node has decoded data.');
     ha.input.disabled = !d.last_decoded && !d.ha_enabled;
     return [field('Name', name), field('Model', model), field('Room / area', area), field('Class', cls, 'Decides when downlinks are sent.'), ha.el,
@@ -132,6 +132,10 @@ App.route('/decoders', async () => {
 
   function listCard() {
     return h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Schemes'), h('button', { class: 'btn sm', onclick: () => addScheme(newScheme('')) }, icon('plus'), 'New')),
+      doc.schemes.length ? h('div', { class: 'scheme-mobile' },
+        h('input', { type: 'checkbox', checked: doc.schemes[Math.max(current, 0)].enabled !== false, title: 'Enabled', onchange: (e) => { doc.schemes[current].enabled = e.target.checked; dirty = true; saveBar(); } }),
+        sel(current, doc.schemes.map((s, i) => [i, s.name || s.id]), { onchange: (e) => { current = Number(e.target.value); draw(); } }),
+        h('button', { class: 'icon-btn', title: 'Move up', onclick: () => move(current, -1) }, '▲'), h('button', { class: 'icon-btn', title: 'Move down', onclick: () => move(current, 1) }, '▼')) : null,
       h('div', { class: 'scheme-list' }, doc.schemes.length ? doc.schemes.map((s, i) => h('div', { class: 'scheme-row' + (i === current ? ' on' : ''), onclick: () => { current = i; draw(); } },
         h('input', { type: 'checkbox', checked: s.enabled !== false, title: 'Enabled', onclick: (e) => { e.stopPropagation(); s.enabled = e.target.checked; dirty = true; saveBar(); } }),
         h('div', { class: 'scheme-name' }, h('div', null, s.name || s.id), h('div', { class: 'small muted' }, `${s.matchType}${s.matchValue ? ' ' + s.matchValue : ''} · ${s.type}`)),
@@ -260,8 +264,8 @@ App.route('/decoders', async () => {
   function draw() {
     saveBar();
     root.replaceChildren(
-      pageHead([['Decoder Studio']], 'Decoder Studio', ['The first enabled scheme that matches and decodes wins. A decoder set on a node or group takes priority.'], [
-        h('button', { class: 'btn', onclick: importDoc }, 'Import'), h('button', { class: 'btn', onclick: exportDoc }, icon('download'), 'Export')]),
+      pageHead([['Decoder Studio']], 'Decoder Studio', ['The first enabled scheme that decodes wins. Node and group decoders go first.'], [
+        h('button', { class: 'btn hide-phone', onclick: importDoc }, 'Import'), h('button', { class: 'btn hide-phone', onclick: exportDoc }, icon('download'), 'Export')]),
       bar,
       h('div', { class: 'studio' }, listCard(), current >= 0 && doc.schemes[current] ? editorCard(doc.schemes[current]) : h('div', { class: 'card empty' }, 'Choose a scheme or create a new one.')));
   }

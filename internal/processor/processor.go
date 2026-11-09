@@ -39,8 +39,10 @@ type Processor struct {
 	smu      sync.RWMutex
 	settings config.Settings
 
-	dmu         sync.Mutex
-	downlinkers map[string]Downlinker // by gateway kind
+	dmu          sync.Mutex
+	downlinkers  map[string]Downlinker // by gateway kind
+	broadcastSeq seqCounter
+	echo         echoGuard
 
 	qmu   sync.Mutex
 	dedup map[string]*dedupEntry
@@ -301,6 +303,11 @@ func (p *Processor) HandleUplink(pkt model.RxPacket) {
 	}
 	if pkt.Meta.CRCStatus == "bad" {
 		summary = "CRC error · " + summary
+	}
+	if p.echo.heard(pkt.Payload) {
+		ev["echo"] = true
+		p.emit(&model.Event{Name: "gs.up", Gateways: []string{g.ID}, Summary: "Own downlink heard back, ignored · " + summary, Data: ev}, p.Settings().StoreGatewayRaw)
+		return
 	}
 	p.emit(&model.Event{Name: "gs.up", Gateways: []string{g.ID}, Summary: summary, Data: ev}, p.Settings().StoreGatewayRaw)
 	p.forwardUplink(g, pkt)
