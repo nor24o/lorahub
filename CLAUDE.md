@@ -67,6 +67,10 @@ Realtime status, Radio config, TX test, Remote config, Logs, Decoder lab, MQTT &
 per-entity exposure). GPIO and Pinout pages were removed on request.
 Remote config does NOT use SSH (owner's requirement); it uses the raw_lora_app link below.
 
+Pipeline page (web/static/pipeline.js): live flow of packets through gateways, merge, decoder, node and outputs, built from
+as.up and gs.up events and the current settings. Graphical decoder (web/static/bytemap.js): drag across bytes to create fields,
+used by Decoder Studio, Decoder lab and the node and group Decoder tabs.
+
 ## Gateway roles and link
 The Bobcat is the main server: LoRaHub plus its own raw_lora_app. The Dragino LPS8 at .17 is only a satellite: it runs
 raw_lora_app, sends uplinks to the Bobcat and receives config and downlinks. Decoding, MQTT and Home Assistant are on the Bobcat.

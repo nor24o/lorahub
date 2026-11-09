@@ -429,6 +429,15 @@ func (m *MQTT) RemoveHA() {
 	}
 }
 
+// ForgetGateway withdraws what was published under a gateway's former ID.
+func (m *MQTT) ForgetGateway(id string) {
+	s := m.settings()
+	for _, k := range gatewayFields {
+		m.publish(gatewayTopic(s, id, k.key), []byte{}, true)
+	}
+	m.publish(s.MQTTTopicPrefix+"/gateways/"+id+"/status", []byte{}, true)
+}
+
 func (m *MQTT) handleBirth(payload []byte) {
 	if strings.TrimSpace(string(payload)) == "online" && m.settings().HomeAssistant.RepublishOnBirth {
 		m.RepublishHA()

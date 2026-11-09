@@ -109,7 +109,9 @@ func (p *Processor) handleNode(fr *Frame) bool {
 		p.touchDevice(dv, fr, msg["decoded"])(dv)
 		dv.LastScheme = ""
 		if info, ok := msg["decoder"].(map[string]any); ok {
-			dv.LastScheme, _ = info["name"].(string)
+			if _, isScheme := info["scheme_id"]; isScheme {
+				dv.LastScheme, _ = info["name"].(string)
+			}
 		}
 		if !dv.Adopted { // what the node says about itself, until the owner decides
 			if c, _ := decoded["node_class"].(string); c == "A" || c == "C" {
@@ -213,10 +215,17 @@ func (p *Processor) buildNodeMessage(app *model.Application, d *model.Device, hd
 	}
 	res := formatter.Decode(f, formatter.Input{Bytes: hdr.Data, FPort: 1, RecvTime: fr.At, Meta: attrs,
 		Vars: map[string]any{"node_id": hdr.NodeID, "serial": hdr.Serial, "payload": fr.Payload}})
+	if res != nil && len(res.Data) > 0 {
+		source := "group"
+		if d.Uplink.Type != "" && d.Uplink.Type != "inherit" {
+			source = "node"
+		}
+		msg["decoder"] = map[string]any{"source": source, "name": f.Type}
+	}
 	if (res == nil || (len(res.Data) == 0 && len(res.Errors) == 0)) && scheme != nil { // no usable decoder on the node or group: use the schemes
 		res = &formatter.Result{Data: scheme.Data, Warnings: scheme.Warnings, Errors: scheme.Errors}
 		if scheme.SchemeID != "" {
-			msg["decoder"] = map[string]any{"scheme_id": scheme.SchemeID, "name": scheme.SchemeName}
+			msg["decoder"] = map[string]any{"source": "scheme", "scheme_id": scheme.SchemeID, "name": scheme.SchemeName}
 		}
 	}
 	if res != nil {

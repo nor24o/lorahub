@@ -139,6 +139,10 @@ func main() {
 		return ids
 	}
 	go mq.Run(bus, stop)
+	for _, id := range proc.RenamedGateways() {
+		// Later, so an external broker has had time to connect.
+		time.AfterFunc(20*time.Second, func() { mq.ForgetGateway(id) })
+	}
 
 	report := func(e *model.Event) {
 		e.Time = time.Now().UTC()

@@ -420,14 +420,24 @@ App.route('/gateways', async () => {
   return h('div', { class: 'stack' },
     pageHead([['Gateways']], 'Gateways', [`${gws.filter((g) => g.online).length} of ${gws.length} connected`], [h('a', { class: 'btn primary', href: '#/gateways/new' }, icon('plus'), 'Register gateway')]),
     h('div', { class: 'card' }, gws.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' },
-      h('thead', null, h('tr', null, ['Status', 'ID', 'Name', 'EUI', 'Connection', 'Address', 'RX / TX', 'Last seen'].map((x) => h('th', null, x)))),
+      h('thead', null, h('tr', null, ['Status', 'ID', 'Name', 'EUI', 'Link', 'Engine', 'Address', 'RX / TX', 'Last seen'].map((x) => h('th', null, x)))),
       h('tbody', null, gws.map((g) => h('tr', { class: 'click', onclick: () => { location.hash = '#/gateways/' + g.gateway_id; } },
         h('td', null, h('span', { class: 'dot ' + (g.online ? 'on' : 'off') })), h('td', null, h('b', null, g.gateway_id)), h('td', null, g.name || '—'),
-        h('td', { class: 'mono small' }, g.eui), h('td', null, h('span', { class: 'badge' }, KIND_LABEL[g.kind] || g.kind)), h('td', { class: 'mono small' }, g.last_addr || '—'),
+        h('td', { class: 'mono small' }, g.eui), h('td', null, linkBadge(g)), h('td', { class: 'small nowrap' }, engineLabel(g)), h('td', { class: 'mono small' }, g.last_addr || '—'),
         h('td', { class: 'nowrap' }, `${g.rx_count} / ${g.tx_count}`), h('td', { class: 'small muted nowrap' }, ago(g.last_seen))))))) :
       h('div', { class: 'empty' }, icon('gateway'), 'No gateways yet. Gateways auto-register when they connect (see Settings), or register one manually.')),
     connectionHelp());
 });
+
+function linkBadge(g) {
+  const st = g.last_status || {};
+  if (st.link >= 2) return h('span', { class: 'badge ' + (st.auth ? 'ok' : 'warn') }, st.auth ? 'Reliable, signed' : 'Reliable, pairing');
+  return h('span', { class: 'badge' }, KIND_LABEL[g.kind] || g.kind);
+}
+function engineLabel(g) {
+  const st = g.last_status || {};
+  return st.engine ? `${({ 'dragino-lps8': 'Dragino LPS8', 'bobcat-300': 'Bobcat 300' })[st.model] || st.model} · v${st.engine}` : '—';
+}
 
 function connectionHelp(g) {
   const host = location.hostname;
@@ -463,7 +473,7 @@ App.route('/gateways/new', async () => {
 
 function gwHeader(g, active) {
   return [pageHead([['Gateways', '#/gateways'], [g.gateway_id]], g.name || g.gateway_id,
-    [h('span', { class: 'mono small' }, 'EUI ' + g.eui), onlineBadge(g.online, g.last_seen), h('span', { class: 'badge' }, KIND_LABEL[g.kind] || g.kind), h('span', null, `↑ ${g.rx_count}  ↓ ${g.tx_count}`)]),
+    [h('span', { class: 'mono small' }, 'EUI ' + g.eui), onlineBadge(g.online, g.last_seen), linkBadge(g), g.last_status && g.last_status.engine ? h('span', { class: 'small muted' }, engineLabel(g)) : null, h('span', null, `↑ ${g.rx_count}  ↓ ${g.tx_count}`)]),
   tabs('#/gateways/' + g.gateway_id, [['', 'Overview'], ['live', 'Live data'], ['radio', 'Radio'], ['transmit', 'Transmit'], ['settings', 'Settings'], ['connect', 'Connection']], active)];
 }
 

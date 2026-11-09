@@ -143,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		if r.URL.Path != "/" {
 			if _, err := fs.Stat(s.Web, strings.TrimPrefix(r.URL.Path, "/")); err == nil {
+				w.Header().Set("Cache-Control", "no-cache") // a new version must show at once
 				files.ServeHTTP(w, r)
 				return
 			}

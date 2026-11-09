@@ -54,6 +54,8 @@ type Processor struct {
 	schemes *formatter.SchemeDoc
 	rules   []model.Rule
 
+	renamed []string // former gateway IDs corrected at startup
+
 	dutyMu sync.Mutex
 	duty   map[string][]dutyEntry
 
@@ -77,6 +79,7 @@ func New(st *store.Store, bus *events.Bus, log *slog.Logger) *Processor {
 		}
 	}
 	p.settings = s
+	p.fixReversedIDs()
 	p.loadPipeline()
 	return p
 }
@@ -202,7 +205,9 @@ func (p *Processor) HandleStatus(eui, kind, addr string, status map[string]any) 
 		}
 		if status != nil {
 			merged := map[string]any{}
-			if len(gw.LastStatus) > 0 {
+			// A current engine reports everything each time, so nothing from
+			// older status formats is carried along.
+			if _, complete := status["link"]; !complete && len(gw.LastStatus) > 0 {
 				jsonUnmarshal(gw.LastStatus, &merged)
 			}
 			for k, v := range status {

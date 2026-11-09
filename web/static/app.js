@@ -465,25 +465,9 @@ function formatterEditor(fmt, opts = {}) {
   const testHex = inp(opts.samplePayload || '', { class: 'mono', placeholder: 'e.g. 0167011002687F' });
   const testPort = inp(opts.fport || 1, { type: 'number', min: 0, max: 255, style: { width: '90px' } });
   const out = h('div');
-
-  function fieldsTable() {
-    const tbody = h('tbody');
-    st.fields.forEach((f, i) => {
-      const upd = (k, conv) => (e) => { f[k] = conv ? conv(e.target.value) : e.target.value; };
-      tbody.append(h('tr', null,
-        h('td', null, inp(f.name, { oninput: upd('name'), placeholder: 'temperature' })),
-        h('td', null, inp(f.offset, { type: 'number', oninput: upd('offset', Number), style: { width: '70px' } })),
-        h('td', null, inp(f.length || '', { type: 'number', oninput: upd('length', Number), style: { width: '70px' }, placeholder: 'auto' })),
-        h('td', null, sel(f.type, FIELD_TYPES, { onchange: (e) => { f.type = e.target.value; f.length = 0; render(); } })),
-        h('td', null, inp(f.scale || '', { type: 'number', step: 'any', oninput: upd('scale', Number), style: { width: '80px' }, placeholder: '1' })),
-        h('td', null, inp(f.add || '', { type: 'number', step: 'any', oninput: upd('add', Number), style: { width: '70px' }, placeholder: '0' })),
-        h('td', null, fieldOptionsButton(f, render)),
-        h('td', null, h('button', { class: 'icon-btn', onclick: () => { st.fields.splice(i, 1); render(); } }, icon('trash')))));
-    });
-    return h('div', { class: 'stack' },
-      h('div', { class: 'table-wrap card' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Name', 'Offset', 'Length', 'Type', 'Scale', 'Add', '', ''].map((x) => h('th', null, x)))), tbody)),
-      h('button', { class: 'btn', onclick: () => { st.fields.push({ name: '', offset: 0, type: 'uint8', scale: 1 }); render(); } }, icon('plus'), 'Add field'));
-  }
+  let mapper = null;
+  let autoTimer = null;
+  const autoTest = () => { clearTimeout(autoTimer); autoTimer = setTimeout(() => { if (cleanHex(testHex.value)) test(); }, 250); };
 
   async function test() {
     out.replaceChildren(h('span', { class: 'muted small' }, 'Running…'));
@@ -492,7 +476,9 @@ function formatterEditor(fmt, opts = {}) {
       const parts = [];
       if (r.errors && r.errors.length) parts.push(h('div', { class: 'callout warn' }, h('b', null, 'Errors: '), r.errors.join('; ')));
       if (r.warnings && r.warnings.length) parts.push(h('div', { class: 'callout' }, h('b', null, 'Warnings: '), r.warnings.join('; ')));
-      parts.push(jsonView(r.data || {}));
+      if (mapper) mapper.setValues(r.data || {});
+      parts.push(valueTiles(r.data || {}));
+      parts.push(h('details', null, h('summary', { class: 'small muted' }, 'JSON'), jsonView(r.data || {})));
       parts.push(h('div', { class: 'small faint' }, `Executed in ${r.duration_ms.toFixed(2)} ms`));
       out.replaceChildren(...parts);
     } catch (e) { out.replaceChildren(h('div', { class: 'callout warn' }, e.message)); }
@@ -505,7 +491,7 @@ function formatterEditor(fmt, opts = {}) {
     return h('div', { class: 'bytes' }, (hx.match(/../g) || []).map((b, i) => h('span', { class: hl.has(i) ? 'hl' : '' }, b, h('small', null, i))));
   }
   const pills = h('div');
-  testHex.addEventListener('input', () => pills.replaceChildren(bytePills()));
+  testHex.addEventListener('input', () => { pills.replaceChildren(bytePills()); if (mapper) mapper.redraw(); autoTest(); });
 
   function render() {
     const kids = [field('Formatter type', typeSel)];
@@ -519,7 +505,8 @@ function formatterEditor(fmt, opts = {}) {
       kids.push(field('Data offset', inp(st.data_offset || 0, { type: 'number', min: 0, oninput: (e) => { st.data_offset = Number(e.target.value); }, style: { width: '120px' } }),
         'Extra bytes to skip at the start of the data (the NODE_ID + SERIAL header is already removed).'));
     } else if (st.type === 'fields') {
-      kids.push(field('Fields', fieldsTable(), 'Offsets count from the first data byte after the header; a negative offset counts from the end. Length -1 reads to the end. Numeric values become value × scale + add.'));
+      mapper = byteMapper({ fields: st.fields, bytes: () => cleanHex(testHex.value).match(/../g) || [], onChange: autoTest });
+      kids.push(mapper.el);
     } else if (isMethod(st.type)) {
       kids.push(decodeMethodEditor(st, () => {}));
     } else if (st.type === 'inherit') {
@@ -585,6 +572,10 @@ const App = {
     this.shell();
     window.addEventListener('hashchange', () => this.dispatch());
     this.dispatch();
+    setInterval(async () => {   // pick up a new LoRaHub version without a manual refresh
+      if (document.hidden || document.querySelector('.modal-bg')) return;
+      try { const s = await api('GET', '/auth/status'); if (s.version && s.version !== this.version) location.reload(); } catch (e) { /* restarting */ }
+    }, 30000);
   },
   showAuth(setup) {
     this.leave();
@@ -613,6 +604,7 @@ const App = {
       h('div', { class: 'nav' },
         navItem('#/', 'home', 'Overview'),
         h('div', { class: 'nav-section' }, 'Live'),
+        navItem('#/pipeline', 'link', 'Pipeline'),
         navItem('#/status', 'live', 'Realtime status'),
         navItem('#/live', 'eye', 'Live data'),
         h('div', { class: 'nav-section' }, 'Network'),

@@ -111,8 +111,37 @@ func (p *Processor) adoptReversedEUI(eui, kind string) *model.Gateway {
 	}
 	p.log.Info("corrected gateway EUI", "gateway", g.ID, "eui", eui)
 	g.EUI = eui
+	p.renameToEUI(g, reverseEUI(eui))
+	if fixed, err := p.store.GatewayByEUI(eui); err == nil {
+		return fixed
+	}
 	return g
 }
+
+// renameToEUI gives a gateway the ID that belongs to its correct EUI.
+func (p *Processor) renameToEUI(g *model.Gateway, oldEUI string) {
+	newID := gatewayIDFromEUI(g.EUI)
+	if err := p.store.RenameGateway(g.ID, newID, oldEUI); err != nil {
+		p.log.Warn("correct gateway ID", "gateway", g.ID, "err", err)
+		return
+	}
+	p.log.Info("corrected gateway ID", "from", g.ID, "to", newID)
+	p.renamed = append(p.renamed, g.ID)
+}
+
+// fixReversedIDs corrects gateways whose ID was made from a reversed EUI.
+func (p *Processor) fixReversedIDs() {
+	for _, g := range p.store.Gateways() {
+		old := reverseEUI(g.EUI)
+		if g.Kind == "bobcat" && old != "" && old != g.EUI && g.ID == gatewayIDFromEUI(old) {
+			p.renameToEUI(g, old)
+		}
+	}
+}
+
+// RenamedGateways lists former IDs corrected at startup, so what was published
+// under them can be withdrawn.
+func (p *Processor) RenamedGateways() []string { return append([]string{}, p.renamed...) }
 
 var modelNames = map[string]string{"dragino-lps8": "Dragino LPS8", "bobcat-300": "Bobcat 300"}
 
