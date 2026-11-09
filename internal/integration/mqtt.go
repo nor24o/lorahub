@@ -35,11 +35,24 @@ type MQTT struct {
 
 	// Device looks up a node; set once before Run.
 	Device func(appID, devID string) (*model.Device, error)
+	// Devices and Gateways list what can be exposed; set once before Run.
+	Devices func() []*model.Device
+	// LastMessage returns a node's latest as.up message as JSON, or nil.
+	LastMessage func(appID, devID string) []byte
+	Gateways    func() []string
+	// Group looks up a node group; SaveControlValue remembers the last value
+	// of a dynamic command. Both are set once before Run.
+	Group            func(appID string) (*model.Application, error)
+	SaveControlValue func(appID, devID, key, value string)
 
 	mu     sync.Mutex
 	ext    paho.Client
 	extKey string
 	haSent map[string]bool
+	// extRetained holds LoRaHub's discovery topics seen on the external broker.
+	extRetained map[string]bool
+	// syncMu keeps node changes and the stale-entity sweep from overlapping.
+	syncMu sync.Mutex
 }
 
 // NewMQTT creates the MQTT integration; the embedded broker is started if
@@ -78,6 +91,12 @@ func NewMQTT(cfg *config.Config, settings func() config.Settings, dl DownlinkFun
 			m.handleDown(pk.TopicName, pk.Payload)
 		})
 		srv.Subscribe(prefix+"/+/+/set", 2, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
+			m.handleDown(pk.TopicName, pk.Payload)
+		})
+		srv.Subscribe(settings().HomeAssistant.DiscoveryPrefix+"/status", 3, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
+			m.handleBirth(pk.Payload)
+		})
+		srv.Subscribe(prefix+"/+/+/cmd/+", 4, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
 			m.handleDown(pk.TopicName, pk.Payload)
 		})
 		log.Info("embedded MQTT broker listening", "addr", cfg.MQTTBroker.Listen)
@@ -134,6 +153,13 @@ func (m *MQTT) ensureExternal() paho.Client {
 			handler := func(_ paho.Client, msg paho.Message) { m.handleDown(msg.Topic(), msg.Payload()) }
 			c.Subscribe(prefix+"/+/+/down", 0, handler)
 			c.Subscribe(prefix+"/+/+/set", 0, handler)
+			c.Subscribe(prefix+"/+/+/cmd/+", 0, handler)
+			// What Home Assistant's broker holds from LoRaHub, so stale entities can be withdrawn.
+			disc := m.settings().HomeAssistant.DiscoveryPrefix
+			note := func(_ paho.Client, msg paho.Message) { m.noteRetained(msg.Topic(), msg.Payload()) }
+			c.Subscribe(disc+"/+/+/+/config", 0, note)
+			c.Subscribe(disc+"/+/+/config", 0, note)
+			c.Subscribe(m.settings().HomeAssistant.DiscoveryPrefix+"/status", 0, func(_ paho.Client, msg paho.Message) { m.handleBirth(msg.Payload()) })
 		})
 	c := paho.NewClient(o)
 	c.Connect()
@@ -146,12 +172,24 @@ func (m *MQTT) ensureExternal() paho.Client {
 // "f_port", "confirmed", "replace".
 func (m *MQTT) handleDown(topic string, payload []byte) {
 	parts := strings.Split(topic, "/")
+	cmds := m.settings().MQTTCommands
+	if len(parts) == 5 && parts[3] == "cmd" {
+		if cmds.AcceptSet {
+			m.handleControl(parts[1], parts[2], parts[4], payload)
+		}
+		return
+	}
 	if len(parts) != 4 {
 		return
 	}
 	appID, devID := parts[1], parts[2]
 	if parts[3] == "set" {
-		m.handleSet(appID, devID, payload)
+		if cmds.AcceptSet {
+			m.handleSet(appID, devID, payload)
+		}
+		return
+	}
+	if !cmds.AcceptDown {
 		return
 	}
 	var req struct {
@@ -181,11 +219,12 @@ func (m *MQTT) handleDown(topic string, payload []byte) {
 }
 
 func (m *MQTT) publish(topic string, payload []byte, retain bool) {
+	qos := m.settings().MQTTPublish.QoS
 	if m.broker != nil {
-		m.broker.Publish(topic, payload, retain, 0)
+		m.broker.Publish(topic, payload, retain, qos)
 	}
 	if c := m.ensureExternal(); c != nil && c.IsConnected() {
-		c.Publish(topic, 0, retain, payload)
+		c.Publish(topic, qos, retain, payload)
 	}
 }
 
@@ -201,6 +240,7 @@ func (m *MQTT) Run(bus *events.Bus, stop <-chan struct{}) {
 			return
 		case <-tick.C:
 			m.ensureExternal()
+			m.SweepHA(false)
 		case e, ok := <-ch:
 			if !ok {
 				return
@@ -212,30 +252,57 @@ func (m *MQTT) Run(bus *events.Bus, stop <-chan struct{}) {
 
 func (m *MQTT) handleEvent(e *model.Event) {
 	s := m.settings()
-	p := s.MQTTTopicPrefix
+	p, out := s.MQTTTopicPrefix, s.MQTTPublish
 	b, _ := json.Marshal(e.Data)
 	switch {
 	case e.Name == "as.up":
-		m.publish(fmt.Sprintf("%s/%s/%s/up", p, e.AppID, e.DevID), b, false)
+		if out.Up {
+			m.publish(fmt.Sprintf("%s/%s/%s/up", p, e.AppID, e.DevID), filterUp(b, s), false)
+		}
 		m.nodeState(e, s, b)
-	case e.Name == "ns.join.accept":
-		m.publish(fmt.Sprintf("%s/%s/%s/join", p, e.AppID, e.DevID), b, false)
-	case e.Name == "as.down.queued":
+	case e.Name == "as.down.queued" && out.DownEvents:
 		m.publish(fmt.Sprintf("%s/%s/%s/down/queued", p, e.AppID, e.DevID), b, false)
-	case e.Name == "ns.down.sent":
+	case e.Name == "ns.down.sent" && out.DownEvents:
 		m.publish(fmt.Sprintf("%s/%s/%s/down/sent", p, e.AppID, e.DevID), b, false)
-	case e.Name == "ns.down.failed":
+	case e.Name == "ns.down.failed" && out.DownEvents:
 		m.publish(fmt.Sprintf("%s/%s/%s/down/failed", p, e.AppID, e.DevID), b, false)
-	case e.Name == "ns.up.unmatched":
+	case e.Name == "ns.up.unmatched" && out.Unmatched:
 		m.publish(p+"/unmatched", b, false)
-	case e.Name == "gs.up" && len(e.Gateways) > 0:
+	case e.Name == "gs.up" && out.GatewayUp && len(e.Gateways) > 0:
 		m.publish(p+"/gateways/"+e.Gateways[0]+"/up", b, false)
 	case e.Name == "gs.status" && len(e.Gateways) > 0:
-		m.publish(p+"/gateways/"+e.Gateways[0]+"/status", b, true)
-		if s.HomeAssistant.Enabled {
+		// Home Assistant's gateway sensors read this topic.
+		if out.GatewayStatus || (s.HomeAssistant.Enabled && s.HomeAssistant.Gateways) {
+			m.publish(p+"/gateways/"+e.Gateways[0]+"/status", b, true)
+		}
+		if s.HomeAssistant.Enabled && s.HomeAssistant.Gateways {
 			m.gatewayDiscovery(e.Gateways[0], e.Data, s)
 		}
 	}
+}
+
+// filterUp removes the parts of an uplink message that are turned off.
+func filterUp(raw []byte, s config.Settings) []byte {
+	out := s.MQTTPublish
+	if out.IncludeGateways && out.IncludeRadio && out.IncludeRaw {
+		return raw
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	if !out.IncludeGateways {
+		delete(m, "gateways")
+	}
+	if !out.IncludeRadio {
+		delete(m, "radio")
+	}
+	if !out.IncludeRaw {
+		delete(m, "payload_hex")
+		delete(m, "data_hex")
+	}
+	b, _ := json.Marshal(m)
+	return b
 }
 
 func haClass(field string) (string, string) {

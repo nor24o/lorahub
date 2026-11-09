@@ -5,11 +5,9 @@ package formatter
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"time"
@@ -220,6 +218,21 @@ func Decode(f model.Formatter, in Input) *Result {
 	switch f.Type {
 	case "", "none", "inherit":
 		return nil
+	}
+	if p, err := applyPre(f.Options, in.Bytes); err != nil {
+		return &Result{Errors: []string{err.Error()}}
+	} else {
+		in.Bytes = p
+	}
+	if IsMethod(f.Type) {
+		b := in.Bytes
+		if f.DataOffset > 0 && f.DataOffset <= len(b) {
+			b = b[f.DataOffset:]
+		}
+		d, w, e := decodeMethod(f.Type, f.Fields, f.Options, b)
+		return &Result{Data: d, Warnings: w, Errors: e}
+	}
+	switch f.Type {
 	case "javascript":
 		r := DecodeJS(f.Code, in)
 		return &r
@@ -239,94 +252,4 @@ func Decode(f model.Formatter, in Input) *Result {
 		return &Result{Data: d, Warnings: warns}
 	}
 	return &Result{Errors: []string{"unknown formatter type " + f.Type}}
-}
-
-// DecodeFields applies a list of byte-range fields.
-func DecodeFields(fields []model.Field, b []byte) (map[string]any, []string) {
-	out := map[string]any{}
-	var warns []string
-	for _, f := range fields {
-		if f.Name == "" {
-			continue
-		}
-		l := f.Length
-		if l <= 0 {
-			l = typeLen(f.Type)
-		}
-		if f.Offset < 0 || f.Offset+l > len(b) {
-			warns = append(warns, fmt.Sprintf("field %s out of range", f.Name))
-			continue
-		}
-		seg := b[f.Offset : f.Offset+l]
-		var num float64
-		isNum := true
-		switch f.Type {
-		case "uint8":
-			num = float64(seg[0])
-		case "int8":
-			num = float64(int8(seg[0]))
-		case "uint16_be", "uint16":
-			num = float64(binary.BigEndian.Uint16(seg))
-		case "uint16_le":
-			num = float64(binary.LittleEndian.Uint16(seg))
-		case "int16_be", "int16":
-			num = float64(int16(binary.BigEndian.Uint16(seg)))
-		case "int16_le":
-			num = float64(int16(binary.LittleEndian.Uint16(seg)))
-		case "uint24_be":
-			num = float64(uint32(seg[0])<<16 | uint32(seg[1])<<8 | uint32(seg[2]))
-		case "int24_be":
-			v := int32(uint32(seg[0])<<16 | uint32(seg[1])<<8 | uint32(seg[2]))
-			if v&0x800000 != 0 {
-				v -= 0x1000000
-			}
-			num = float64(v)
-		case "uint32_be", "uint32":
-			num = float64(binary.BigEndian.Uint32(seg))
-		case "uint32_le":
-			num = float64(binary.LittleEndian.Uint32(seg))
-		case "int32_be", "int32":
-			num = float64(int32(binary.BigEndian.Uint32(seg)))
-		case "int32_le":
-			num = float64(int32(binary.LittleEndian.Uint32(seg)))
-		case "float32_be", "float32":
-			num = float64(math.Float32frombits(binary.BigEndian.Uint32(seg)))
-		case "float32_le":
-			num = float64(math.Float32frombits(binary.LittleEndian.Uint32(seg)))
-		case "bool":
-			out[f.Name] = seg[0] != 0
-			isNum = false
-		case "bit":
-			out[f.Name] = (seg[0]>>uint(f.Bit))&1 == 1
-			isNum = false
-		case "ascii":
-			out[f.Name] = strings.TrimRight(string(seg), "\x00")
-			isNum = false
-		default: // hex
-			out[f.Name] = strings.ToUpper(hex.EncodeToString(seg))
-			isNum = false
-		}
-		if isNum {
-			if f.Scale != 0 {
-				num *= f.Scale
-			}
-			num += f.Add
-			out[f.Name] = math.Round(num*1e6) / 1e6
-		}
-	}
-	return out, warns
-}
-
-func typeLen(t string) int {
-	switch {
-	case strings.HasPrefix(t, "uint8"), strings.HasPrefix(t, "int8"), t == "bool", t == "bit":
-		return 1
-	case strings.Contains(t, "16"):
-		return 2
-	case strings.Contains(t, "24"):
-		return 3
-	case strings.Contains(t, "32"):
-		return 4
-	}
-	return 1
 }

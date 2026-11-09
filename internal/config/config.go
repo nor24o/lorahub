@@ -38,7 +38,6 @@ type Config struct {
 		RestartCommand string `yaml:"restart_command"`
 		StatusAddr     string `yaml:"status_addr"`
 		Service        string `yaml:"service"`
-		GPIOAllowed    []int  `yaml:"gpio_allowed"`
 	} `yaml:"concentrator"`
 }
 
@@ -106,6 +105,8 @@ type Settings struct {
 	EventMaxRows         int    `json:"event_max_rows"`
 	StoreGatewayRaw      bool   `json:"store_gateway_raw_events"`
 	GatewayOfflineSec    int    `json:"gateway_offline_after_s"`
+	LinkKey              string `json:"link_key"`       // shared with paired raw_lora_app gateways
+	LinkAutoPair         bool   `json:"link_auto_pair"` // give the key to gateways that have none
 
 	MQTTTopicPrefix string `json:"mqtt_topic_prefix"`
 	ExternalMQTT    struct {
@@ -115,9 +116,37 @@ type Settings struct {
 		Password string `json:"password"`
 		ClientID string `json:"client_id"`
 	} `json:"external_mqtt"`
+	MQTTPublish struct {
+		Up              bool `json:"up"`
+		IncludeGateways bool `json:"include_gateways"`
+		IncludeRadio    bool `json:"include_radio"`
+		IncludeRaw      bool `json:"include_raw"`
+		State           bool `json:"state"`
+		StateRetain     bool `json:"state_retain"`
+		GatewayUp       bool `json:"gateway_up"`
+		GatewayStatus   bool `json:"gateway_status"`
+		Unmatched       bool `json:"unmatched"`
+		DownEvents      bool `json:"down_events"`
+		QoS             byte `json:"qos"`
+	} `json:"mqtt_publish"`
+	MQTTCommands struct {
+		AcceptDown bool   `json:"accept_down"`
+		AcceptSet  bool   `json:"accept_set"`
+		OnHex      string `json:"on_hex"`
+		OffHex     string `json:"off_hex"`
+	} `json:"mqtt_commands"`
 	HomeAssistant struct {
-		Enabled         bool   `json:"enabled"`
-		DiscoveryPrefix string `json:"discovery_prefix"`
+		Enabled          bool     `json:"enabled"`
+		DiscoveryPrefix  string   `json:"discovery_prefix"`
+		ExposeMode       string   `json:"expose_mode"` // adopted | all
+		ExcludeFields    []string `json:"exclude_fields"`
+		Diagnostics      []string `json:"diagnostics"`
+		Switches         bool     `json:"switches"`
+		ExpireAfter      int      `json:"expire_after_s"`
+		Gateways         bool     `json:"gateways"`
+		GatewayFields    []string `json:"gateway_fields"`
+		RepublishOnBirth bool     `json:"republish_on_birth"`
+		LastPayload      bool     `json:"last_payload"`
 	} `json:"home_assistant"`
 }
 
@@ -137,9 +166,19 @@ func DefaultSettings() Settings {
 		EventMaxRows:         200000,
 		StoreGatewayRaw:      true,
 		GatewayOfflineSec:    120,
+		LinkAutoPair:         true,
 		MQTTTopicPrefix:      "lorahub",
 		PacketFormat:         PacketFormat{NodeIDOffset: 0, NodeIDLength: 2, SerialOffset: 2, SerialLength: 4, DataOffset: 6},
 	}
-	s.HomeAssistant.DiscoveryPrefix = "homeassistant"
+	p := &s.MQTTPublish
+	p.Up, p.IncludeGateways, p.IncludeRadio, p.IncludeRaw, p.State, p.StateRetain = true, true, true, true, true, true
+	p.GatewayUp, p.GatewayStatus, p.Unmatched, p.DownEvents = true, true, true, true
+	s.MQTTCommands.AcceptDown, s.MQTTCommands.AcceptSet = true, true
+	s.MQTTCommands.OnHex, s.MQTTCommands.OffHex = "0101", "0100"
+	ha := &s.HomeAssistant
+	ha.DiscoveryPrefix, ha.ExposeMode = "homeassistant", "adopted"
+	ha.Diagnostics = []string{"rssi", "snr", "freq", "datr", "gateway_count", "last_seen", "seq"}
+	ha.Switches, ha.Gateways, ha.RepublishOnBirth, ha.LastPayload = true, true, true, true
+	ha.GatewayFields = []string{"rx", "tx", "crc_err", "tx_err", "uptime_s", "temp_c"}
 	return s
 }

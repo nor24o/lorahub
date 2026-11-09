@@ -2,20 +2,23 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/nor24o/lorahub/internal/ingest"
+	"github.com/nor24o/lorahub/internal/model"
+	"github.com/nor24o/lorahub/internal/processor"
 )
 
 func runCmd(timeout time.Duration, name string, args ...string) (string, error) {
@@ -72,260 +75,294 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"log": out})
 }
 
-// concentratorTX hands a test transmission straight to raw_lora_app.
-func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Abort      bool    `json:"abort"`
-		Modu       string  `json:"modu"`
-		Freq       float64 `json:"freq"`
-		Datr       string  `json:"datr"`
-		Codr       string  `json:"codr"`
-		Power      int     `json:"powe"`
-		RFChain    int     `json:"rfch"`
-		InvertPol  bool    `json:"ipol"`
-		Preamble   int     `json:"prea"`
-		PayloadHex string  `json:"payload_hex"`
-		ASCII      string  `json:"ascii"`
+type txRequest struct {
+	Gateway       string  `json:"gateway"`
+	Abort         bool    `json:"abort"`
+	Modu          string  `json:"modu"`
+	Freq          float64 `json:"freq"`
+	Datr          string  `json:"datr"`
+	Codr          string  `json:"codr"`
+	Power         int     `json:"powe"`
+	RFChain       int     `json:"rfch"`
+	InvertPol     bool    `json:"ipol"`
+	Preamble      int     `json:"prea"`
+	NoCRC         bool    `json:"ncrc"`
+	NoHeader      bool    `json:"nhdr"`
+	FDev          int     `json:"f_dev"`
+	FOff          int     `json:"f_off"`
+	PayloadHex    string  `json:"payload_hex"`
+	ASCII         string  `json:"ascii"`
+	RandomLen     int     `json:"random_len"`
+	AppendCounter bool    `json:"append_counter"`
+	Count         int     `json:"count"`
+	IntervalMs    int     `json:"interval_ms"`
+	DelayMs       int     `json:"delay_ms"`
+}
+
+// txState tracks the test sequence in progress.
+type txState struct {
+	sync.Mutex
+	running     bool
+	sent, total int
+	lastErr     string
+	stop        chan struct{}
+}
+
+// txAddress returns where raw_lora_app listens for the chosen gateway.
+func (s *Server) txAddress(id string) (string, *model.Gateway, error) {
+	if id == "" {
+		return fmt.Sprintf("127.0.0.1:%d", s.Cfg.Bobcat.DownlinkPort), nil, nil
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if req.RFChain != 0 && req.RFChain != 1 {
-		writeErr(w, 400, "RF chain must be 0 or 1")
-		return
-	}
-	msg := map[string]any{}
-	if req.Abort {
-		msg = map[string]any{"abort": true, "rfch": req.RFChain}
-	} else {
-		if req.Modu != "LORA" && req.Modu != "FSK" && req.Modu != "CW" {
-			writeErr(w, 400, "mode must be LORA, FSK or CW")
-			return
-		}
-		if req.Freq < 100 || req.Freq > 1100 {
-			writeErr(w, 400, "frequency must be given in MHz")
-			return
-		}
-		if req.Power < 0 || req.Power > 27 {
-			writeErr(w, 400, "power must be 0 to 27 dBm")
-			return
-		}
-		data := []byte(req.ASCII)
-		if req.PayloadHex != "" {
-			var err error
-			if data, err = hex.DecodeString(strings.ReplaceAll(req.PayloadHex, " ", "")); err != nil {
-				writeErr(w, 400, "payload must be hex")
-				return
-			}
-		}
-		if len(data) > 255 {
-			writeErr(w, 400, "payload is longer than 255 bytes")
-			return
-		}
-		msg = map[string]any{"imme": true, "freq": req.Freq, "rfch": req.RFChain, "powe": req.Power, "modu": req.Modu, "codr": req.Codr,
-			"ipol": req.InvertPol, "size": len(data), "data": base64.StdEncoding.EncodeToString(data)}
-		if req.Modu == "FSK" {
-			rate, err := strconv.Atoi(req.Datr)
-			if err != nil {
-				writeErr(w, 400, "FSK data rate must be a number in bit/s")
-				return
-			}
-			msg["datr"] = rate
-		} else {
-			msg["datr"] = req.Datr
-		}
-		if req.Preamble > 0 {
-			msg["prea"] = req.Preamble
-		}
-	}
-	b, _ := json.Marshal(msg)
-	c, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", s.Cfg.Bobcat.DownlinkPort))
+	g, err := s.Store.Gateway(id)
 	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
+		return "", nil, errors.New("unknown gateway")
+	}
+	t, err := s.remoteTargetOf(g)
+	if err != nil {
+		return "", nil, err
+	}
+	return net.JoinHostPort(t.host, strconv.Itoa(t.controlPort)), g, nil
+}
+
+func validateTX(req *txRequest) error {
+	if req.RFChain != 0 && req.RFChain != 1 {
+		return errors.New("RF chain must be 0 or 1")
+	}
+	if req.Modu != "LORA" && req.Modu != "FSK" && req.Modu != "CW" {
+		return errors.New("mode must be LORA, FSK or CW")
+	}
+	if req.Freq < 100 || req.Freq > 1100 {
+		return errors.New("frequency must be given in MHz")
+	}
+	if req.Power < 0 || req.Power > 27 {
+		return errors.New("power must be 0 to 27 dBm")
+	}
+	if req.Count == 0 {
+		req.Count = 1
+	}
+	if req.Count < 1 || req.Count > 1000 {
+		return errors.New("repeat count must be 1 to 1000")
+	}
+	if req.Count > 1 && req.IntervalMs < 100 {
+		return errors.New("the interval between packets must be at least 100 ms")
+	}
+	if req.DelayMs < 0 || req.DelayMs > 60000 {
+		return errors.New("start delay must be 0 to 60000 ms")
+	}
+	if req.RandomLen < 0 || req.RandomLen > 255 {
+		return errors.New("random payload must be 0 to 255 bytes")
+	}
+	return nil
+}
+
+// txPayload returns the payload generator of a request.
+func txPayload(req *txRequest) (func(i int) []byte, error) {
+	base := []byte(req.ASCII)
+	if req.PayloadHex != "" {
+		var err error
+		if base, err = hex.DecodeString(strings.ReplaceAll(req.PayloadHex, " ", "")); err != nil {
+			return nil, errors.New("payload must be hex")
+		}
+	}
+	size := len(base)
+	if req.RandomLen > 0 {
+		size = req.RandomLen
+	}
+	if req.AppendCounter {
+		size += 2
+	}
+	if size > 255 {
+		return nil, errors.New("payload is longer than 255 bytes")
+	}
+	return func(i int) []byte {
+		b := append([]byte{}, base...)
+		if req.RandomLen > 0 {
+			b = make([]byte, req.RandomLen)
+			rand.Read(b)
+		}
+		if req.AppendCounter {
+			b = append(b, byte(i>>8), byte(i))
+		}
+		return b
+	}, nil
+}
+
+func txMessage(req *txRequest, data []byte) map[string]any {
+	msg := map[string]any{"imme": true, "freq": req.Freq, "rfch": req.RFChain, "powe": req.Power, "modu": req.Modu, "codr": req.Codr,
+		"ipol": req.InvertPol, "ncrc": req.NoCRC, "nhdr": req.NoHeader, "size": len(data), "data": base64.StdEncoding.EncodeToString(data)}
+	if req.Preamble > 0 {
+		msg["prea"] = req.Preamble
+	}
+	if req.Modu == "FSK" {
+		rate, _ := strconv.Atoi(req.Datr)
+		msg["datr"] = rate
+		if req.FDev > 0 {
+			msg["f_dev"] = req.FDev
+		}
+	} else {
+		msg["datr"] = req.Datr
+	}
+	if req.Modu == "CW" && req.FOff != 0 {
+		msg["f_off"] = req.FOff
+	}
+	return msg
+}
+
+func udpSend(addr string, msg map[string]any) error {
+	c, err := net.Dial("udp", addr)
+	if err != nil {
+		return err
 	}
 	defer c.Close()
-	if _, err := c.Write(b); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	b, _ := json.Marshal(msg)
+	_, err = c.Write(b)
+	return err
+}
+
+// sendTX hands a transmission to the engine. A current engine confirms that
+// it has the packet, so a failure is reported instead of silently lost.
+func (s *Server) sendTX(g *model.Gateway, addr string, msg map[string]any) error {
+	if g == nil || linkOf(g).Link < ingest.LinkVersion {
+		return udpSend(addr, msg)
 	}
-	writeJSON(w, 200, map[string]any{"sent": msg})
-}
-
-var gpioLine = regexp.MustCompile(`^\s*gpio-(\d+)\s+\(([^|)]*)\|?([^)]*)\)\s+(in|out)\s+(hi|lo)`)
-var gpioChip = regexp.MustCompile(`^gpiochip(\d+):`)
-
-type gpioInfo struct {
-	Global    int    `json:"gpio"`
-	Pin       string `json:"pin"`
-	Label     string `json:"label"`
-	Direction string `json:"direction"`
-	Value     int    `json:"value"`
-	CanSet    bool   `json:"can_set"`
-}
-
-func readTrim(path string) string {
-	b, err := os.ReadFile(path)
+	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
-		return ""
+		return err
 	}
-	return strings.TrimSpace(string(b))
+	port, _ := strconv.Atoi(portText)
+	m := map[string]any{}
+	for k, v := range msg {
+		m[k] = v
+	}
+	ack, err := controlExchange(host, port, s.linkWire(g, m), "tx_ack", 1500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	switch ack["status"] {
+	case "queued", "sent", "aborted":
+		return nil
+	}
+	return fmt.Errorf("the gateway refused the transmission: %v", ack["status"])
 }
 
-func gpioBases() []int {
-	dirs, _ := filepath.Glob("/sys/class/gpio/gpiochip*")
-	var out []int
-	for _, d := range dirs {
-		if v, err := strconv.Atoi(readTrim(d + "/base")); err == nil {
-			out = append(out, v)
-		}
-	}
-	sort.Ints(out)
-	return out
-}
-
-func (s *Server) concentratorFile() map[string]any {
-	var cfg map[string]any
-	if b, err := os.ReadFile(s.Cfg.Concentrator.ConfigPath); err == nil {
-		json.Unmarshal(b, &cfg)
-	}
-	return cfg
-}
-
-func (s *Server) readGPIO() []gpioInfo {
-	allowed := map[int]bool{}
-	for _, g := range s.Cfg.Concentrator.GPIOAllowed {
-		allowed[g] = true
-	}
-	cfg := s.concentratorFile()
-	protected := map[int]bool{}
-	for _, k := range []string{"reset_gpio", "pa_gpio"} {
-		if v, err := strconv.Atoi(fmt.Sprint(cfg[k])); err == nil {
-			protected[v] = true
-		}
-	}
-	bases := gpioBases()
-	bank := -1
-	out := []gpioInfo{}
-	for _, l := range strings.Split(readTrim("/sys/kernel/debug/gpio"), "\n") {
-		if m := gpioChip.FindStringSubmatch(l); m != nil {
-			bank, _ = strconv.Atoi(m[1])
-			continue
-		}
-		m := gpioLine.FindStringSubmatch(l)
-		if m == nil || bank < 0 || bank >= len(bases) {
-			continue
-		}
-		line, _ := strconv.Atoi(m[1])
-		g := gpioInfo{Global: bases[bank] + line, Pin: fmt.Sprintf("GPIO%d_%c%d", bank, 'A'+line/8, line%8), Label: strings.TrimSpace(m[3]), Direction: m[4]}
-		if m[5] == "hi" {
-			g.Value = 1
-		}
-		g.CanSet = allowed[g.Global] && !protected[g.Global] && (g.Label == "" || g.Label == "sysfs")
-		out = append(out, g)
-	}
-	return out
-}
-
-func (s *Server) getHardware(w http.ResponseWriter, r *http.Request) {
-	leds := []map[string]any{}
-	dirs, _ := filepath.Glob("/sys/class/leds/*")
-	for _, d := range dirs {
-		v, _ := strconv.Atoi(readTrim(d + "/brightness"))
-		m, _ := strconv.Atoi(readTrim(d + "/max_brightness"))
-		trig := ""
-		for _, t := range strings.Fields(readTrim(d + "/trigger")) {
-			if strings.HasPrefix(t, "[") {
-				trig = strings.Trim(t, "[]")
-			}
-		}
-		leds = append(leds, map[string]any{"name": filepath.Base(d), "brightness": v, "max": m, "trigger": trig})
-	}
-	nets := []map[string]any{}
-	ifs, _ := filepath.Glob("/sys/class/net/*")
-	for _, d := range ifs {
-		rx, _ := strconv.ParseUint(readTrim(d+"/statistics/rx_packets"), 10, 64)
-		tx, _ := strconv.ParseUint(readTrim(d+"/statistics/tx_packets"), 10, 64)
-		nets = append(nets, map[string]any{"name": filepath.Base(d), "state": readTrim(d + "/operstate"), "carrier": readTrim(d+"/carrier") == "1",
-			"mac": readTrim(d + "/address"), "rx_packets": rx, "tx_packets": tx})
-	}
-	cfg := s.concentratorFile()
-	roles := []map[string]any{}
-	for _, x := range [][2]string{{"SPI device", "spi_path"}, {"Concentrator reset GPIO", "reset_gpio"}, {"PA GPIO", "pa_gpio"}, {"RX LED", "led_rx"}, {"TX LED", "led_tx"}} {
-		if v := fmt.Sprint(cfg[x[1]]); cfg[x[1]] != nil && v != "" {
-			roles = append(roles, map[string]any{"function": x[0], "value": v})
-		}
-	}
-	writeJSON(w, 200, map[string]any{"gpio": s.readGPIO(), "leds": leds, "net": nets, "roles": roles, "board": strings.Trim(readTrim("/proc/device-tree/model"), "\x00")})
-}
-
-func (s *Server) setLED(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
-	}
+// concentratorTX hands a test transmission straight to raw_lora_app, on this
+// machine or on a satellite, once or as a timed sequence.
+func (s *Server) concentratorTX(w http.ResponseWriter, r *http.Request) {
+	var req txRequest
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	dir := "/sys/class/leds/" + filepath.Base(req.Name)
-	if req.Name == "" || req.Name != filepath.Base(req.Name) || readTrim(dir+"/max_brightness") == "" {
-		writeErr(w, 404, "no such LED")
-		return
-	}
-	if err := os.WriteFile(dir+"/brightness", []byte(strconv.Itoa(req.Value)), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]bool{"ok": true})
-}
-
-func (s *Server) setGPIO(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		GPIO   int    `json:"gpio"`
-		Action string `json:"action"` // set | pulse
-		Value  int    `json:"value"`
-	}
-	if err := readJSON(r, &req); err != nil {
+	addr, g, err := s.txAddress(req.Gateway)
+	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	found := false
-	for _, g := range s.readGPIO() {
-		if g.Global == req.GPIO && g.CanSet {
-			found = true
+	if req.Abort {
+		s.tx.Lock()
+		if s.tx.running {
+			close(s.tx.stop)
+			s.tx.running = false
 		}
-	}
-	if !found {
-		writeErr(w, 403, "this GPIO is protected: only lines listed under concentrator.gpio_allowed in lorahub.yml can be driven")
+		s.tx.Unlock()
+		if err := s.sendTX(g, addr, map[string]any{"abort": true, "rfch": req.RFChain}); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"aborted": true})
 		return
 	}
-	dir := fmt.Sprintf("/sys/class/gpio/gpio%d", req.GPIO)
-	if _, err := os.Stat(dir); err != nil {
-		os.WriteFile("/sys/class/gpio/export", []byte(strconv.Itoa(req.GPIO)), 0o200)
-	}
-	if err := os.WriteFile(dir+"/direction", []byte("out"), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	if err := validateTX(&req); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
-	set := func(v int) error { return os.WriteFile(dir+"/value", []byte(strconv.Itoa(v)), 0o644) }
-	var err error
-	if req.Action == "pulse" {
-		if err = set(1); err == nil {
-			time.Sleep(100 * time.Millisecond)
-			err = set(0)
+	if req.Modu == "FSK" {
+		if _, err := strconv.Atoi(req.Datr); err != nil {
+			writeErr(w, 400, "FSK data rate must be a number in bit/s")
+			return
 		}
-	} else {
-		v := 0
-		if req.Value == 1 {
-			v = 1
-		}
-		err = set(v)
 	}
+	payload, err := txPayload(&req)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 400, err.Error())
 		return
 	}
+	if g != nil {
+		req.Power = processor.TxPowerFor(g, req.Power)
+	}
+	if req.Count == 1 && req.DelayMs == 0 {
+		msg := txMessage(&req, payload(0))
+		if err := s.sendTX(g, addr, msg); err != nil {
+			writeErr(w, 502, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"sent": msg})
+		return
+	}
+	s.tx.Lock()
+	if s.tx.running {
+		s.tx.Unlock()
+		writeErr(w, 409, "a transmit sequence is already running; stop it first")
+		return
+	}
+	stop := make(chan struct{})
+	s.tx.running, s.tx.sent, s.tx.total, s.tx.lastErr, s.tx.stop = true, 0, req.Count, "", stop
+	s.tx.Unlock()
+	go s.runTXJob(g, addr, req, payload, stop)
+	writeJSON(w, 200, map[string]any{"job": true, "total": req.Count, "power": req.Power})
+}
+
+func (s *Server) runTXJob(g *model.Gateway, addr string, req txRequest, payload func(int) []byte, stop <-chan struct{}) {
+	wait := func(ms int) bool {
+		select {
+		case <-stop:
+			return false
+		case <-time.After(time.Duration(ms) * time.Millisecond):
+			return true
+		}
+	}
+	if !wait(req.DelayMs) {
+		return
+	}
+	for i := 0; i < req.Count; i++ {
+		err := s.sendTX(g, addr, txMessage(&req, payload(i)))
+		s.tx.Lock()
+		if err != nil {
+			s.tx.lastErr = err.Error()
+		} else {
+			s.tx.sent++
+		}
+		s.tx.Unlock()
+		if err != nil || (i+1 < req.Count && !wait(req.IntervalMs)) {
+			break
+		}
+	}
+	s.tx.Lock()
+	select {
+	case <-stop:
+	default:
+		s.tx.running = false
+	}
+	s.tx.Unlock()
+}
+
+func (s *Server) txJobStatus(w http.ResponseWriter, r *http.Request) {
+	s.tx.Lock()
+	defer s.tx.Unlock()
+	writeJSON(w, 200, map[string]any{"running": s.tx.running, "sent": s.tx.sent, "total": s.tx.total, "error": s.tx.lastErr})
+}
+
+func (s *Server) haEntities(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.MQTT.EntityReport())
+}
+
+func (s *Server) haRepublish(w http.ResponseWriter, r *http.Request) {
+	removed := s.MQTT.SweepHA(true) // also sensors for fields the nodes no longer send
+	s.MQTT.RepublishHA()
+	writeJSON(w, 200, map[string]any{"ok": true, "removed": removed})
+}
+
+func (s *Server) haRemove(w http.ResponseWriter, r *http.Request) {
+	s.MQTT.RemoveHA()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }

@@ -197,6 +197,62 @@ func (s *Store) UpdateGateway(id string, persist bool, fn func(*model.Gateway)) 
 	return err
 }
 
+// RenameGateway moves a gateway to a new ID, together with its event history
+// and the nodes that were last heard through it. oldEUI is rewritten to the
+// gateway's current EUI in stored events.
+func (s *Store) RenameGateway(oldID, newID, oldEUI string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.gateways[oldID]
+	if !ok {
+		return ErrNotFound
+	}
+	if _, taken := s.gateways[newID]; taken {
+		return fmt.Errorf("gateway %s already exists", newID)
+	}
+	moved := clone(g)
+	moved.ID = newID
+	data, _ := json.Marshal(moved)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM gateways WHERE id=?`, oldID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO gateways(id, eui, data) VALUES(?,?,?)`, newID, moved.EUI, string(data)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE events SET gateways=replace(gateways,?1,?2), summary=replace(summary,?1,?2),
+		data=replace(replace(data,?1,?2),?3,?4) WHERE gateways LIKE ?5`,
+		oldID, newID, oldEUI, moved.EUI, "%,"+oldID+",%"); err != nil {
+		return err
+	}
+	var touched []*model.Device
+	for _, d := range s.devices {
+		if d.LastGateway != oldID {
+			continue
+		}
+		c := clone(d)
+		c.LastGateway = newID
+		b, _ := json.Marshal(c)
+		if _, err := tx.Exec(`UPDATE devices SET data=? WHERE app_id=? AND id=?`, string(b), c.AppID, c.ID); err != nil {
+			return err
+		}
+		touched = append(touched, c)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	delete(s.gateways, oldID)
+	s.gateways[newID] = moved
+	for _, d := range touched {
+		s.devices[d.AppID+"/"+d.ID] = d
+	}
+	return nil
+}
+
 // DeleteGateway removes a gateway.
 func (s *Store) DeleteGateway(id string) error {
 	s.mu.Lock()

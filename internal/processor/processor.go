@@ -39,8 +39,10 @@ type Processor struct {
 	smu      sync.RWMutex
 	settings config.Settings
 
-	dmu         sync.Mutex
-	downlinkers map[string]Downlinker // by gateway kind
+	dmu          sync.Mutex
+	downlinkers  map[string]Downlinker // by gateway kind
+	broadcastSeq seqCounter
+	echo         echoGuard
 
 	qmu   sync.Mutex
 	dedup map[string]*dedupEntry
@@ -53,6 +55,11 @@ type Processor struct {
 	rmu     sync.RWMutex
 	schemes *formatter.SchemeDoc
 	rules   []model.Rule
+
+	renamed []string // former gateway IDs corrected at startup
+
+	dutyMu sync.Mutex
+	duty   map[string][]dutyEntry
 
 	Started time.Time
 }
@@ -67,7 +74,14 @@ func New(st *store.Store, bus *events.Bus, log *slog.Logger) *Processor {
 		dedup: map[string]*dedupEntry{}, forwarders: map[string][]*ingest.Forwarder{}, Started: time.Now()}
 	s := config.DefaultSettings()
 	st.GetSetting("settings", &s)
+	if s.LinkKey == "" {
+		s.LinkKey = store.NewToken(24)
+		if err := st.SetSetting("settings", s); err != nil {
+			log.Warn("save link key", "err", err)
+		}
+	}
 	p.settings = s
+	p.fixReversedIDs()
 	p.loadPipeline()
 	return p
 }
@@ -145,6 +159,9 @@ func (p *Processor) resolveGateway(eui, kind, addr string) (*model.Gateway, bool
 	if err == nil {
 		return g, !g.Disabled
 	}
+	if g := p.adoptReversedEUI(eui, kind); g != nil {
+		return g, !g.Disabled
+	}
 	if !p.Settings().AutoRegisterGateways {
 		return nil, false
 	}
@@ -190,7 +207,9 @@ func (p *Processor) HandleStatus(eui, kind, addr string, status map[string]any) 
 		}
 		if status != nil {
 			merged := map[string]any{}
-			if len(gw.LastStatus) > 0 {
+			// A current engine reports everything each time, so nothing from
+			// older status formats is carried along.
+			if _, complete := status["link"]; !complete && len(gw.LastStatus) > 0 {
 				jsonUnmarshal(gw.LastStatus, &merged)
 			}
 			for k, v := range status {
@@ -212,6 +231,7 @@ func (p *Processor) HandleStatus(eui, kind, addr string, status map[string]any) 
 			Summary: fmt.Sprintf("Gateway connected via %s from %s", kindLabel(kind), addr),
 			Data:    map[string]any{"gateway_id": g.ID, "eui": g.EUI, "addr": addr, "kind": kind}}, true)
 	}
+	p.applyLinkStatus(g, status)
 	if status != nil {
 		p.emit(&model.Event{Name: "gs.status", Gateways: []string{g.ID}, Summary: "Gateway status", Data: status}, false)
 		p.forwardStatus(g, status)
@@ -246,6 +266,9 @@ func (p *Processor) HandleUplink(pkt model.RxPacket) {
 		gw.RxCount++
 		gw.LastSeen = &now
 	})
+	if rejectedByFilter(g, &pkt.Meta) {
+		return
+	}
 	pkt.Meta.GatewayIDs = model.GatewayIDs{GatewayID: g.ID, EUI: g.EUI}
 	if g.Location != nil {
 		loc := *g.Location
@@ -280,6 +303,11 @@ func (p *Processor) HandleUplink(pkt model.RxPacket) {
 	}
 	if pkt.Meta.CRCStatus == "bad" {
 		summary = "CRC error · " + summary
+	}
+	if p.echo.heard(pkt.Payload) {
+		ev["echo"] = true
+		p.emit(&model.Event{Name: "gs.up", Gateways: []string{g.ID}, Summary: "Own downlink heard back, ignored · " + summary, Data: ev}, p.Settings().StoreGatewayRaw)
+		return
 	}
 	p.emit(&model.Event{Name: "gs.up", Gateways: []string{g.ID}, Summary: summary, Data: ev}, p.Settings().StoreGatewayRaw)
 	p.forwardUplink(g, pkt)

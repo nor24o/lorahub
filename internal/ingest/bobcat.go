@@ -36,6 +36,16 @@ type BobcatServer struct {
 	// ResolveAddr returns the last known IP of a gateway EUI (from the
 	// database) so downlinks work right after a LoRaHub restart.
 	ResolveAddr func(eui string) string
+	// ResolvePort returns a gateway's own downlink port; 0 means the default.
+	ResolvePort func(eui string) int
+	// LinkKey returns the key shared with paired gateways.
+	LinkKey func() string
+	// AutoPair reports whether unpaired gateways receive the key.
+	AutoPair func() bool
+
+	links   map[string]*linkState
+	seen    map[string]time.Time
+	waiting map[string]*txWait
 }
 
 type pendingRx struct {
@@ -71,6 +81,9 @@ func NewBobcatServer(addr string, downlinkPort int, static map[string]string, re
 
 // Close stops the server.
 func (s *BobcatServer) Close() error { return s.conn.Close() }
+
+// LocalAddr is the address the server listens on.
+func (s *BobcatServer) LocalAddr() net.Addr { return s.conn.LocalAddr() }
 
 func (s *BobcatServer) loop() {
 	buf := make([]byte, 65535)
@@ -130,7 +143,14 @@ func (s *BobcatServer) handle(b []byte, addr *net.UDPAddr) {
 	switch {
 	case b[0] == '{':
 		var probe struct {
+			V             int             `json:"v"`
 			MsgType       string          `json:"msg_type"`
+			GatewayID     string          `json:"gateway_id"`
+			Seq           uint32          `json:"seq"`
+			Boot          uint32          `json:"boot"`
+			RequestID     string          `json:"request_id"`
+			Status        string          `json:"status"`
+			Nonce         string          `json:"nonce"`
 			GatewayStatus map[string]any  `json:"gateway_status"`
 			Rxpk          []Rxpk          `json:"rxpk"`
 			Stat          json.RawMessage `json:"stat"`
@@ -138,19 +158,41 @@ func (s *BobcatServer) handle(b []byte, addr *net.UDPAddr) {
 		if err := json.Unmarshal(b, &probe); err != nil {
 			return
 		}
+		gatewayID := strings.ToUpper(probe.GatewayID)
+		if probe.V >= LinkVersion && (probe.MsgType == "uplink" || probe.MsgType == "gateway_status") {
+			s.ack(addr, probe.Seq)
+			if s.duplicate(fmt.Sprintf("%s/%d/%d", gatewayID, probe.Boot, probe.Seq)) {
+				return
+			}
+		}
+		switch probe.MsgType {
+		case "tx_ack":
+			s.onTxAck(gatewayID, probe.RequestID, probe.Status)
+			return
+		case "auth_required":
+			s.onAuthRequired(gatewayID, probe.Nonce)
+			return
+		}
 		if probe.MsgType == "gateway_status" && probe.GatewayStatus != nil {
 			eui, _ := probe.GatewayStatus["eui"].(string)
 			if eui == "" || strings.Trim(eui, "0") == "" {
 				return
 			}
+			eui = strings.ToUpper(eui)
 			s.learn(ip, eui)
-			s.sink.HandleStatus(strings.ToUpper(eui), "bobcat", ip, probe.GatewayStatus)
+			s.noteStatus(eui, ip, probe.GatewayStatus)
+			s.sink.HandleStatus(eui, "bobcat", ip, probe.GatewayStatus)
 			return
 		}
 		if len(probe.Rxpk) == 0 {
 			return
 		}
-		eui := s.euiFor(ip)
+		eui := gatewayID
+		if len(eui) == 16 && strings.Trim(eui, "0") != "" {
+			s.learn(ip, eui)
+		} else {
+			eui = s.euiFor(ip)
+		}
 		if eui == "" {
 			s.mu.Lock()
 			if len(s.pending[ip]) < 64 {
@@ -253,8 +295,21 @@ func (s *BobcatServer) Send(eui string, tx model.TxPacket) error {
 	if tx.Preamble > 0 {
 		m["prea"] = tx.Preamble
 	}
+	if tx.NoHeader {
+		m["nhdr"] = true
+	}
+	port := s.downlinkPort
+	if s.ResolvePort != nil {
+		if p := s.ResolvePort(eui); p > 0 {
+			port = p
+		}
+	}
+	ua := &net.UDPAddr{IP: net.ParseIP(ip), Port: port}
+	eui = strings.ToUpper(eui)
+	if s.linked(eui) {
+		return s.sendConfirmed(eui, ua, m)
+	}
 	b, _ := json.Marshal(m)
-	ua := &net.UDPAddr{IP: net.ParseIP(ip), Port: s.downlinkPort}
 	_, err := s.conn.WriteToUDP(b, ua)
 	return err
 }

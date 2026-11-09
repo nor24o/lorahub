@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +51,8 @@ type Server struct {
 	MQTT  *integration.MQTT
 	Log   *slog.Logger
 	Web   fs.FS
+
+	tx txState
 }
 
 const cookieName = "lorahub_session"
@@ -89,6 +92,7 @@ func (s *Server) Handler() http.Handler {
 	p("DELETE /api/applications/{app}", s.deleteApp)
 
 	p("GET /api/applications/{app}/devices", s.listDevices)
+	p("POST /api/applications/{app}/broadcast", s.broadcast)
 	p("POST /api/applications/{app}/devices", s.createDevice)
 	p("GET /api/applications/{app}/devices/{dev}", s.getDevice)
 	p("PUT /api/applications/{app}/devices/{dev}", s.updateDevice)
@@ -122,18 +126,20 @@ func (s *Server) Handler() http.Handler {
 	p("GET /api/concentrator", s.getConcentrator)
 	p("PUT /api/concentrator", s.putConcentrator)
 	p("POST /api/concentrator/restart", s.restartConcentrator)
+	p("POST /api/concentrator/apply", s.applyConcentrator)
 	p("POST /api/concentrator/service", s.concentratorService)
 	p("POST /api/concentrator/tx", s.concentratorTX)
+	p("GET /api/concentrator/tx/job", s.txJobStatus)
+	p("GET /api/ha/entities", s.haEntities)
+	p("POST /api/ha/republish", s.haRepublish)
+	p("POST /api/ha/remove", s.haRemove)
 	p("GET /api/logs", s.getLogs)
-	p("GET /api/hardware", s.getHardware)
-	p("POST /api/hardware/led", s.setLED)
-	p("POST /api/hardware/gpio", s.setGPIO)
-	p("GET /api/remote/key", s.remoteKey)
+	p("GET /api/vpn/wireguard", s.getWireGuard)
+	p("POST /api/vpn/wireguard/service", s.wireGuardService)
+	p("GET /api/vpn/tailscale", s.getTailscale)
+	p("POST /api/vpn/tailscale/{action}", s.tailscaleAction)
 	p("GET /api/gateways/{id}/remote", s.getRemote)
-	p("PUT /api/gateways/{id}/remote", s.putRemote)
 	p("PUT /api/gateways/{id}/remote/config", s.putRemoteConfig)
-	p("POST /api/gateways/{id}/remote/service", s.remoteService)
-	p("GET /api/gateways/{id}/remote/logs", s.remoteLogs)
 
 	// Static web console (SPA)
 	files := http.FileServer(http.FS(s.Web))
@@ -144,6 +150,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		if r.URL.Path != "/" {
 			if _, err := fs.Stat(s.Web, strings.TrimPrefix(r.URL.Path, "/")); err == nil {
+				w.Header().Set("Cache-Control", "no-cache") // a new version must show at once
 				files.ServeHTTP(w, r)
 				return
 			}
@@ -301,7 +308,11 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 // ---------------- overview / system / settings ----------------
 
 func (s *Server) gatewayOnline(g *model.Gateway) bool {
-	return g.LastSeen != nil && time.Since(*g.LastSeen) < time.Duration(s.Proc.Settings().GatewayOfflineSec)*time.Second
+	after := g.OfflineAfter
+	if after <= 0 {
+		after = s.Proc.Settings().GatewayOfflineSec
+	}
+	return g.LastSeen != nil && time.Since(*g.LastSeen) < time.Duration(after)*time.Second
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
@@ -395,7 +406,8 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
-	st := s.Proc.Settings()
+	before := s.Proc.Settings()
+	st := before
 	if err := readJSON(r, &st); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -403,6 +415,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if err := s.Proc.SetSettings(st); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if s.MQTT != nil {
+		go s.MQTT.ReconcileHA(before, s.Proc.Settings())
 	}
 	writeJSON(w, 200, s.Proc.Settings())
 }
@@ -437,6 +452,23 @@ func (s *Server) getGateway(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateGateway(g *model.Gateway) error {
+	for _, p := range []int{g.ControlPort, g.StatusPort} {
+		if p < 0 || p > 65535 {
+			return fmt.Errorf("ports must be between 1 and 65535")
+		}
+	}
+	if g.DutyCyclePct < 0 || g.DutyCyclePct > 100 {
+		return fmt.Errorf("duty cycle must be between 0 and 100 percent")
+	}
+	if g.AntennaGain < 0 || g.AntennaGain > 30 {
+		return fmt.Errorf("antenna gain must be between 0 and 30 dBi")
+	}
+	if g.MinRSSI > 0 {
+		return fmt.Errorf("minimum RSSI must be negative, or 0 for no limit")
+	}
+	if g.OfflineAfter < 0 {
+		return fmt.Errorf("offline timeout cannot be negative")
+	}
 	if !idRe.MatchString(g.ID) {
 		return fmt.Errorf("gateway ID must be 2-36 lowercase letters, digits or dashes")
 	}
@@ -482,11 +514,12 @@ func (s *Server) updateGateway(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	upd := *cur
-	if err := readJSON(r, &upd); err != nil {
+	merged, err := mergeJSON(cur, r)
+	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	upd := *merged
 	upd.ID = cur.ID
 	if err := validateGateway(&upd); err != nil {
 		writeErr(w, 400, err.Error())
@@ -675,11 +708,12 @@ func (s *Server) updateApp(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	upd := *cur
-	if err := readJSON(r, &upd); err != nil {
+	merged, err := mergeJSON(cur, r)
+	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	upd := *merged
 	upd.ID, upd.CreatedAt, upd.UpdatedAt = cur.ID, cur.CreatedAt, time.Now().UTC()
 	if err := s.validateGroup(&upd); err != nil {
 		writeErr(w, 400, err.Error())
@@ -694,9 +728,15 @@ func (s *Server) updateApp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) {
+	nodes := s.Store.Devices(r.PathValue("app"))
 	if err := s.Store.DeleteApplication(r.PathValue("app")); err != nil {
 		storeErr(w, err)
 		return
+	}
+	if s.MQTT != nil {
+		for _, d := range nodes {
+			s.MQTT.NodeChanged(d, nil) // its nodes leave Home Assistant with it
+		}
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -738,6 +778,26 @@ func validateDevice(d *model.Device) error {
 	}
 	if !idRe.MatchString(d.ID) {
 		return fmt.Errorf("device ID must be 2-36 lowercase letters, digits or dashes")
+	}
+	if d.RawDownlink != nil {
+		if err := d.RawDownlink.Validate(); err != nil {
+			return err
+		}
+	}
+	if len(d.HACommands) > 20 {
+		return fmt.Errorf("a node can have at most 20 commands")
+	}
+	names := map[string]bool{}
+	for i := range d.HACommands {
+		c := &d.HACommands[i]
+		if err := c.Normalize(); err != nil {
+			return err
+		}
+		key := strings.ToLower(c.Key())
+		if names[key] {
+			return fmt.Errorf("command %q appears twice", c.Name)
+		}
+		names[key] = true
 	}
 	d.DevEUI, d.JoinEUI, d.AppKey = normHex(d.DevEUI), normHex(d.JoinEUI), normHex(d.AppKey)
 	if d.Band == "" {
@@ -847,11 +907,12 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	upd := *cur
-	if err := readJSON(r, &upd); err != nil {
+	merged, err := mergeJSON(cur, r)
+	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	upd := *merged
 	upd.ID, upd.AppID = cur.ID, cur.AppID
 	if err := validateDevice(&upd); err != nil {
 		writeErr(w, 400, err.Error())
@@ -873,7 +934,7 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		*dv = upd
 		// runtime fields are owned by the server
 		dv.LastSeen, dv.UplinkCount, dv.LastRSSI, dv.LastSNR, dv.LastGateway, dv.LastDecoded = rt.LastSeen, rt.UplinkCount, rt.LastRSSI, rt.LastSNR, rt.LastGateway, rt.LastDecoded
-		dv.Queue, dv.UsedNonces, dv.CreatedAt, dv.LastScheme = rt.Queue, rt.UsedNonces, rt.CreatedAt, rt.LastScheme
+		dv.Queue, dv.UsedNonces, dv.CreatedAt, dv.LastScheme, dv.Profile, dv.DownSeq = rt.Queue, rt.UsedNonces, rt.CreatedAt, rt.LastScheme, rt.Profile, rt.DownSeq
 		if dv.Mode == "otaa" {
 			dv.Session = rt.Session
 		}
@@ -1166,14 +1227,8 @@ func (s *Server) getConcentrator(w http.ResponseWriter, r *http.Request) {
 		out["config_error"] = err.Error()
 	}
 	if s.Cfg.Concentrator.StatusAddr != "" {
-		if c, err := net.DialTimeout("tcp", s.Cfg.Concentrator.StatusAddr, time.Second); err == nil {
-			c.SetDeadline(time.Now().Add(2 * time.Second))
-			b, _ := io.ReadAll(io.LimitReader(c, 8192))
-			c.Close()
-			var st any
-			if json.Unmarshal(b, &st) == nil {
-				out["status"] = st
-			}
+		if st, err := readStatus(s.Cfg.Concentrator.StatusAddr); err == nil {
+			out["status"] = st
 		} else {
 			out["status_error"] = "raw_lora_app status server unreachable: " + err.Error()
 		}
@@ -1197,6 +1252,82 @@ func (s *Server) putConcentrator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// applyConcentrator saves a radio configuration and restarts the engine with
+// it. When the radio does not start listening, the previous configuration is
+// put back, so a setting the hardware cannot do never leaves the gateway deaf.
+func (s *Server) applyConcentrator(w http.ResponseWriter, r *http.Request) {
+	var cfg map[string]any
+	if err := readJSON(r, &cfg); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	path := s.Cfg.Concentrator.ConfigPath
+	old, err := os.ReadFile(path)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	b, _ := json.MarshalIndent(cfg, "", "    ")
+	os.WriteFile(path+".bak", old, 0o644)
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	ok, why := s.restartAndWait()
+	if ok {
+		writeJSON(w, 200, map[string]any{"ok": true, "service": s.serviceState()})
+		return
+	}
+	os.WriteFile(path+".failed", b, 0o644)
+	os.WriteFile(path, old, 0o644)
+	back, _ := s.restartAndWait()
+	msg := "The radio did not start with these settings, so the previous ones were put back"
+	if !back {
+		msg = "The radio did not start with these settings, and not with the previous ones either"
+	}
+	if why != "" {
+		msg += ". The engine said: " + why
+	}
+	writeErr(w, 409, msg)
+}
+
+// restartAndWait restarts the radio engine and waits until it listens.
+func (s *Server) restartAndWait() (bool, string) {
+	if out, err := runCmd(30*time.Second, "systemctl", "restart", s.Cfg.Concentrator.Service); err != nil {
+		return false, strings.TrimSpace(out)
+	}
+	if s.Cfg.Concentrator.StatusAddr == "" {
+		return true, ""
+	}
+	for deadline := time.Now().Add(25 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(time.Second)
+		if b, err := readStatus(s.Cfg.Concentrator.StatusAddr); err == nil {
+			var st struct {
+				RX string `json:"rx_status"`
+			}
+			if json.Unmarshal(b, &st) == nil && st.RX == "LISTENING" {
+				return true, ""
+			}
+		}
+	}
+	out, _ := runCmd(5*time.Second, "journalctl", "-u", s.Cfg.Concentrator.Service, "-n", "60", "--no-pager", "-o", "cat")
+	return false, engineErrors(out)
+}
+
+// engineErrors picks the engine's own error lines out of its log.
+func engineErrors(log string) string {
+	var lines []string
+	for _, l := range strings.Split(log, "\n") {
+		if l = strings.TrimSpace(l); strings.Contains(l, "ERROR") && !slices.Contains(lines, l) {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) > 3 {
+		lines = lines[len(lines)-3:]
+	}
+	return strings.Join(lines, " · ")
 }
 
 func (s *Server) restartConcentrator(w http.ResponseWriter, r *http.Request) {

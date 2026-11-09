@@ -1,225 +1,277 @@
 package api
 
 import (
-	"bytes"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-
+	"github.com/nor24o/lorahub/internal/ingest"
 	"github.com/nor24o/lorahub/internal/model"
 )
 
-const remoteTimeout = 10 * time.Second
+// Remote gateways are controlled through raw_lora_app's own commands: JSON
+// get_config / set_config on its UDP downlink port, and JSON status on TCP.
+const (
+	controlTimeout    = 2 * time.Second
+	applyTimeout      = 25 * time.Second // set_config restarts the SX1302
+	defaultStatusPort = 5557
+)
 
-var remotePath = regexp.MustCompile(`^/[A-Za-z0-9_./-]+$`)
+// Downlink ports raw_lora_app is usually configured with, tried when a
+// gateway's own port is not known yet.
+var commonControlPorts = []int{5556, 1700}
 
-func (s *Server) remoteKeyPath() string { return filepath.Join(s.Cfg.DataDir, "remote_id_rsa") }
-
-// remoteSigner loads the key used to log in to satellites, creating it once.
-func (s *Server) remoteSigner() (ssh.Signer, error) {
-	path := s.remoteKeyPath()
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		k, gerr := rsa.GenerateKey(rand.Reader, 3072)
-		if gerr != nil {
-			return nil, gerr
-		}
-		b = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
-		if err = os.WriteFile(path, b, 0o600); err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, err
-	}
-	signer, err := ssh.ParsePrivateKey(b)
+// readStatus fetches the JSON status raw_lora_app serves on its TCP port.
+func readStatus(addr string) (json.RawMessage, error) {
+	c, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
 		return nil, err
 	}
-	as, ok := signer.(ssh.AlgorithmSigner)
-	if !ok {
-		return signer, nil
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	b, _ := io.ReadAll(io.LimitReader(c, 8192))
+	if !json.Valid(b) || len(b) == 0 {
+		return nil, errors.New("no valid status received")
 	}
-	// Dropbear on older OpenWrt only verifies SHA-1 RSA signatures.
-	return ssh.NewSignerWithAlgorithms(as, []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA})
+	return b, nil
 }
 
-func (s *Server) remoteKey(w http.ResponseWriter, r *http.Request) {
-	signer, err := s.remoteSigner()
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]string{"public_key": strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " lorahub"})
+// linkInfo is what a gateway last reported about its link.
+type linkInfo struct {
+	Link int  `json:"link"`
+	Auth bool `json:"auth"`
 }
 
-func remoteOf(g *model.Gateway) model.GatewayRemote {
-	r := model.GatewayRemote{Port: 22, User: "root", ConfigPath: "/etc/lora/config.json"}
-	if g.Remote != nil {
-		r = *g.Remote
+func linkOf(g *model.Gateway) linkInfo {
+	var l linkInfo
+	if len(g.LastStatus) > 0 {
+		json.Unmarshal(g.LastStatus, &l)
 	}
-	if r.Host == "" {
-		if h, _, err := net.SplitHostPort(g.LastAddr); err == nil {
-			r.Host = h
-		} else {
-			r.Host = g.LastAddr
+	return l
+}
+
+// linkWire builds a command for a gateway, signing it when the gateway is
+// paired. The result is called again if the gateway asks for a fresh nonce.
+func (s *Server) linkWire(g *model.Gateway, req map[string]any) func(nonce string) []byte {
+	l := linkOf(g)
+	if l.Link >= ingest.LinkVersion {
+		req["request_id"] = ingest.NewRequestID()
+	}
+	payload, _ := json.Marshal(req)
+	key := s.Proc.Settings().LinkKey
+	return func(nonce string) []byte {
+		if l.Link >= ingest.LinkVersion && l.Auth && key != "" {
+			return ingest.SignLink(key, nonce, payload)
 		}
+		return payload
 	}
-	return r
 }
 
-type remoteSession struct {
-	client *ssh.Client
-}
-
-func (s *Server) dialRemote(g *model.Gateway) (*remoteSession, model.GatewayRemote, error) {
-	rc := remoteOf(g)
-	if rc.Host == "" {
-		return nil, rc, errors.New("set the gateway address first")
-	}
-	signer, err := s.remoteSigner()
+// controlExchange sends one command and waits for the reply of type want.
+func controlExchange(host string, port int, wire func(nonce string) []byte, want string, timeout time.Duration) (map[string]any, error) {
+	c, err := net.Dial("udp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
-		return nil, rc, err
+		return nil, err
 	}
-	var seen string
-	cfg := &ssh.ClientConfig{User: rc.User, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, Timeout: remoteTimeout,
-		HostKeyAlgorithms: []string{ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA},
-		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
-			seen = ssh.FingerprintSHA256(key)
-			if rc.HostKey != "" && rc.HostKey != seen {
-				return fmt.Errorf("the gateway's SSH host key changed (expected %s, got %s); if that is expected, trust the new key in the connection settings", rc.HostKey, seen)
+	defer c.Close()
+	if _, err := c.Write(wire(ingest.StubNonce)); err != nil {
+		return nil, err
+	}
+	c.SetReadDeadline(time.Now().Add(timeout))
+	retried := false
+	buf := make([]byte, 16384)
+	for {
+		n, err := c.Read(buf)
+		if err != nil {
+			return nil, fmt.Errorf("no answer from raw_lora_app on UDP port %d", port)
+		}
+		var m map[string]any
+		if json.Unmarshal(buf[:n], &m) != nil {
+			continue
+		}
+		switch m["msg_type"] {
+		case want:
+			return m, nil
+		case "auth_required":
+			nonce, _ := m["nonce"].(string)
+			if retried || nonce == "" {
+				return nil, errors.New("the gateway rejected LoRaHub's link key")
 			}
-			return nil
-		}}
-	c, err := ssh.Dial("tcp", net.JoinHostPort(rc.Host, fmt.Sprint(rc.Port)), cfg)
-	if err != nil {
-		return nil, rc, err
-	}
-	if rc.HostKey == "" {
-		rc.HostKey = seen
-		pin := rc
-		s.Store.UpdateGateway(g.ID, true, func(x *model.Gateway) { x.Remote = &pin })
-	}
-	return &remoteSession{c}, rc, nil
-}
-
-func (r *remoteSession) run(cmd string, stdin []byte) (string, error) {
-	sess, err := r.client.NewSession()
-	if err != nil {
-		return "", err
-	}
-	defer sess.Close()
-	if stdin != nil {
-		sess.Stdin = bytes.NewReader(stdin)
-	}
-	type result struct {
-		out []byte
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		b, e := sess.CombinedOutput(cmd)
-		done <- result{b, e}
-	}()
-	select {
-	case res := <-done:
-		return string(res.out), res.err
-	case <-time.After(remoteTimeout):
-		return "", errors.New("the gateway did not answer in time")
+			retried = true
+			c.Write(wire(nonce))
+		}
 	}
 }
 
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
-
-func (s *Server) remoteGateway(w http.ResponseWriter, r *http.Request) (*model.Gateway, bool) {
-	g, err := s.Store.Gateway(r.PathValue("id"))
-	if err != nil {
-		storeErr(w, err)
-		return nil, false
+func gatewayHost(g *model.Gateway) string {
+	if h, _, err := net.SplitHostPort(g.LastAddr); err == nil {
+		return h
 	}
-	return g, true
+	return g.LastAddr
+}
+
+func (s *Server) controlPortOf(g *model.Gateway) int {
+	if g.ControlPort > 0 {
+		return g.ControlPort
+	}
+	return s.Cfg.Bobcat.DownlinkPort
+}
+
+// isLocalGateway reports whether g is the concentrator on this machine.
+func (s *Server) isLocalGateway(g *model.Gateway) bool {
+	b, err := readStatus(s.Cfg.Concentrator.StatusAddr)
+	if err != nil {
+		return false
+	}
+	var st struct {
+		EUI string `json:"eui"`
+	}
+	return json.Unmarshal(b, &st) == nil && st.EUI != "" && strings.EqualFold(st.EUI, g.EUI)
+}
+
+type remoteTarget struct {
+	host                    string
+	controlPort, statusPort int
+	local                   bool
+}
+
+func (s *Server) remoteTargetOf(g *model.Gateway) (remoteTarget, error) {
+	if g.Kind != "bobcat" {
+		return remoteTarget{}, errors.New("this gateway does not run raw_lora_app, so LoRaHub cannot change its radio settings")
+	}
+	t := remoteTarget{host: gatewayHost(g), controlPort: s.controlPortOf(g), statusPort: g.StatusPort, local: s.isLocalGateway(g)}
+	if t.statusPort == 0 {
+		t.statusPort = defaultStatusPort
+	}
+	if t.local {
+		t.host, t.controlPort = "127.0.0.1", s.Cfg.Bobcat.DownlinkPort
+	}
+	if t.host == "" {
+		return t, errors.New("the gateway's address is not known yet; wait for its next heartbeat")
+	}
+	return t, nil
+}
+
+// discoverControl asks the gateway for its configuration on the known port,
+// then on the common ones, and remembers a port that answers.
+func (s *Server) discoverControl(g *model.Gateway, t remoteTarget) (map[string]any, int, error) {
+	ports := []int{t.controlPort}
+	if !t.local && g.ControlPort == 0 {
+		for _, p := range commonControlPorts {
+			if p != t.controlPort {
+				ports = append(ports, p)
+			}
+		}
+	}
+	var last error
+	for _, p := range ports {
+		m, err := controlExchange(t.host, p, s.linkWire(g, map[string]any{"cmd": "get_config", "full": true}), "config_resp", controlTimeout)
+		if err != nil {
+			last = err
+			continue
+		}
+		if !t.local && g.ControlPort != p {
+			s.Store.UpdateGateway(g.ID, true, func(x *model.Gateway) { x.ControlPort = p })
+		}
+		return m, p, nil
+	}
+	return nil, t.controlPort, last
 }
 
 func (s *Server) getRemote(w http.ResponseWriter, r *http.Request) {
-	g, ok := s.remoteGateway(w, r)
-	if !ok {
+	g, err := s.Store.Gateway(r.PathValue("id"))
+	if err != nil {
+		storeErr(w, err)
 		return
 	}
-	sess, rc, err := s.dialRemote(g)
-	out := map[string]any{"remote": rc}
+	out := map[string]any{"online": s.gatewayOnline(g), "supported": false}
+	t, err := s.remoteTargetOf(g)
 	if err != nil {
 		out["error"] = err.Error()
 		writeJSON(w, 200, out)
 		return
 	}
-	defer sess.client.Close()
-	if b, err := sess.run("cat "+shellQuote(rc.ConfigPath), nil); err != nil {
-		out["config_error"] = strings.TrimSpace(b)
+	out["supported"], out["local"], out["host"], out["status_port"] = true, t.local, t.host, t.statusPort
+	out["control_port"] = t.controlPort
+	if st, err := readStatus(net.JoinHostPort(t.host, strconv.Itoa(t.statusPort))); err == nil {
+		out["status"] = st
 	} else {
-		out["config"] = json.RawMessage(b)
-		if !json.Valid([]byte(b)) {
-			delete(out, "config")
-			out["config_error"] = "the config file on the gateway is not valid JSON"
-		}
+		out["status_error"] = err.Error()
 	}
-	if b, _ := sess.run("nc 127.0.0.1 5557 2>/dev/null </dev/null", nil); json.Valid([]byte(b)) && b != "" {
-		out["status"] = json.RawMessage(b)
+	if r.URL.Query().Get("status") == "1" {
+		writeJSON(w, 200, out)
+		return
 	}
-	b, _ := sess.run("pidof raw_lora_app sx1276_app lg02_pkt_fwd lg01_pkt_fwd", nil)
-	out["running"] = strings.TrimSpace(b) != ""
+	cfg, port, err := s.discoverControl(g, t)
+	out["control_port"] = port
+	switch {
+	case err == nil:
+		out["config"] = cfg
+		out["link"] = linkOf(g)
+	case out["status"] != nil:
+		out["error"] = "This gateway reports its status but does not answer remote settings commands. Its raw_lora_app build is too old for this, or its control port is wrong (see the gateway's Settings tab). Live status and TX test still work if the port is right."
+	default:
+		out["error"] = err.Error()
+	}
 	writeJSON(w, 200, out)
 }
 
-func (s *Server) putRemote(w http.ResponseWriter, r *http.Request) {
-	g, ok := s.remoteGateway(w, r)
-	if !ok {
-		return
+// validateRemote checks settings for a gateway. Current engines take any
+// setting of their config file; older ones only the original few.
+func validateRemote(cfg map[string]any, full bool) error {
+	allowed := map[string]bool{"rf0_freq": true, "rf1_freq": true, "tx_default_freq": true, "tx_default_power": true, "sync_word": true, "target_ip": true, "port_up": true}
+	if len(cfg) == 0 {
+		return errors.New("nothing to change")
 	}
-	var req struct {
-		Host        string `json:"host"`
-		Port        int    `json:"port"`
-		User        string `json:"user"`
-		ConfigPath  string `json:"config_path"`
-		TrustNewKey bool   `json:"trust_new_key"`
+	num := func(k string, lo, hi float64) error {
+		v, ok := cfg[k].(float64)
+		if !ok || v < lo || v > hi {
+			return fmt.Errorf("%s must be between %.0f and %.0f", k, lo, hi)
+		}
+		return nil
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
-		return
+	for k := range cfg {
+		var err error
+		switch {
+		case k == "link_key", !allowed[k] && !full:
+			err = fmt.Errorf("%s cannot be changed remotely", k)
+		case k == "rf0_freq", k == "rf1_freq", k == "tx_default_freq":
+			err = num(k, 100e6, 1100e6)
+		case k == "tx_default_power":
+			err = num(k, 0, 27)
+		case k == "port_up":
+			err = num(k, 1, 65535)
+		case k == "sync_word":
+			if v, _ := cfg[k].(string); v != "public" && v != "private" {
+				err = errors.New("sync_word must be public or private")
+			}
+		case k == "target_ip":
+			if v, _ := cfg[k].(string); net.ParseIP(v) == nil || !strings.Contains(v, ".") {
+				err = errors.New("target_ip must be an IPv4 address")
+			}
+		}
+		if err != nil {
+			return err
+		}
 	}
-	if req.Port == 0 {
-		req.Port = 22
-	}
-	if req.Port < 1 || req.Port > 65535 || req.User == "" || strings.ContainsAny(req.User, " '\"") || !remotePath.MatchString(req.ConfigPath) || strings.ContainsAny(req.Host, " '\"/") {
-		writeErr(w, 400, "check the address, port, user and config path")
-		return
-	}
-	rc := remoteOf(g)
-	if req.Host != rc.Host || req.TrustNewKey {
-		rc.HostKey = ""
-	}
-	rc.Host, rc.Port, rc.User, rc.ConfigPath = req.Host, req.Port, req.User, req.ConfigPath
-	if err := s.Store.UpdateGateway(g.ID, true, func(x *model.Gateway) { x.Remote = &rc }); err != nil {
-		storeErr(w, err)
-		return
-	}
-	writeJSON(w, 200, rc)
+	return nil
 }
 
 func (s *Server) putRemoteConfig(w http.ResponseWriter, r *http.Request) {
-	g, ok := s.remoteGateway(w, r)
-	if !ok {
+	g, err := s.Store.Gateway(r.PathValue("id"))
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	t, err := s.remoteTargetOf(g)
+	if err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	var cfg map[string]any
@@ -227,63 +279,40 @@ func (s *Server) putRemoteConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	body, _ := json.MarshalIndent(cfg, "", "    ")
-	sess, rc, err := s.dialRemote(g)
-	if err != nil {
-		writeErr(w, 502, err.Error())
-		return
-	}
-	defer sess.client.Close()
-	p := shellQuote(rc.ConfigPath)
-	tmp := shellQuote(rc.ConfigPath + ".new")
-	bak := shellQuote(rc.ConfigPath + ".bak")
-	if out, err := sess.run(fmt.Sprintf("cat > %s && cp %s %s 2>/dev/null; mv %s %s", tmp, p, bak, tmp, p), body); err != nil {
-		writeErr(w, 502, strings.TrimSpace(out+" "+err.Error()))
-		return
-	}
-	writeJSON(w, 200, map[string]bool{"ok": true})
-}
-
-func (s *Server) remoteService(w http.ResponseWriter, r *http.Request) {
-	g, ok := s.remoteGateway(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		Cmd string `json:"cmd"`
-	}
-	if err := readJSON(r, &req); err != nil {
+	if err := validateRemote(cfg, linkOf(g).Link >= ingest.LinkVersion); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if !serviceCmds[req.Cmd] {
-		writeErr(w, 400, "cmd must be start, stop or restart")
-		return
-	}
-	sess, _, err := s.dialRemote(g)
+	ack, err := controlExchange(t.host, t.controlPort, s.linkWire(g, map[string]any{"cmd": "set_config", "config": cfg}), "config_ack", applyTimeout)
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	defer sess.client.Close()
-	if out, err := sess.run(fmt.Sprintf("if [ -x /etc/init.d/lora_gateway ]; then /etc/init.d/lora_gateway %s; else systemctl %s raw-lora; fi", req.Cmd, req.Cmd), nil); err != nil {
-		writeErr(w, 502, strings.TrimSpace(out+" "+err.Error()))
+	if ack["status"] != "ok" {
+		writeErr(w, 502, fmt.Sprint(ack["message"]))
 		return
 	}
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	writeJSON(w, 200, ack)
 }
 
-func (s *Server) remoteLogs(w http.ResponseWriter, r *http.Request) {
-	g, ok := s.remoteGateway(w, r)
-	if !ok {
-		return
+// ProbeControlPorts finds the UDP control port of raw_lora_app gateways, so
+// downlinks reach a satellite whose port differs from the hub's default.
+func (s *Server) ProbeControlPorts(stop <-chan struct{}) {
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
+	for {
+		for _, g := range s.Store.Gateways() {
+			if g.Kind != "bobcat" || g.ControlPort != 0 || !s.gatewayOnline(g) {
+				continue
+			}
+			if t, err := s.remoteTargetOf(g); err == nil && !t.local {
+				s.discoverControl(g, t)
+			}
+		}
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+		}
 	}
-	sess, _, err := s.dialRemote(g)
-	if err != nil {
-		writeErr(w, 502, err.Error())
-		return
-	}
-	defer sess.client.Close()
-	out, _ := sess.run("if [ -f /var/log/lora.log ]; then tail -n 200 /var/log/lora.log; else journalctl -u raw-lora -n 200 --no-pager; fi", nil)
-	writeJSON(w, 200, map[string]string{"log": out})
 }
