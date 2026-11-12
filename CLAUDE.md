@@ -61,7 +61,7 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Go ≥ 1.26 (go.mod). Cross-compile is pure Go (CGO_ENABLED=0).
 
 ## Status / open items
-- Running on the real Bobcat (LoRaHub 0.8.26) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
+- Running on the real Bobcat (LoRaHub 0.8.27) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
   owner preferences are in SESSION_LOG.md section 1.
 - Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md

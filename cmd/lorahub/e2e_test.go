@@ -551,6 +551,8 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("interval number %v", num)
 		}
 		btn := jsonOf(t, e.rec.wait(t, m, "homeassistant/button/lorahub_node_cafe_96b840eb/cmd_Blink/config", nil).payload)
+		// Its Relay switch sends 0101 / 0100, as the generic Output switch of a class C node would: Output goes.
+		e.rec.wait(t, m, "homeassistant/switch/lorahub_node_cafe_96b840eb/switch/config", func(p string) bool { return p == "" })
 		published := jsonOf(t, e.rec.wait(t, m, "lorahub/node-cafe/96b840eb/description", nil).payload)
 		if cmds, _ := published["commands"].([]any); len(cmds) != 3 {
 			t.Fatalf("description on MQTT: %v", published)

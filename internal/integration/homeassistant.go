@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -82,6 +83,24 @@ func findControl(d *model.Device, key string) *model.HACommand {
 
 // controlValue is what a dynamic command shows: its last value, or the minimum
 // so a number never starts out unknown.
+// hasOwnOutputSwitch reports whether one of the node's switches, announced by
+// the node or set in LoRaHub, sends what the generic Output switch would (ON
+// 0101, OFF 0100). Output is then left out: two switches would do the same.
+func hasOwnOutputSwitch(cmds []model.HACommand) bool {
+	for i := range cmds {
+		c := &cmds[i]
+		if c.Kind != "switch" {
+			continue
+		}
+		on, err1 := c.Render("ON")
+		off, err2 := c.Render("OFF")
+		if err1 == nil && err2 == nil && bytes.Equal(on, []byte{1, 1}) && bytes.Equal(off, []byte{1, 0}) {
+			return true
+		}
+	}
+	return false
+}
+
 func controlValue(d *model.Device, c *model.HACommand) string {
 	switch c.Kind {
 	case "switch":
@@ -342,8 +361,9 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 	for _, k := range stateField {
 		claimed[k] = true
 	}
-	isSwitch := d.Class == "C" || d.HASwitch || strings.Contains(strings.ToLower(d.Model), "valve") ||
-		strings.Contains(strings.ToLower(d.Model), "relay") || strings.Contains(strings.ToLower(d.Model), "actuator")
+	isSwitch := (d.Class == "C" || d.HASwitch || strings.Contains(strings.ToLower(d.Model), "valve") ||
+		strings.Contains(strings.ToLower(d.Model), "relay") || strings.Contains(strings.ToLower(d.Model), "actuator")) &&
+		!hasOwnOutputSwitch(cmds)
 	_, hasState := flat["state"]
 	cmd := fmt.Sprintf("%s/%s/%s/set", s.MQTTTopicPrefix, d.AppID, d.ID)
 	command := func(component, key, name string, extra map[string]any) {
