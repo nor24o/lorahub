@@ -14,9 +14,16 @@ const HAValueToken = "{value}"
 // HACommand is a control LoRaHub announces to Home Assistant for one node.
 type HACommand struct {
 	Name string `json:"name"`
-	Kind string `json:"kind,omitempty"` // button (default, fixed payload) | number | text
-	// PayloadHex is the payload in hex; number and text commands contain {value}.
+	// Kind: button (default, fixed payload), number, text, switch (sends 1 for on
+	// and 0 for off) or choice (sends the chosen option's value).
+	Kind string `json:"kind,omitempty"`
+	// PayloadHex is the payload in hex; the other kinds than button contain {value}.
 	PayloadHex string `json:"payload_hex"`
+	// Source is "node" for a command the node announced itself (model.NodeDescription).
+	Source string `json:"source,omitempty"`
+
+	// choice
+	Options []HAOption `json:"options,omitempty"`
 
 	// number
 	Min   float64 `json:"min,omitempty"`
@@ -28,6 +35,12 @@ type HACommand struct {
 	// Encoding is how the value becomes bytes: u8, i16le and so on for a
 	// number, hex or ascii for text.
 	Encoding string `json:"encoding,omitempty"`
+}
+
+// HAOption is one option of a choice.
+type HAOption struct {
+	Name  string  `json:"name"`
+	Value float64 `json:"value"`
 }
 
 type haEncoding struct {
@@ -42,7 +55,20 @@ var haEncodings = map[string]haEncoding{
 }
 
 // Dynamic reports whether the payload depends on a value from Home Assistant.
-func (c *HACommand) Dynamic() bool { return c.Kind == "number" || c.Kind == "text" }
+func (c *HACommand) Dynamic() bool {
+	return c.Kind == "number" || c.Kind == "text" || c.Kind == "switch" || c.Kind == "choice"
+}
+
+// Component is the Home Assistant entity type of the command.
+func (c *HACommand) Component() string {
+	if c.Kind == "choice" {
+		return "select"
+	}
+	if c.Kind == "" {
+		return "button"
+	}
+	return c.Kind
+}
 
 // Key identifies the command in entity IDs and MQTT topics.
 func (c *HACommand) Key() string {
@@ -85,7 +111,7 @@ func (c *HACommand) Normalize() error {
 			return fmt.Errorf("command %q needs a hex payload", c.Name)
 		}
 		return nil
-	case "number", "text":
+	case "number", "text", "switch", "choice":
 		if c.PayloadHex == "" {
 			c.PayloadHex = HAValueToken
 		}
@@ -94,6 +120,34 @@ func (c *HACommand) Normalize() error {
 		}
 	default:
 		return fmt.Errorf("command %q: unknown type %q", c.Name, c.Kind)
+	}
+	if c.Kind == "switch" || c.Kind == "choice" {
+		if c.Encoding == "" {
+			c.Encoding = "u8"
+		}
+		values := []float64{0, 1}
+		if c.Kind == "choice" {
+			if len(c.Options) == 0 || len(c.Options) > 32 {
+				return fmt.Errorf("command %q: a choice has 1 to 32 options", c.Name)
+			}
+			values = values[:0]
+			names := map[string]bool{}
+			for i := range c.Options {
+				o := &c.Options[i]
+				o.Name = strings.TrimSpace(o.Name)
+				if o.Name == "" || names[strings.ToLower(o.Name)] {
+					return fmt.Errorf("command %q: each option needs its own name", c.Name)
+				}
+				names[strings.ToLower(o.Name)] = true
+				values = append(values, o.Value)
+			}
+		}
+		for _, v := range values {
+			if _, err := encodeHANumber(v, c.Encoding); err != nil {
+				return fmt.Errorf("command %q: %w", c.Name, err)
+			}
+		}
+		return nil
 	}
 	if c.Kind == "text" {
 		if c.Encoding == "" {
@@ -134,7 +188,23 @@ func (c *HACommand) Render(value string) ([]byte, error) {
 		return nil, err
 	}
 	var mid []byte
-	if c.Kind == "number" {
+	if c.Kind == "switch" {
+		on, ok := map[string]float64{"ON": 1, "1": 1, "TRUE": 1, "OFF": 0, "0": 0, "FALSE": 0}[strings.ToUpper(strings.TrimSpace(value))]
+		if !ok {
+			return nil, fmt.Errorf("a switch takes ON or OFF, not %q", value)
+		}
+		if mid, err = encodeHANumber(on, c.Encoding); err != nil {
+			return nil, err
+		}
+	} else if c.Kind == "choice" {
+		o := c.Option(value)
+		if o == nil {
+			return nil, fmt.Errorf("%q is not one of the options", value)
+		}
+		if mid, err = encodeHANumber(o.Value, c.Encoding); err != nil {
+			return nil, err
+		}
+	} else if c.Kind == "number" {
 		v, perr := strconv.ParseFloat(strings.TrimSpace(value), 64)
 		if perr != nil || math.IsNaN(v) || v < c.Min || v > c.Max {
 			return nil, fmt.Errorf("value %q is outside %g to %g", value, c.Min, c.Max)
@@ -151,6 +221,22 @@ func (c *HACommand) Render(value string) ([]byte, error) {
 		return nil, fmt.Errorf("empty value")
 	}
 	return append(append(left, mid...), right...), nil
+}
+
+// Option finds a choice's option by name (any case) or by value.
+func (c *HACommand) Option(v string) *HAOption {
+	v = strings.TrimSpace(v)
+	for i := range c.Options {
+		if strings.EqualFold(c.Options[i].Name, v) {
+			return &c.Options[i]
+		}
+	}
+	for i := range c.Options {
+		if strconv.FormatFloat(c.Options[i].Value, 'f', -1, 64) == v {
+			return &c.Options[i]
+		}
+	}
+	return nil
 }
 
 func encodeHANumber(v float64, encoding string) ([]byte, error) {

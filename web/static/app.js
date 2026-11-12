@@ -33,6 +33,7 @@ const ICONS = {
   live: 'M3 12h4l3-8 4 16 3-8h4',
   code: 'M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16',
   chip: 'M7 7h10v10H7zM9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4',
+  help: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01',
   gear: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
   device: 'M7 3h10v18H7zM11 18h2',
   plus: 'M12 5v14M5 12h14',
@@ -66,7 +67,7 @@ const LOGO = () => {
 
 // ---------- API ----------
 async function api(method, path, body) {
-  const opt = { method, headers: {}, credentials: 'same-origin' };
+  const opt = { method, headers: { 'X-Requested-With': 'lorahub' }, credentials: 'same-origin' };
   if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch('/api' + path, opt);
   let data = null;
@@ -656,8 +657,10 @@ const App = {
         navItem('#/tx', 'send', 'TX test'),
         navItem('#/remote', 'key', 'Remote config'),
         h('div', { class: 'nav-section' }, 'System'),
+        navItem('#/device', 'chip', 'Device'),
         navItem('#/logs', 'inbox', 'Logs'),
-        navItem('#/settings', 'gear', 'Settings')));
+        navItem('#/settings', 'gear', 'Settings'),
+        navItem('#/help', 'help', 'Help')));
     this.sidebar.addEventListener('click', (e) => { if (e.target.closest('a')) this.sidebar.classList.remove('open'); });
     this.main = h('main', { class: 'main' });
     this.main.addEventListener('click', () => this.sidebar.classList.remove('open'));

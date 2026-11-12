@@ -94,6 +94,12 @@ func (p *Processor) handleNode(fr *Frame) bool {
 			}
 		}
 	}
+	var descPart *model.DescriptionPart
+	var descErr error
+	isDesc := false
+	if !simulated {
+		descPart, descErr, isDesc = p.description(app, &hdr)
+	}
 	devs := p.store.FindDevices(func(d *model.Device) bool {
 		return d.AppID == app.ID && d.Mode == "node" && strings.EqualFold(d.Serial, hdr.Serial)
 	})
@@ -124,6 +130,10 @@ func (p *Processor) handleNode(fr *Frame) bool {
 
 	unlock := p.lockDevice(d.AppID, d.ID)
 	defer unlock()
+	if isDesc { // a list of the node's commands, not measurements
+		p.nodeDescribed(app, d, &hdr, fr, descPart, descErr)
+		return true
+	}
 	msg := p.buildNodeMessage(app, d, &hdr, fr, scheme)
 	if simulated {
 		msg["simulated"] = true
@@ -174,6 +184,16 @@ func (p *Processor) handleNode(fr *Frame) bool {
 	}
 	p.evalRules(updated, decoded)
 	return true
+}
+
+// WaitsForUplink tells whether a downlink for d is held until the node's next
+// packet (its own setting, the group's, class A or its profile), rather than
+// sent at once.
+func WaitsForUplink(app *model.Application, d *model.Device) bool {
+	if d.Mode == "otaa" || d.Mode == "abp" {
+		return true
+	}
+	return downlinkCfg(app, d).Mode == "after_uplink"
 }
 
 func downlinkCfg(app *model.Application, d *model.Device) model.RawDownlink {

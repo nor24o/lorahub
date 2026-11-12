@@ -9,11 +9,13 @@ all: test build arm64
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub ./cmd/lorahub
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub-sim ./cmd/lorahub-sim
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub-sat ./cmd/lorahub-sat
 
 # Static binary for the Bobcat Miner 300 (RK3566, aarch64)
 arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub-linux-arm64 ./cmd/lorahub
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub-sim-linux-arm64 ./cmd/lorahub-sim
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/lorahub-sat-linux-arm64 ./cmd/lorahub-sat
 
 test:
 	go vet ./...

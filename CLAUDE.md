@@ -23,6 +23,16 @@ SX1302 engine `raw_lora_app` from https://github.com/nor24o/custom-lps8-firmware
 
 ## Layout
 - `cmd/lorahub` daemon · `cmd/lorahub-sim` gateway simulator (default sends CAFE packets)
+- `internal/satpanel`: a Bobcat's device settings (telemetry; wired and Wi-Fi address settings; Wi-Fi client, radio
+  on/off, access point bridged to the cable or with its own network 10.42.0.0/24 (NetworkManager shared mode, needs
+  dnsmasq-base); host name, time zone, NTP; SD card mount/browse/download and LoRaHub backup; status lights).
+  `API()` is mounted by the hub at `/api/host` (console page `#/device`, `web/static/device.js`) and by
+  `cmd/lorahub-sat`, the satellite's own page on :80 (root password via `unix_chkpwd`, sessions hashed in
+  `/var/lib/lorahub-sat/sessions.json`). The pages are one file, `web/static/host-ui.js`, used by both.
+  Every network change is checked for 60 s and undone if the board loses its way out: a satellite pings the hub
+  through the tunnel, the hub pings the home router. Changes to an active profile use `nmcli device reapply`.
+  NetworkManager profiles of the access point: `lorahub-ap`, plus `lorahub-br0` and `lorahub-br0-port` for the bridge.
+  `internal/wgstat` is the WireGuard parser shared with the hub's VPN page.
 - `internal/ingest` Semtech UDP server/forwarder, raw_lora_app protocol (JSON rxpk on
   5555, binary heartbeat 0x02 / boot 0x03, downlink flat JSON to port 5556)
 - `internal/processor` dedup across gateways → `node.go` (NODE_ID/SERIAL handling,
@@ -32,7 +42,8 @@ SX1302 engine `raw_lora_app` from https://github.com/nor24o/custom-lps8-firmware
 - `internal/integration` built-in MQTT broker + external, Home Assistant discovery, webhooks
 - `internal/api` REST + websocket `/api/live`; `internal/store` SQLite (pure Go)
 - `web/static` SPA (vanilla JS, no build step, embedded): app.js = core/components,
-  pages.js = routes. Routes still use `/applications` internally = node groups.
+  pages.js = routes. help.js = Help (`#/help/<topic>`, and the satellite's Help tab): every function with an animated
+  example (flow scenes, byte scenes, a live LED simulator); add a topic there when adding a feature. Routes still use `/applications` internally = node groups.
 - `deploy/` install.sh, systemd unit, lorahub.yml, dev.yml
 
 ## Output JSON (MQTT `lorahub/{group}/{serial}/up`)
@@ -50,7 +61,7 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Go ≥ 1.26 (go.mod). Cross-compile is pure Go (CGO_ENABLED=0).
 
 ## Status / open items
-- Running on the real Bobcat (LoRaHub 0.8.16) with the LPS8 as satellite; current state, open items and
+- Running on the real Bobcat (LoRaHub 0.8.27) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
   owner preferences are in SESSION_LOG.md section 1.
 - Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
@@ -83,6 +94,9 @@ Per-node commands are defined in LoRaHub (Device.HACommands, exposure popup) and
 ## Gateway roles and link
 The Bobcat is the main server: LoRaHub plus its own raw_lora_app. The Dragino LPS8 at .17 is only a satellite: it runs
 raw_lora_app, sends uplinks to the Bobcat and receives config and downlinks. Decoding, MQTT and Home Assistant are on the Bobcat.
+A second Bobcat, `bobcat-sat3` at .16 (tunnel 10.77.0.3), is also a satellite, set up from a copy of the hub's eMMC by
+`deploy/satellite/add-satellite.sh` (README there). That script detects such a copy and gives it its own identity first; never
+start a copied hub with LoRaHub, Tailscale or wg0 running, and never `tailscale logout` on a copy (it shares the hub's login).
 One raw_lora_app.c serves both (GATEWAY_MODEL comes from the CPU); keep the copies in both firmware trees identical:
 ~/bobcat-miner-300/sx1302_hal (built natively on the Bobcat) and ~/2027_Latest_LORA/custom-lps8-firmware/targets/sx1302/src
 (WSL Ubuntu-18.04, toolchain ~/openwrt/openwrt/staging_dir/toolchain-mips_24kc_gcc-7.5.0_musl).
@@ -101,9 +115,21 @@ Edits use `mergeJSON` (`internal/api/merge.go`): fields sent are replaced whole,
 
 ## Downlink settings and node profile
 Effective settings (`downlinkCfg`, `internal/processor/node.go`): Device.RawDownlink (node's Downlink tab: mode, delay, gateway, frequency, SF, BW, CR, power, IQ, preamble, CRC, implicit header, NODE_ID+SERIAL) wins outright; otherwise group `downlink_radio`, class C forcing immediate, then the firmware's profile on top.
-Group option `node_profile` (`internal/model/profile.go`): after SERIAL_ID comes 1 profile byte (bits 7-6 class 00 A/01 B/10 C, bit 5 inverted IQ, bit 4 radio block follows, bits 3-0 free) and an optional 4-byte radio block (frequency in 100 Hz MSB first, 0 = uplink's; then SF nibble, 2-bit BW, 2-bit CR). Removed from `data_hex` before decoding; reported as `profile`, or `profile_error` with the data left intact. Class B is handled like A (no ping slots).
+Group option `node_profile` (`internal/model/profile.go`): after SERIAL_ID comes 1 profile byte (bits 7-6 class 00 A/01 B/10 C, bit 5 inverted IQ, bit 4 radio block follows, bit 3 description, bits 2-0 free) and an optional 4-byte radio block (frequency in 100 Hz MSB first, 0 = uplink's; then SF nibble, 2-bit BW, 2-bit CR). Removed from `data_hex` before decoding; reported as `profile`, or `profile_error` with the data left intact. Class B is handled like A (no ping slots).
 
 Group option `downlink_control` (node override `node_control`, and it always turns the NODE_ID+SERIAL header on): downlink is `NODE_ID | SERIAL_ID | control | data`, control = bit 7 from hub, bits 6-5 audience (00 one node, 01 group, 10 everyone), bit 4 confirm, bits 3-0 sequence (Device.DownSeq). Broadcast tab (`SendBroadcast`, `internal/processor/broadcast.go`): SERIAL_ID FFFFFFFF, NODE_ID FFFF for everyone; sent once per chosen gateway in turn; class A nodes get a copy in their queue with ExpiresAt, for their next receive window.
+
+## Node self-description
+A node can announce the commands it accepts (`internal/model/describe.go`, `internal/processor/describe.go`, layout in
+`docs/node-protocol.md`): an uplink with profile bit 3, then `D1`, a part byte (part/parts nibbles) and entries
+(code, kind = type nibble button/switch/number/choice/raw + value format nibble, type fields, name, unit for numbers).
+Without the group's profile option it is still recognised by its exact layout. Parts are collected for 10 minutes; the
+result is `Device.Described` (kept on console edits, changed only by the node) and published retained on
+`{prefix}/{group}/{node}/description`. `Device.Commands()` = commands set in LoRaHub, then the announced ones (as
+HACommand with Source "node"; a hand-made one with the same name wins). New HACommand kinds: switch (sends code 01/00)
+and choice (HA select, sends the option's value). A command whose name matches a decoded field takes its HA state from
+that field. Downlink `FF` asks a node to describe itself: node page button, `POST .../devices/{dev}/describe`, or
+`DESCRIBE` on `/set`. Processor tells HA through `Processor.NodeChanged` (set to `mq.NodeChanged` in hub.go).
 
 ## Tunnel between gateways
 WireGuard subnet 10.77.0.0/24: Bobcat 10.77.0.1 (`wg-quick@wg0`, UDP 51820), LPS8 10.77.0.2 (OpenWrt `network.wg0`). The LPS8's raw_lora_app sends to `target_ip` 10.77.0.1. `/usr/bin/wg_roam.sh` (cron, each minute) alternates the Bobcat's LAN and public endpoints while there is no recent handshake; off-network use needs UDP 51820 forwarded to the Bobcat on the home router. Tailscale is on the Bobcat only, advertising 10.77.0.0/24; it does not fit on the LPS8 (36.7 MB download, 9.7 MB free flash, 60 MB RAM).
@@ -112,6 +138,16 @@ Pages: LoRaHub `#/vpn` with WireGuard and Tailscale tabs (`web/static/vpn.js`, `
 Radio config "apply" (`POST /api/concentrator/apply`) restarts raw-lora and puts the previous config.json back when the radio is not
 LISTENING within 25 s (the failed one is kept as config.json.failed). Neither board supports `full_duplex`: it stops the Bobcat with
 "FDD mode of Radio A has not been set properly". Class C downlinks avoid a gateway whose link-2 engine has not reported for 45 s.
+Status lights (raw_lora_app 2.2): the engine reads `/etc/lora/led_mode` about once a second, a mode word and colours,
+e.g. `steady idle=cyan rx=red tx=blue`. Modes: normal (heartbeat, packet flashes), steady (idle colour lit, flashes), quiet
+(heartbeat only), solid (idle colour lit only), errors (dark unless something is wrong), off. Colours: green red blue yellow
+cyan magenta white off (one RGB LED, channels on or off; on the Bobcat the sysfs names are swapped: green is `blue:status`,
+blue is `green:status`). Error signals keep fast red and blinking yellow. It reports `led_mode`, `led_idle`, `led_rx`,
+`led_tx` in its status. The device page writes the file from `/etc/lora/led_schedule.json` (mode, colours, night window);
+"Try" (`POST /lights/preview`) shows one colour for 5 s. 2.2 runs on both Bobcats; the LPS8 still runs 2.0.
+Hub DNS: the provider's DNS servers are 100.100.0.1 and 100.100.1.1, inside 100.64.0.0/10, whose answers Tailscale's
+firewall drops when they do not arrive on tailscale0. The hub's Wi-Fi profile Link2 therefore uses the router
+(192.168.1.1) as its only DNS server (`ipv4.ignore-auto-dns yes`).
 Measured 2026-11-10: LPS8 scheduled TX goes out on time (16 of 16 probes, `scratchpad engine17/txprobe.py`); each SX1302 hears its own TX on its other radio.
 
 ## Deploying

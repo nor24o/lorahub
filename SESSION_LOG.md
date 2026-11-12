@@ -8,8 +8,9 @@ belong in this public repository.
 ### What runs where
 | Device | Role | Software |
 |---|---|---|
-| Bobcat Miner 300, 192.168.1.15 (Armbian bookworm) | Main server | LoRaHub **0.8.16** (`/usr/local/bin/lorahub`, unit `lorahub`, data `/var/lib/lorahub`), radio engine `raw_lora_app` 2.0 (`/usr/local/bin/raw_lora_app`, unit `raw-lora`), MQTT broker :1883, web console :80, WireGuard hub `10.77.0.1` (`wg-quick@wg0`, UDP 51820), Tailscale (shares `10.77.0.0/24`, route approved) |
+| Bobcat Miner 300, 192.168.1.15 (Armbian bookworm) | Main server | LoRaHub **0.8.27** (with Help at `#/help`, and a Queued downlinks card on the Overview from `GET /api/downlinks/queued`) (console page Device: network, Wi-Fi, name and time, SD card, lights, system) (`/usr/local/bin/lorahub`, unit `lorahub`, data `/var/lib/lorahub`), radio engine `raw_lora_app` **2.2** (`/usr/local/bin/raw_lora_app`, unit `raw-lora`; 2.1 and 2.0 kept as `raw_lora_app.2.1`, `.2.0`), MQTT broker :1883, web console :80, WireGuard hub `10.77.0.1` (`wg-quick@wg0`, UDP 51820), Tailscale (shares `10.77.0.0/24`, route approved) |
 | Dragino LPS8, 192.168.1.17 (OpenWrt 18.06.9, AR9330, 60 MB RAM) | Satellite only | `raw_lora_app` 2.0 (same source), sends to the hub at `10.77.0.1` over WireGuard (`10.77.0.2`), LuCI page LoRa Gateway → WireGuard VPN, `/usr/bin/wg_roam.sh` from cron |
+| Bobcat Miner 300 `bobcat-sat3`, 192.168.1.16 (copy of the hub's eMMC) | Satellite only | Set up by `deploy/satellite/add-satellite.sh`: `raw_lora_app` 2.0 and WireGuard `10.77.0.3`, gateway `eui-0016c001ff1316e0`. LoRaHub and Tailscale disabled; the hub's copied data and keys are in `/root/hub-copy`. Engine 2.2 (2.1 and 2.0 kept). Its own page `http://192.168.1.16/` (`lorahub-sat` 0.2.6, with a Help tab; about 0.3% of a core idle, 1 to 2% while the page is open). Wi-Fi profile `Link2` set to not connect (it had taken 192.168.1.13) |
 | Home Assistant, 192.168.1.13 | Consumer | Uses its own MQTT broker; LoRaHub publishes to it as the external broker and also to its own |
 
 Older LoRaHub binaries: `/var/lib/lorahub/backup-<version>/lorahub` on the Bobcat.
@@ -36,6 +37,29 @@ Older LoRaHub binaries: `/var/lib/lorahub/backup-<version>/lorahub` on the Bobca
   downlinks, WireGuard after an LPS8 reboot, Tailscale reaching the LPS8's web page.
 
 ### Open items
+- **Home Assistant's address is not reserved:** on 2026-11-10 the eMMC copy's Wi-Fi was given .13 by DHCP
+  (and it ran a second LoRaHub with the hub's MQTT client ID); Home Assistant moved to .14 until the owner put
+  it back on .13. Reserve .13 for it on the router.
+- **Hub DNS fixed 2026-11-11** through the new Device page: Link2 uses 192.168.1.1 only. Before that the hub could not
+  resolve any name since Tailscale was installed (its firewall drops the provider's 100.100.x DNS answers).
+- **Hub engine target fixed 2026-11-11:** `/etc/lora/config.json` on the hub had `target_ip` 192.168.1.8 (the PC) and a
+  `udp_stream` to it, leftovers of the old bridge. Now `target_ip` is 127.0.0.1 and `udp_stream.enabled` is false; the
+  previous file is `/etc/lora/config.json.before-target-fix`. (Every Bobcat build also sends a copy to 127.0.0.1 when the
+  target is elsewhere, which is how LoRaHub got the packets before.)
+- **LPS8 still on engine 2.0.** The 2.2 MIPS build (md5 8f665381) is in the session scratchpad `engine22/`; install it
+  with the same rollback script once the LPS8 is back. Both firmware trees have the 2.2 source (md5 5cd3364f). The LPS8 has
+  single-colour LEDs, so it follows the modes (flashes or not) but not the colours.
+- **Status light colours checked on the boards 2026-11-11** by reading the LED channels: cyan, magenta, yellow, white and the
+  5-second preview light the right channels; the hub is on normal (green, red, blue).
+- **Node self-description (0.8.22) not yet seen from a real node:** no firmware sends it yet. The whole path (request FF,
+  description in one or two parts, Home Assistant switch, button, number and select, downlinks) is covered by
+  `TestEndToEnd` and the processor and model tests; `docs/node-protocol.md` has the layout and a C example (checked to
+  produce the 43-byte example). Do not press "Ask the node to describe itself" on nodes whose firmware does not know FF.
+- **Not yet tried on the hardware:** SD card with a real card; the access point in either mode; a wired or Wi-Fi
+  address change other than the DNS fix (all covered by tests with a fake nmcli).
+- **Satellite page not yet tried with a change on the hardware:** the access point bridge, wired and Wi-Fi
+  changes are covered by tests with a fake nmcli only.
+- **LPS8 silent since 18:38 on 2026-11-10** (no ping, no WireGuard handshake); check its power and cable.
 - **Router:** forward UDP 51820 to 192.168.1.15 and reserve that address, so the LPS8 can join from
   another network. The Bobcat's internet address is set on the LPS8's WireGuard VPN page (not stored here).
 - **Not seen yet on a real node:** a downlink with the new `CAFE 96B840EB 8x data` header reaching the node.

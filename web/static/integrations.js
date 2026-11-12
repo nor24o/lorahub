@@ -181,6 +181,10 @@ function openNodeExposure(n, reload) {
       n.entities.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, ['On', 'Field', 'Type', 'Name', 'Class', 'Unit', 'State'].map((x) => h('th', null, x)))), h('tbody', null, n.entities.map(row)))) : h('div', { class: 'empty' }, 'No decoded data yet, so there is nothing to expose.'),
       n.entities.length ? h('div', { class: 'stack' }, h('h3', { style: { margin: 0 } }, 'Commands to this node'), h('p', { class: 'small muted', style: { margin: 0 } }, 'Define them here and LoRaHub shows them in Home Assistant, for this node only. A Button sends a fixed payload. On class C nodes, Number adds a slider and Text adds a value box; put {value} in the payload where the value goes.'),
         cmdField('Node class', classSel), cmdBox,
+        n.described && n.described.commands.length ? h('div', { class: 'stack' }, h('h3', { style: { margin: '8px 0 0' } }, 'Announced by the node'),
+          h('p', { class: 'small muted', style: { margin: 0 } }, 'The node sent these itself; they change when it describes itself again. Turn one off in the table above. A command above with the same name wins.'),
+          h('div', { class: 'table-wrap' }, h('table', { class: 't compact' }, h('tbody', null, n.described.commands.map((c) => h('tr', null,
+            h('td', { class: 'mono small' }, c.code.toString(16).toUpperCase().padStart(2, '0')), h('td', null, c.name), h('td', null, h('span', { class: 'badge' }, c.kind)))))))) : null,
         h('div', { class: 'row between' }, h('button', { class: 'btn sm', type: 'button', onclick: () => { commands.push({ name: '', kind: 'button', payload_hex: '' }); paintCommands(); } }, icon('plus'), 'Add command'), outputBox.el)) : null,
       h('div', { class: 'form-actions', style: { justifyContent: 'space-between' } }, toggle, n.entities.length ? h('div', { class: 'row' }, h('button', { class: 'btn', onclick: close }, 'Cancel'), save) : h('button', { class: 'btn', onclick: close }, 'Close')));
   }, { wide: true });

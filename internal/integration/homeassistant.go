@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -16,7 +17,7 @@ import (
 )
 
 // handleSet accepts simple commands on <prefix>/<group>/<node>/set:
-// ON, OFF, 1, 0 or a hex payload.
+// ON, OFF, 1, 0, DESCRIBE (asks the node to describe its commands) or a hex payload.
 func (m *MQTT) handleSet(appID, devID string, payload []byte) {
 	cmd := strings.TrimSpace(string(payload))
 	cmds := m.settings().MQTTCommands
@@ -25,6 +26,8 @@ func (m *MQTT) handleSet(appID, devID string, payload []byte) {
 		cmd = cmds.OnHex
 	case "OFF", "0":
 		cmd = cmds.OffHex
+	case "DESCRIBE":
+		cmd = fmt.Sprintf("%02X", model.DescribeRequest)
 	}
 	b, err := hexDecode(cmd)
 	if err != nil || len(b) == 0 {
@@ -69,8 +72,9 @@ func controlTopic(s config.Settings, appID, devID, key string) string {
 }
 
 func findControl(d *model.Device, key string) *model.HACommand {
-	for i := range d.HACommands {
-		if c := &d.HACommands[i]; c.Dynamic() && c.Key() == key {
+	cmds := d.Commands() // set in LoRaHub, and announced by the node
+	for i := range cmds {
+		if c := &cmds[i]; c.Dynamic() && c.Key() == key {
 			return c
 		}
 	}
@@ -79,8 +83,41 @@ func findControl(d *model.Device, key string) *model.HACommand {
 
 // controlValue is what a dynamic command shows: its last value, or the minimum
 // so a number never starts out unknown.
+// hasOwnOutputSwitch reports whether one of the node's switches, announced by
+// the node or set in LoRaHub, sends what the generic Output switch would (ON
+// 0101, OFF 0100). Output is then left out: two switches would do the same.
+func hasOwnOutputSwitch(cmds []model.HACommand) bool {
+	for i := range cmds {
+		c := &cmds[i]
+		if c.Kind != "switch" {
+			continue
+		}
+		on, err1 := c.Render("ON")
+		off, err2 := c.Render("OFF")
+		if err1 == nil && err2 == nil && bytes.Equal(on, []byte{1, 1}) && bytes.Equal(off, []byte{1, 0}) {
+			return true
+		}
+	}
+	return false
+}
+
 func controlValue(d *model.Device, c *model.HACommand) string {
-	if c.Kind != "number" {
+	switch c.Kind {
+	case "switch":
+		if v := d.HAValues[c.Key()]; v == "ON" || v == "OFF" {
+			return v
+		}
+		return "OFF"
+	case "choice":
+		if o := c.Option(d.HAValues[c.Key()]); o != nil {
+			return o.Name
+		}
+		if len(c.Options) > 0 {
+			return c.Options[0].Name
+		}
+		return ""
+	case "number":
+	default:
 		return ""
 	}
 	last := d.HAValues[c.Key()]
@@ -309,8 +346,24 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	isSwitch := d.Class == "C" || d.HASwitch || strings.Contains(strings.ToLower(d.Model), "valve") ||
-		strings.Contains(strings.ToLower(d.Model), "relay") || strings.Contains(strings.ToLower(d.Model), "actuator")
+	cmds := d.Commands()
+	// A command whose name matches a decoded field takes its state from that
+	// field, as the node reports it, and the field is not shown twice.
+	stateField := map[string]string{}
+	for i := range cmds {
+		if c := &cmds[i]; c.Kind == "switch" || c.Kind == "number" || c.Kind == "choice" {
+			if k := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(c.Name), " ", "_")); flat[k] != nil {
+				stateField[c.Key()] = k
+			}
+		}
+	}
+	claimed := map[string]bool{}
+	for _, k := range stateField {
+		claimed[k] = true
+	}
+	isSwitch := (d.Class == "C" || d.HASwitch || strings.Contains(strings.ToLower(d.Model), "valve") ||
+		strings.Contains(strings.ToLower(d.Model), "relay") || strings.Contains(strings.ToLower(d.Model), "actuator")) &&
+		!hasOwnOutputSwitch(cmds)
 	_, hasState := flat["state"]
 	cmd := fmt.Sprintf("%s/%s/%s/set", s.MQTTTopicPrefix, d.AppID, d.ID)
 	command := func(component, key, name string, extra map[string]any) {
@@ -325,7 +378,7 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 	}
 	for _, k := range keys {
 		switch {
-		case k == "node_class", k == "capability", k == "device_type", channelState.MatchString(k):
+		case k == "node_class", k == "capability", k == "device_type", channelState.MatchString(k), claimed[k]:
 			continue
 		case k == "seq":
 			add("sensor", k, "Sequence", val(k), map[string]any{"entity_category": "diagnostic", "icon": "mdi:counter"})
@@ -371,26 +424,51 @@ func allEntities(d *model.Device, decoded map[string]any, s config.Settings) []h
 		"json_attributes_template": "{{ {'payload': value_json['hex'] | default(''), 'bytes': value_json['size'] | default(0)} | tojson }}"}))
 	command("text", "downlink", "Send downlink", map[string]any{"mode": "text", "pattern": "^([0-9A-Fa-f]{2})*$", "max": 250, "icon": "mdi:send",
 		"state_topic": commandBoxTopic(s, d.AppID, d.ID), "value_template": "{{ value_json['value'] }}"})
-	for i := range d.HACommands {
-		c := &d.HACommands[i]
+	for i := range cmds {
+		c := &cmds[i]
 		if !c.Dynamic() {
 			command("button", c.Key(), c.Name, map[string]any{"payload_press": c.PayloadHex, "icon": "mdi:gesture-tap-button"})
 			continue
 		}
 		topic := controlTopic(s, d.AppID, d.ID, c.Key())
 		extra := map[string]any{"command_topic": topic, "state_topic": topic + "/state", "value_template": "{{ value_json['value'] }}"}
-		if c.Kind == "number" {
+		field := stateField[c.Key()]
+		if field != "" {
+			extra["state_topic"] = stateTopic
+		}
+		switch c.Kind {
+		case "number":
 			extra["min"], extra["max"], extra["step"], extra["icon"] = c.Min, c.Max, c.Step, "mdi:tune-variant"
 			if c.Unit != "" {
 				extra["unit_of_measurement"] = c.Unit
 			}
-		} else {
+			if field != "" {
+				extra["value_template"] = val(field)
+			}
+		case "switch":
+			extra["payload_on"], extra["payload_off"], extra["state_on"], extra["state_off"] = "ON", "OFF", "ON", "OFF"
+			extra["icon"] = "mdi:toggle-switch-outline"
+			if field != "" {
+				extra["value_template"] = fmt.Sprintf("{{ 'ON' if value_json['%s'] in [1, true, 'ON', 'on', '1'] else 'OFF' }}", field)
+			}
+		case "choice":
+			names := make([]string, len(c.Options))
+			pairs := make([]string, len(c.Options))
+			for j, o := range c.Options {
+				names[j] = o.Name
+				pairs[j] = fmt.Sprintf("%s: %q", strconv.FormatFloat(o.Value, 'f', -1, 64), o.Name)
+			}
+			extra["options"], extra["icon"] = names, "mdi:format-list-bulleted"
+			if field != "" {
+				extra["value_template"] = fmt.Sprintf("{%% set m = {%s} %%}{{ m.get(value_json['%s'] | int(-1), none) }}", strings.Join(pairs, ", "), field)
+			}
+		default: // text
 			extra["mode"], extra["max"], extra["icon"] = "text", 200, "mdi:form-textbox"
 			if c.Encoding == "hex" {
 				extra["pattern"] = "^([0-9A-Fa-f]{2})*$"
 			}
 		}
-		command(c.Kind, c.Key(), c.Name, extra)
+		command(c.Component(), c.Key(), c.Name, extra)
 		out[len(out)-1].category = "dynamic"
 	}
 	return out
@@ -472,9 +550,10 @@ func (m *MQTT) syncNode(before *model.Device, bs config.Settings, after *model.D
 		m.publish(commandBoxTopic(bs, before.AppID, before.ID), []byte{}, true)
 	}
 	if before != nil {
-		for i := range before.HACommands {
-			c := &before.HACommands[i]
-			if c.Dynamic() && !current[entityTopic(as, before, haEntity{component: c.Kind, key: c.Key()})] {
+		cmds := before.Commands()
+		for i := range cmds {
+			c := &cmds[i]
+			if c.Dynamic() && !current[entityTopic(as, before, haEntity{component: c.Component(), key: c.Key()})] {
 				m.publish(controlTopic(bs, before.AppID, before.ID, c.Key())+"/state", []byte{}, true)
 			}
 		}
@@ -794,7 +873,7 @@ func (m *MQTT) EntityReport() map[string]any {
 				}
 			}
 			node := map[string]any{"group": d.AppID, "node": d.ID, "name": d.Name, "adopted": d.Adopted, "ha_enabled": d.HAEnabled, "exposed": exposed(d, s),
-				"has_data": d.LastDecoded != nil, "ha_fields": d.HAFields, "ha_commands": d.HACommands, "ha_switch": d.HASwitch, "class": d.Class, "class_from_firmware": d.Profile != nil, "serial": d.Serial, "entities": views}
+				"has_data": d.LastDecoded != nil, "ha_fields": d.HAFields, "ha_commands": d.HACommands, "described": d.Described, "ha_switch": d.HASwitch, "class": d.Class, "class_from_firmware": d.Profile != nil, "serial": d.Serial, "entities": views}
 			if m.Group != nil {
 				if app, err := m.Group(d.AppID); err == nil {
 					node["node_id"], node["downlink_header"], node["downlink_control"] = app.NodeID, app.NodeHeaderOn(d), app.NodeControlOn(d)

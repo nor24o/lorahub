@@ -260,6 +260,8 @@ func (m *MQTT) handleEvent(e *model.Event) {
 			m.publish(fmt.Sprintf("%s/%s/%s/up", p, e.AppID, e.DevID), filterUp(b, s), false)
 		}
 		m.nodeState(e, s, b)
+	case e.Name == "as.node.described":
+		m.publish(fmt.Sprintf("%s/%s/%s/description", p, e.AppID, e.DevID), b, true)
 	case e.Name == "as.down.queued" && out.DownEvents:
 		m.publish(fmt.Sprintf("%s/%s/%s/down/queued", p, e.AppID, e.DevID), b, false)
 	case e.Name == "ns.down.sent" && out.DownEvents:

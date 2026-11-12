@@ -5,89 +5,28 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nor24o/lorahub/internal/wgstat"
 )
 
 const (
 	wgInterface     = "wg0"
 	wgService       = "wg-quick@" + wgInterface
 	wgConfigPath    = "/etc/wireguard/" + wgInterface + ".conf"
-	wgConnectedFor  = 180 * time.Second // peers shake hands at least every two minutes
 	tailscaleRoutes = "10.77.0.0/24"
 )
 
-type wgPeer struct {
-	Name          string     `json:"name,omitempty"`
-	PublicKey     string     `json:"public_key"`
-	Endpoint      string     `json:"endpoint,omitempty"`
-	AllowedIPs    []string   `json:"allowed_ips"`
-	LastHandshake *time.Time `json:"last_handshake,omitempty"`
-	Connected     bool       `json:"connected"`
-	RX            uint64     `json:"rx_bytes"`
-	TX            uint64     `json:"tx_bytes"`
-}
+// The parser lives in internal/wgstat, shared with the satellite page.
+type (
+	wgPeer   = wgstat.Peer
+	wgStatus = wgstat.Status
+)
 
-type wgStatus struct {
-	Installed  bool     `json:"installed"`
-	Service    string   `json:"service,omitempty"`
-	Up         bool     `json:"up"`
-	Interface  string   `json:"interface"`
-	Address    string   `json:"address,omitempty"`
-	PublicKey  string   `json:"public_key,omitempty"`
-	ListenPort int      `json:"listen_port,omitempty"`
-	Peers      []wgPeer `json:"peers"`
-}
+func parseWGDump(out string, now time.Time, st *wgStatus) { wgstat.ParseDump(out, now, st) }
 
-// parseWGDump reads `wg show <if> dump`. The first line holds the interface's
-// private key, which is deliberately not kept.
-func parseWGDump(out string, now time.Time, st *wgStatus) {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if f := strings.Split(lines[0], "\t"); len(f) >= 3 {
-		st.PublicKey = f[1]
-		st.ListenPort, _ = strconv.Atoi(f[2])
-	}
-	for _, line := range lines[1:] {
-		f := strings.Split(line, "\t")
-		if len(f) < 7 {
-			continue
-		}
-		p := wgPeer{PublicKey: f[0], AllowedIPs: strings.Split(f[3], ",")}
-		if f[2] != "(none)" {
-			p.Endpoint = f[2]
-		}
-		if at, _ := strconv.ParseInt(f[4], 10, 64); at > 0 {
-			t := time.Unix(at, 0).UTC()
-			p.LastHandshake, p.Connected = &t, now.Sub(t) < wgConnectedFor
-		}
-		p.RX, _ = strconv.ParseUint(f[5], 10, 64)
-		p.TX, _ = strconv.ParseUint(f[6], 10, 64)
-		st.Peers = append(st.Peers, p)
-	}
-}
-
-// parseWGPeerNames finds the comment naming each [Peer] of a wg-quick file.
-func parseWGPeerNames(conf string) map[string]string {
-	names := map[string]string{}
-	comment, inPeer := "", false
-	for _, line := range strings.Split(conf, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "["):
-			inPeer, comment = strings.EqualFold(line, "[Peer]"), ""
-		case inPeer && strings.HasPrefix(line, "#"):
-			if comment == "" {
-				comment = strings.TrimSpace(strings.TrimLeft(line, "#"))
-			}
-		case inPeer:
-			if k, v, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(k), "PublicKey") {
-				names[strings.TrimSpace(v)] = comment
-			}
-		}
-	}
-	return names
-}
+func parseWGPeerNames(conf string) map[string]string { return wgstat.PeerNames(conf) }
 
 func (s *Server) getWireGuard(w http.ResponseWriter, r *http.Request) {
 	st := wgStatus{Interface: wgInterface, Peers: []wgPeer{}}
