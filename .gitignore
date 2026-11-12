@@ -1,0 +1,4 @@
+firmware/.pio/
+firmware/.vscode/
+firmware/test/host/test_proto
+firmware/test/host/test_proto.exe
