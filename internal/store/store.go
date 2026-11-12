@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -72,6 +73,13 @@ func Open(dataDir string) (*Store, error) {
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Backup writes a consistent copy of the database to path, which must not
+// exist yet (SQLite's VACUUM INTO); LoRaHub keeps running meanwhile.
+func (s *Store) Backup(ctx context.Context, path string) error {
+	_, err := s.db.ExecContext(ctx, "VACUUM INTO ?", path)
+	return err
+}
 
 func (s *Store) load() error {
 	rows, err := s.db.Query(`SELECT data FROM gateways`)

@@ -5,9 +5,28 @@ const KIND_LABEL = { bobcat: 'LoRaHub link (raw_lora_app)', semtech_udp: 'Semtec
 
 // ======================= Overview =======================
 App.route('/', async () => {
-  const [ov, gws, sys] = await Promise.all([GET('/overview'), GET('/gateways'), GET('/system')]);
+  const [ov, gws, sys, queued] = await Promise.all([GET('/overview'), GET('/gateways'), GET('/system'), GET('/downlinks/queued').catch(() => [])]);
   const stat = (label, value, hint, href) => h(href ? 'a' : 'div', { class: 'card stat', href, style: { color: 'inherit', textDecoration: 'none' } },
     h('div', { class: 'label' }, label), h('div', { class: 'value' }, value), hint ? h('div', { class: 'hint' }, hint) : null);
+  // Queued downlinks: everything still waiting in a node's queue. Refreshed
+  // every 5 s; a click lists each one.
+  let qList = queued;
+  const qValue = h('div', { class: 'value' }), qHint = h('div', { class: 'hint' });
+  const loadQueued = async () => { try { showQueued(await GET('/downlinks/queued')); } catch (e) { /* keep the last list */ } };
+  const openQueued = () => queuedModal(qList, loadQueued);
+  const qCard = h('div', { class: 'card stat stat-btn', role: 'button', tabindex: 0, title: 'Show the queued downlinks',
+    onclick: openQueued, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openQueued(); } } },
+  h('div', { class: 'label' }, 'Queued downlinks'), qValue, qHint);
+  function showQueued(q) {
+    qList = q;
+    const nodes = new Set(q.map((x) => x.application_id + '/' + x.device_id)).size;
+    qValue.textContent = q.length;
+    qHint.textContent = q.length ? `${nodes} node${nodes === 1 ? '' : 's'} · oldest ${ago(q[0].created_at)}` : 'nothing waiting';
+    qCard.classList.toggle('stat-warn', q.length > 0);
+  }
+  showQueued(queued);
+  const qTimer = setInterval(() => { if (!document.hidden) loadQueued(); }, 5000);
+  App.onLeave(() => clearInterval(qTimer));
   const now = Date.now(), hour = 3600e3;
   const buckets = []; for (let i = 23; i >= 0; i--) buckets.push(Math.floor((now - i * hour) / hour) * hour);
   const series = [
@@ -17,11 +36,12 @@ App.route('/', async () => {
   ];
   return h('div', { class: 'stack' },
     pageHead(null, 'Overview', [h('span', null, sys.hostname), h('span', null, 'up ' + fmtDur(sys.uptime_s)), sys.addresses && sys.addresses.length ? h('span', null, sys.addresses.join(', ')) : null]),
-    h('div', { class: 'grid g4' },
+    h('div', { class: 'grid g5' },
       stat('Gateways', `${ov.gateways_online} / ${ov.gateways}`, 'connected / registered', '#/gateways'),
       stat('Nodes', ov.devices, ov.devices_active_24h + ' active in 24 h', '#/applications'),
       stat('Packets (24 h)', ov.uplinks_24h, ov.gateway_rx_24h + ' gateway receptions', '#/live'),
-      stat('Downlinks (24 h)', ov.downlinks_24h, ov.unmatched_24h + ' from unknown NODE_IDs', '#/live')),
+      stat('Downlinks (24 h)', ov.downlinks_24h, ov.unmatched_24h + ' from unknown NODE_IDs', '#/live'),
+      qCard),
     h('div', { class: 'grid g2' },
       h('div', { class: 'card card-body' }, h('h2', null, 'Traffic — last 24 hours'), barChart(series, buckets)),
       h('div', { class: 'card' },
@@ -51,6 +71,52 @@ App.route('/', async () => {
         h('li', null, h('a', { href: '#/gateways' }, 'Connect satellite gateways')),
         h('li', null, 'Read the JSON via MQTT, webhooks or the API')))));
 });
+
+// The queued downlinks of every node, grouped by node, with a link to the
+// node's Messaging tab and a button that clears its queue.
+function queuedModal(list, onChange) {
+  modal('Queued downlinks', (close) => {
+    const body = h('div', { class: 'stack' });
+    const render = (q) => {
+      if (!q.length) { body.replaceChildren(h('div', { class: 'empty' }, 'Nothing is waiting. Downlinks for class A nodes wait here until the node sends its next packet.')); return; }
+      const byNode = new Map();
+      for (const x of q) {
+        const k = x.application_id + '/' + x.device_id;
+        if (!byNode.has(k)) byNode.set(k, []);
+        byNode.get(k).push(x);
+      }
+      body.replaceChildren(...[...byNode.values()].map((items) => {
+        items.sort((a, b) => a.position - b.position);
+        const n = items[0], nid = n.node_id || n.application_id;
+        const when = n.waits_for === 'packet' ? `Sent after its next packet · last packet ${ago(n.last_seen)}` : 'Waiting for a gateway to send it';
+        const clear = async () => {
+          if (!confirm(`Remove the ${items.length} queued downlink${items.length === 1 ? '' : 's'} of ${n.name || n.device_id}?`)) return;
+          try {
+            await api('DELETE', `/applications/${n.application_id}/devices/${n.device_id}/down`);
+            toast('Queue cleared');
+            render(await GET('/downlinks/queued'));
+            onChange();
+          } catch (e) { errToast(e); }
+        };
+        return h('div', { class: 'q-node' },
+          h('div', { class: 'row between', style: { gap: '8px', flexWrap: 'wrap' } },
+            h('div', null, h('a', { href: `#/applications/${n.application_id}/devices/${n.device_id}/messaging`, onclick: close }, h('b', null, n.name || n.device_id)), ' ',
+              h('span', { class: 'mono small muted' }, n.serial ? `${nid} / ${n.serial}` : nid)),
+            h('div', { class: 'row', style: { gap: '6px' } }, h('span', { class: 'badge' + (n.waits_for === 'packet' ? '' : ' warn') }, when),
+              h('button', { class: 'btn sm danger', onclick: clear }, icon('trash'), 'Clear'))),
+          h('div', { class: 'table-wrap' }, h('table', { class: 't' },
+            h('thead', null, h('tr', null, ['#', 'Bytes sent on air', 'Queued', ''].map((x) => h('th', null, x)))),
+            h('tbody', null, items.map((x) => h('tr', null,
+              h('td', null, x.position),
+              h('td', { class: 'mono small' }, x.payload_hex || '(empty)'),
+              h('td', { class: 'small muted', title: fmtDate(x.created_at) }, ago(x.created_at)),
+              h('td', { class: 'small muted' }, x.expires_at ? 'broadcast, until ' + fmtTime(x.expires_at) : '')))))));
+      }));
+    };
+    render(list);
+    return body;
+  }, { wide: true });
+}
 
 // ======================= Node groups =======================
 // A node group = all nodes whose packets start with the same NODE_ID.
@@ -327,6 +393,60 @@ function devHeader(a, d, active) {
   tabs(base, [['', 'Overview'], ['live', 'Live data'], ['messages', 'Messages'], ['messaging', 'Downlink'], ['formatters', 'Decoder'], ['settings', 'Settings']], active)];
 }
 
+// ---------- commands a node announced itself (model/describe.go) ----------
+const DESC_SIZES = { u8: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4 };
+function descValueHex(v, format) {
+  const n = DESC_SIZES[format] || 1;
+  const mod = 2 ** (8 * n);
+  return (((Number(v) % mod) + mod) % mod).toString(16).toUpperCase().padStart(2 * n, '0');
+}
+function descScaled(v, scale) { return scale < 0 ? v / 10 ** -scale : v * 10 ** (scale || 0); }
+function descRows(cmds) {
+  return cmds.map((c) => {
+    const code = c.code.toString(16).toUpperCase().padStart(2, '0');
+    let values = '', example = code;
+    switch (c.kind) {
+      case 'button':
+        values = c.value != null ? 'sends the value ' + descValueHex(c.value, c.format) : 'no value';
+        if (c.value != null) example += ' ' + descValueHex(c.value, c.format);
+        break;
+      case 'switch':
+        values = 'on 1, off 0 (' + c.format + ')';
+        example += ' ' + descValueHex(1, c.format) + '  (on)';
+        break;
+      case 'number':
+        values = `${descScaled(c.min, c.scale)} to ${descScaled(c.max, c.scale)}${c.unit ? ' ' + c.unit : ''} (${c.format}${c.scale ? ', raw × 10^' + c.scale : ''})`;
+        example += ' ' + descValueHex(c.min, c.format) + '  (' + descScaled(c.min, c.scale) + ')';
+        break;
+      case 'choice':
+        values = c.options.map((o) => o.value + ' ' + o.name).join(', ');
+        example += ' ' + descValueHex(c.options[0].value, c.format) + '  (' + c.options[0].name + ')';
+        break;
+      default:
+        values = 'hex' + (c.max_len ? ', up to ' + c.max_len + ' bytes' : '');
+        example += ' …';
+    }
+    return h('tr', null, h('td', { class: 'mono' }, code), h('td', null, h('b', null, c.name)), h('td', null, h('span', { class: 'badge' }, c.kind)),
+      h('td', { class: 'small' }, values), h('td', { class: 'mono small' }, example));
+  });
+}
+function describedCard(a, d) {
+  const ask = h('button', { class: 'btn sm', onclick: async () => {
+    try {
+      await api('POST', `/applications/${a.application_id}/devices/${d.device_id}/describe`);
+      toast(d.class === 'C' ? 'Describe request sent' : 'Describe request queued: the node gets it after its next packet');
+    } catch (e) { errToast(e); }
+  } }, 'Ask the node to describe itself');
+  const ds = d.described;
+  return h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Commands from the node'), ask),
+    ds ? h('div', null,
+      h('div', { class: 'card-body small muted', style: { paddingBottom: '0' } }, `Announced ${fmtDate(ds.received)} (${ago(ds.received)})${ds.parts > 1 ? ', in ' + ds.parts + ' parts' : ''}. `,
+        'They become controls in Home Assistant when the node is exposed; switches, numbers and choices on class C nodes. The downlink is the code and value after NODE_ID, SERIAL_ID and the control byte, as set for this group.'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, ['Code', 'Name', 'Type', 'Values', 'Downlink data'].map((x) => h('th', null, x)))),
+        h('tbody', null, descRows(ds.commands)))))
+      : h('div', { class: 'card-body muted small' }, 'This node has not described its commands. Firmware that supports it sends a description after power-on, or when asked with the button above (code FF). The byte layout is in docs/node-protocol.md.'));
+}
+
 async function loadDev(app, dev) { return Promise.all([GET('/applications/' + app), GET(`/applications/${app}/devices/${dev}`)]); }
 
 App.route('/applications/:app/devices/:dev', async ({ app, dev }) => {
@@ -356,6 +476,7 @@ App.route('/applications/:app/devices/:dev', async ({ app, dev }) => {
     h('div', { class: 'grid g2' },
       h('div', { class: 'card card-body' }, h('h2', null, 'Latest decoded data'), d.last_decoded ? jsonView(d.last_decoded) : h('p', { class: 'muted' }, 'Nothing decoded yet. Set a decoder on the Decoder tab.')),
       h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Received by (last packet)')), gwTable || h('div', { class: 'empty' }, 'No packets yet.'))),
+    describedCard(a, d),
     liveView({ app, dev, short: true, title: 'Live data' }));
 });
 
@@ -576,8 +697,22 @@ function gwHeader(g, active) {
   tabs('#/gateways/' + g.gateway_id, [['', 'Overview'], ['live', 'Live data'], ['radio', 'Radio'], ['transmit', 'Transmit'], ['settings', 'Settings'], ['connect', 'Connection']], active)];
 }
 
+// devicePage links a satellite's own web page (the Bobcat satellite page or the
+// LPS8's LuCI): its home-network address as seen by the tunnel, and the tunnel address.
+function devicePage(g, wg) {
+  const addr = g.last_addr || '';
+  if (g.kind !== 'bobcat' || !addr || addr.startsWith('127.')) return null;
+  const peer = wg && (wg.peers || []).find((p) => (p.allowed_ips || []).includes(addr + '/32'));
+  const lan = peer && peer.endpoint ? peer.endpoint.replace(/:\d+$/, '') : '';
+  const hosts = [];
+  if (lan && lan !== addr && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(lan)) hosts.push(lan);
+  hosts.push(addr);
+  return hosts.map((a, i) => [i ? h('span', { class: 'muted' }, ' or ') : null, h('a', { href: 'http://' + a + '/', target: '_blank', rel: 'noopener' }, 'http://' + a + '/')]);
+}
+
 App.route('/gateways/:id', async ({ id }) => {
-  const g = await GET('/gateways/' + id);
+  const [g, wg] = await Promise.all([GET('/gateways/' + id), GET('/vpn/wireguard').catch(() => null)]);
+  const page = devicePage(g, wg);
   const st = g.last_status || {};
   const statusRows = Object.entries(st).filter(([k]) => k !== 'updated_at').map(([k, v]) => [h('dt', null, k), h('dd', { class: 'mono small' }, typeof v === 'object' ? JSON.stringify(v) : String(v))]);
   return h('div', { class: 'stack' }, gwHeader(g, ''),
@@ -585,6 +720,7 @@ App.route('/gateways/:id', async ({ id }) => {
       h('div', { class: 'card card-body' }, h('h2', null, 'General information'), h('dl', { class: 'kv' },
         h('dt', null, 'Gateway ID'), h('dd', null, val(g.gateway_id)), h('dt', null, 'Gateway EUI'), h('dd', null, val(g.eui)),
         h('dt', null, 'Connection'), h('dd', null, KIND_LABEL[g.kind] || g.kind), h('dt', null, 'Address'), h('dd', { class: 'mono small' }, g.last_addr || '—'),
+        page ? [h('dt', null, 'Device page'), h('dd', null, page)] : null,
         h('dt', null, 'Frequency plan'), h('dd', null, g.frequency_plan), h('dt', null, 'Downlinks'), h('dd', null, g.downlink_enabled ? 'enabled' : 'disabled'),
         h('dt', null, 'Last seen'), h('dd', null, fmtDate(g.last_seen)), h('dt', null, 'Received / sent'), h('dd', null, `${g.rx_count} / ${g.tx_count}`),
         h('dt', null, 'Location'), h('dd', null, g.location ? h('a', { href: `https://www.openstreetmap.org/?mlat=${g.location.latitude}&mlon=${g.location.longitude}#map=15/${g.location.latitude}/${g.location.longitude}`, target: '_blank', rel: 'noopener' }, `${g.location.latitude}, ${g.location.longitude}`) : h('a', { href: `#/gateways/${id}/settings` }, 'set location')),

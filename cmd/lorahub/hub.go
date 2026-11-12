@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/nor24o/lorahub/internal/integration"
 	"github.com/nor24o/lorahub/internal/model"
 	"github.com/nor24o/lorahub/internal/processor"
+	"github.com/nor24o/lorahub/internal/satpanel"
 	"github.com/nor24o/lorahub/internal/store"
 	"github.com/nor24o/lorahub/web"
 )
@@ -142,6 +144,7 @@ func startHub(cfg *config.Config, log *slog.Logger, announceAfter time.Duration)
 			return nil
 		})
 	}
+	proc.NodeChanged = mq.NodeChanged // a node's own description changes its controls
 	go mq.Run(bus, h.stop)
 	// Announce again once brokers are connected, so a restart leaves no entity
 	// unknown until its node next transmits.
@@ -160,7 +163,15 @@ func startHub(cfg *config.Config, log *slog.Logger, announceAfter time.Duration)
 	go integration.NewWebhooks(st, log, report).Run(bus, h.stop)
 	go proc.Housekeeping(h.stop)
 
-	srv := &api.Server{Cfg: cfg, Store: st, Bus: bus, Proc: proc, MQTT: mq, Log: log, Web: web.FS()}
+	// The board's own settings (network, Wi-Fi, SD card, lights): the same code
+	// as a satellite's page, checked against the home router instead of the hub.
+	host := satpanel.New(satpanel.Options{Role: satpanel.RoleHub, Version: version, Log: log.With("part", "device"), Backup: st.Backup})
+	if runtime.GOOS == "linux" {
+		ctx, cancel := context.WithCancel(context.Background())
+		h.closers = append(h.closers, cancel)
+		go host.Run(ctx)
+	}
+	srv := &api.Server{Cfg: cfg, Store: st, Bus: bus, Proc: proc, MQTT: mq, Log: log, Web: web.FS(), Host: host.API()}
 	go srv.ProbeControlPorts(h.stop)
 	ln, err := net.Listen("tcp", cfg.HTTP.Listen)
 	if err != nil {

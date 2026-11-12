@@ -8,7 +8,8 @@ import "fmt"
 //	profile byte   bit 7-6  class: 00 A, 01 B, 10 C, 11 reserved
 //	               bit 5    1 = the node listens with inverted IQ
 //	               bit 4    1 = a downlink radio block follows
-//	               bit 3-0  free for the firmware, reported as "user"
+//	               bit 3    1 = this packet is a description of the node's commands (describe.go)
+//	               bit 2-0  free for the firmware, reported as "user"
 //	radio block    byte 0-2 downlink frequency in 100 Hz, MSB first, 0 = same as uplink
 //	               byte 3   bit 7-4 SF 5..12, 0 = same as uplink
 //	                        bit 3-2 bandwidth: 0 125, 1 250, 2 500 kHz
@@ -18,6 +19,7 @@ import "fmt"
 type NodeProfile struct {
 	Class      string  `json:"class"`
 	InvertIQ   bool    `json:"invert_iq"`
+	Describe   bool    `json:"describe,omitempty"` // the packet describes the node's commands
 	User       int     `json:"user"`
 	Frequency  float64 `json:"frequency,omitempty"`   // MHz
 	DataRate   string  `json:"data_rate,omitempty"`   // empty = same as uplink
@@ -34,7 +36,7 @@ func ParseNodeProfile(b []byte) (*NodeProfile, int, error) {
 	if class == 3 {
 		return nil, 0, fmt.Errorf("profile byte %02X uses the reserved class", b[0])
 	}
-	p := &NodeProfile{Class: string("ABC"[class]), InvertIQ: b[0]&0x20 != 0, User: int(b[0] & 0x0F)}
+	p := &NodeProfile{Class: string("ABC"[class]), InvertIQ: b[0]&0x20 != 0, Describe: b[0]&DescribeFlag != 0, User: int(b[0] & 0x07)}
 	if b[0]&0x10 == 0 {
 		return p, 1, nil
 	}

@@ -51,6 +51,9 @@ type Server struct {
 	MQTT  *integration.MQTT
 	Log   *slog.Logger
 	Web   fs.FS
+	// Host is the board's device settings API (internal/satpanel), mounted at
+	// /api/host behind the console's login.
+	Host http.Handler
 
 	tx txState
 }
@@ -99,8 +102,10 @@ func (s *Server) Handler() http.Handler {
 	p("DELETE /api/applications/{app}/devices/{dev}", s.deleteDevice)
 	p("POST /api/applications/{app}/devices/{dev}/down", s.queueDown)
 	p("DELETE /api/applications/{app}/devices/{dev}/down", s.clearDown)
+	p("POST /api/applications/{app}/devices/{dev}/describe", s.requestDescription)
 	p("POST /api/applications/{app}/devices/{dev}/reset", s.resetSession)
 	p("GET /api/devices", s.allDevices)
+	p("GET /api/downlinks/queued", s.queuedDownlinks)
 
 	p("GET /api/events", s.listEvents)
 	p("DELETE /api/events", s.clearEvents)
@@ -134,6 +139,10 @@ func (s *Server) Handler() http.Handler {
 	p("POST /api/ha/republish", s.haRepublish)
 	p("POST /api/ha/remove", s.haRemove)
 	p("GET /api/logs", s.getLogs)
+	if s.Host != nil {
+		host := http.StripPrefix("/api/host", s.Host)
+		mux.Handle("/api/host/", s.auth(host.ServeHTTP))
+	}
 	p("GET /api/vpn/wireguard", s.getWireGuard)
 	p("POST /api/vpn/wireguard/service", s.wireGuardService)
 	p("GET /api/vpn/tailscale", s.getTailscale)
@@ -935,6 +944,7 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		// runtime fields are owned by the server
 		dv.LastSeen, dv.UplinkCount, dv.LastRSSI, dv.LastSNR, dv.LastGateway, dv.LastDecoded = rt.LastSeen, rt.UplinkCount, rt.LastRSSI, rt.LastSNR, rt.LastGateway, rt.LastDecoded
 		dv.Queue, dv.UsedNonces, dv.CreatedAt, dv.LastScheme, dv.Profile, dv.DownSeq = rt.Queue, rt.UsedNonces, rt.CreatedAt, rt.LastScheme, rt.Profile, rt.DownSeq
+		dv.Described = rt.Described // what the node announced; only the node changes it
 		if dv.Mode == "otaa" {
 			dv.Session = rt.Session
 		}

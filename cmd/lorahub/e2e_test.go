@@ -267,6 +267,21 @@ func (e *e2e) must(t *testing.T, method, path string, body any) map[string]any {
 	return out
 }
 
+// queued is the Overview's list of queued downlinks.
+func (e *e2e) queued(t *testing.T) []map[string]any {
+	t.Helper()
+	resp, err := e.web.Get(e.base + "/api/downlinks/queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("%d %v", resp.StatusCode, err)
+	}
+	return out
+}
+
 func (e *e2e) publish(topic, payload string) {
 	e.mq.Publish(topic, 0, false, payload).Wait()
 }
@@ -386,6 +401,9 @@ func TestEndToEnd(t *testing.T) {
 		e.publish(set, "0101")
 		e.gw1.noTX(t, 400*time.Millisecond)
 		e.gw2.noTX(t, 10*time.Millisecond)
+		if q := e.queued(t); len(q) != 1 || q[0]["device_id"] != "96b840eb" || q[0]["payload_hex"] != "CAFE96B840EB0101" || q[0]["position"] != 1.0 || q[0]["waits_for"] != "packet" {
+			t.Fatalf("Overview list of queued downlinks: %v", q)
+		}
 		m := e.rec.mark()
 		e.gw2.uplink("CAFE96B840EB0167011004", 9_000_000, 868.5, "SF7BW125", -50, 9)
 		tx := e.gw2.nextTX(t)
@@ -393,6 +411,9 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("%v", tx)
 		}
 		e.rec.wait(t, m, up, func(p string) bool { return jsonOf(t, p)["data_hex"] == "0167011004" })
+		if q := e.queued(t); len(q) != 0 {
+			t.Fatalf("sent but still listed: %v", q)
+		}
 	})
 
 	t.Run("a downlink heard back by the other gateway is not an uplink", func(t *testing.T) {
@@ -509,10 +530,63 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	relayCfg := "homeassistant/switch/lorahub_node_cafe_96b840eb/cmd_Relay/config"
+	t.Run("a node describes its commands and gets them as controls", func(t *testing.T) {
+		// Asked from the console: FF after the header and control byte, at once for class C.
+		e.must(t, "POST", "/api/applications/node-cafe/devices/96b840eb/describe", nil)
+		if got := txHex(e.gw2.nextTX(t)); got != "CAFE96B840EB83FF" {
+			t.Fatal(got)
+		}
+		// The answer: profile byte 88 (class C, description), then the example of docs/node-protocol.md.
+		desc := "D111" + "0111" + "05" + hex.EncodeToString([]byte("Relay")) + "0200" + "05" + hex.EncodeToString([]byte("Blink")) +
+			"0323000A0E1000" + "08" + hex.EncodeToString([]byte("Interval")) + "01" + hex.EncodeToString([]byte("s"))
+		m := e.rec.mark()
+		e.gw2.uplink(strings.ToUpper("CAFE96B840EB88"+desc), 50_000_000, 868.1, "SF7BW125", -50, 9)
+		sw := jsonOf(t, e.rec.wait(t, m, relayCfg, func(p string) bool { return p != "" }).payload)
+		if sw["command_topic"] != "lorahub/node-cafe/96b840eb/cmd/cmd_Relay" || sw["payload_on"] != "ON" {
+			t.Fatalf("relay switch %v", sw)
+		}
+		num := jsonOf(t, e.rec.wait(t, m, "homeassistant/number/lorahub_node_cafe_96b840eb/cmd_Interval/config", nil).payload)
+		if num["min"] != 10.0 || num["max"] != 3600.0 || num["unit_of_measurement"] != "s" {
+			t.Fatalf("interval number %v", num)
+		}
+		btn := jsonOf(t, e.rec.wait(t, m, "homeassistant/button/lorahub_node_cafe_96b840eb/cmd_Blink/config", nil).payload)
+		published := jsonOf(t, e.rec.wait(t, m, "lorahub/node-cafe/96b840eb/description", nil).payload)
+		if cmds, _ := published["commands"].([]any); len(cmds) != 3 {
+			t.Fatalf("description on MQTT: %v", published)
+		}
+		e.rec.noneMatching(t, m, up, func(p string) bool { return strings.Contains(jsonOf(t, p)["payload_hex"].(string), "D111") }, 300*time.Millisecond)
+		d := e.must(t, "GET", "/api/applications/node-cafe/devices/96b840eb", nil)
+		if dd, _ := d["described"].(map[string]any); dd == nil || len(dd["commands"].([]any)) != 3 {
+			t.Fatalf("stored description: %v", d["described"])
+		}
+
+		// Each control sends the code the node announced, with its value.
+		e.publish("lorahub/node-cafe/96b840eb/cmd/cmd_Relay", "ON")
+		if got := txHex(e.gw2.nextTX(t)); got != "CAFE96B840EB840101" {
+			t.Fatal("relay on:", got)
+		}
+		e.publish("lorahub/node-cafe/96b840eb/cmd/cmd_Interval", "300")
+		if got := txHex(e.gw2.nextTX(t)); got != "CAFE96B840EB8503012C" {
+			t.Fatal("interval 300:", got)
+		}
+		e.publish(set, btn["payload_press"].(string))
+		if got := txHex(e.gw2.nextTX(t)); got != "CAFE96B840EB8602" {
+			t.Fatal("blink:", got)
+		}
+		e.rec.wait(t, m, "lorahub/node-cafe/96b840eb/cmd/cmd_Relay/state", func(p string) bool { return p == `{"value":"ON"}` })
+
+		// Editing the node in the console keeps what it announced.
+		e.must(t, "PUT", "/api/applications/node-cafe/devices/96b840eb", map[string]any{"name": "Relay board"})
+		if d := e.must(t, "GET", "/api/applications/node-cafe/devices/96b840eb", nil); d["described"] == nil {
+			t.Fatal("an edit dropped the description")
+		}
+	})
+
 	t.Run("deleting the group removes it from Home Assistant", func(t *testing.T) {
 		m := e.rec.mark()
 		e.must(t, "DELETE", "/api/applications/node-cafe", nil)
-		for _, topic := range []string{disc, "homeassistant/button/lorahub_node_cafe_96b840eb/cmd_Open/config", "homeassistant/text/lorahub_node_cafe_96b840eb/downlink/config"} {
+		for _, topic := range []string{disc, relayCfg, "homeassistant/button/lorahub_node_cafe_96b840eb/cmd_Open/config", "homeassistant/text/lorahub_node_cafe_96b840eb/downlink/config"} {
 			e.rec.wait(t, m, topic, func(p string) bool { return p == "" })
 		}
 	})

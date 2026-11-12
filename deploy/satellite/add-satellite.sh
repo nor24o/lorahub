@@ -12,7 +12,14 @@
 #   --tunnel-ip IP   the satellite's tunnel address (default: the next free one)
 #   --wan HOST:PORT  the hub's internet address and WireGuard port, for a
 #                    satellite that will also work away from home
+#   --name NAME      the satellite's host name (a copy of the hub gets
+#                    bobcat-sat<N>, N being the end of its tunnel address)
 #   --check          only check both Bobcats and say what would happen
+#
+# A Bobcat whose eMMC was copied from the hub is detected and given its own
+# identity first: LoRaHub and Tailscale are stopped there, the hub's data, keys
+# and Tailscale login are moved to /root/hub-copy, and it gets a new machine-id,
+# SSH host keys, host name and tunnel key.
 #
 # Running it again is safe: keys, the tunnel address and the hub's entry for
 # the satellite are reused, and files it replaces are kept as *.before-satellite.
@@ -22,19 +29,21 @@ HUB=192.168.1.15
 NEW=""
 TUN=""
 WAN=""
+NEWNAME=""
 CHECK=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
         --tunnel-ip) TUN="$2"; shift 2 ;;
         --wan) WAN="$2"; shift 2 ;;
+        --name) NEWNAME="$2"; shift 2 ;;
         --check) CHECK=1; shift ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) NEW="$1"; shift ;;
     esac
 done
-[ -n "$NEW" ] || { sed -n '2,20p' "$0"; exit 2; }
+[ -n "$NEW" ] || { sed -n '2,25p' "$0"; exit 2; }
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 hub() { "${SSH[@]}" "root@$HUB" "$@"; }
@@ -60,13 +69,22 @@ ok "LoRaHub and WireGuard run; tunnel $HUB_TUN, UDP $HUB_PORT"
 
 say "Checking the new Bobcat $NEW"
 sat true 2>/dev/null || die "cannot reach root@$NEW or log in with your SSH key (is it on the network? copy the key with: ssh-copy-id root@$NEW)"
-[ "$(sat 'cat /etc/machine-id')" != "$(hub 'cat /etc/machine-id')" ] || die "$NEW is the hub itself"
+# A copied eMMC has the hub's machine-id, but every boot has its own boot_id.
+[ "$(sat 'cat /proc/sys/kernel/random/boot_id')" != "$(hub 'cat /proc/sys/kernel/random/boot_id')" ] || die "$NEW is the hub itself"
 [ "$(sat 'uname -m')" = aarch64 ] || die "$NEW is not a 64-bit ARM system"
 sat 'test -e /dev/spidev5.0' || die "$NEW has no /dev/spidev5.0, so the radio cannot be reached.
       Install the same Armbian as the hub (its device tree: ${HUB_DTB:-unknown})."
 NEW_DTB=$(sat "grep -h '^fdtfile=' /boot/armbianEnv.txt 2>/dev/null || true")
 [ "$NEW_DTB" = "$HUB_DTB" ] || printf '   note: device tree differs (%s here, %s on the hub)\n' "${NEW_DTB:-none}" "${HUB_DTB:-none}"
-if sat 'systemctl is-active --quiet lorahub 2>/dev/null'; then
+# A copy of the hub's eMMC: same machine-id or the hub's own tunnel key.
+CLONE=0
+SAT_PUB=$(sat 'test -s /etc/wireguard/wg0.key && wg pubkey < /etc/wireguard/wg0.key 2>/dev/null || true')
+if [ "$(sat 'cat /etc/machine-id')" = "$(hub 'cat /etc/machine-id')" ] || [ "$SAT_PUB" = "$HUB_PUB" ]; then
+    CLONE=1
+    SAT_PUB=""
+    echo "   note: $NEW is a copy of the hub; it will get its own identity first"
+    echo "         (LoRaHub and Tailscale stopped there, hub data and keys moved to /root/hub-copy)"
+elif sat 'systemctl is-active --quiet lorahub 2>/dev/null'; then
     die "LoRaHub runs on $NEW. A satellite must not run it; stop it first: systemctl disable --now lorahub"
 fi
 OLD=$(sat "systemctl list-units --type=service --state=running --no-legend 2>/dev/null | grep -iE 'bridge|lora[-_]web|mosquitto' | awk '{print \$1}' | tr '\n' ' ' || true")
@@ -74,7 +92,6 @@ OLD=$(sat "systemctl list-units --type=service --state=running --no-legend 2>/de
 NAME=$(sat 'hostname')
 ok "$NAME: aarch64, radio SPI present"
 
-SAT_PUB=$(sat 'test -s /etc/wireguard/wg0.key && wg pubkey < /etc/wireguard/wg0.key 2>/dev/null || true')
 if [ -z "$TUN" ] && [ -n "$SAT_PUB" ]; then
     TUN=$(hub 'wg show wg0 allowed-ips' | awk -v k="$SAT_PUB" '$1 == k {print $2}' | cut -d/ -f1 | head -n 1)
 fi
@@ -85,20 +102,56 @@ if [ -z "$TUN" ]; then
     done
 fi
 [ -n "$TUN" ] || die "no free tunnel address left in $NET.0/24"
-ok "tunnel address for $NAME: $TUN"
+if [ -z "$NEWNAME" ] && { [ "$CLONE" = 1 ] || [ "$NAME" = "$(hub hostname)" ]; }; then
+    NEWNAME="bobcat-sat${TUN##*.}"
+fi
+[ "$NEWNAME" = "$NAME" ] && NEWNAME=""
+ok "tunnel address for $NAME: $TUN${NEWNAME:+, new host name $NEWNAME}"
 
 if [ "$CHECK" = 1 ]; then
     say "Check only: nothing was changed"
-    echo "   Would install the radio engine from $HUB on $NEW ($NAME), with the tunnel at $TUN"
+    [ "$CLONE" = 0 ] || echo "   Would first give $NEW its own identity (it is a copy of the hub)."
+    echo "   Would install the radio engine from $HUB on $NEW (${NEWNAME:-$NAME}), with the tunnel at $TUN"
     echo "   and the hub reached at $HUB:$HUB_PORT${WAN:+, or $WAN away from home}."
     exit 0
 fi
 
 # ---------- install ----------
 
+if [ "$CLONE" = 1 ]; then
+    say "Giving the copy of the hub its own identity"
+    # Nothing is deleted: the hub's data, tunnel key and Tailscale login go to
+    # /root/hub-copy (an existing copy there is kept as *.~N~).
+    sat 'systemctl disable --now lorahub tailscaled >/dev/null 2>&1 || true
+         systemctl disable --now wg-quick@wg0 raw-lora >/dev/null 2>&1 || true
+         mkdir -p /root/hub-copy && chmod 700 /root/hub-copy
+         for p in /var/lib/lorahub /var/lib/tailscale/tailscaled.state /etc/wireguard/wg0.key /etc/wireguard/wg0.conf; do
+             [ -e "$p" ] && mv --backup=numbered "$p" /root/hub-copy/; true
+         done
+         rm -f /etc/machine-id /var/lib/NetworkManager/secret_key
+         systemd-machine-id-setup >/dev/null'
+    [ "$(sat 'cat /etc/machine-id')" != "$(hub 'cat /etc/machine-id')" ] || die "the machine-id on $NEW did not change"
+    ok "LoRaHub and Tailscale stopped, hub data and keys in /root/hub-copy, new machine-id"
+    # New SSH host keys, so the two Bobcats can be told apart; this PC then
+    # learns the satellite's new key.
+    sat 'rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub && ssh-keygen -A >/dev/null && systemctl restart ssh'
+    ssh-keygen -R "$NEW" >/dev/null 2>&1 || true
+    sat true || die "cannot log in to $NEW after its SSH host keys changed"
+    ok "new SSH host keys"
+fi
+if [ -n "$NEWNAME" ]; then
+    sat "hostnamectl set-hostname '$NEWNAME'
+         if grep -q '^127\.0\.1\.1' /etc/hosts; then sed -i 's/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t$NEWNAME/' /etc/hosts
+         else printf '127.0.1.1\t%s\n' '$NEWNAME' >> /etc/hosts; fi
+         systemctl try-restart avahi-daemon >/dev/null 2>&1 || true"
+    ok "host name $NAME -> $NEWNAME"
+    NAME=$NEWNAME
+fi
+
 say "Installing WireGuard on $NAME"
-sat 'command -v wg >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools; }'
+sat 'pk=""; command -v wg >/dev/null || pk="wireguard-tools"; [ -x /usr/sbin/dnsmasq ] || pk="$pk dnsmasq-base"; [ -z "$pk" ] || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pk; }'
 SAT_PUB=$(sat 'umask 077; mkdir -p /etc/wireguard; test -s /etc/wireguard/wg0.key || wg genkey > /etc/wireguard/wg0.key; wg pubkey < /etc/wireguard/wg0.key')
+[ "$SAT_PUB" != "$HUB_PUB" ] || die "$NEW has the hub's tunnel key; move /etc/wireguard/wg0.key away there and run again"
 ok "key ready"
 
 say "Copying the radio engine from the hub"
@@ -248,7 +301,21 @@ case "$gw" in
     *) printf '   note: %s (it pairs on its own within a minute)\n' "$gw" ;;
 esac
 
+say "Installing the satellite page"
+HERE=$(cd "$(dirname "$0")" && pwd)
+PAGE_BIN="$HERE/../../dist/lorahub-sat-linux-arm64"
+if [ -f "$PAGE_BIN" ]; then
+    sat 'cat > /usr/local/bin/lorahub-sat.new' < "$PAGE_BIN"
+    sat 'cat > /etc/systemd/system/lorahub-sat.service' < "$HERE/lorahub-sat.service"
+    sat 'chmod 755 /usr/local/bin/lorahub-sat.new && mv /usr/local/bin/lorahub-sat.new /usr/local/bin/lorahub-sat
+         systemctl daemon-reload; systemctl enable lorahub-sat >/dev/null 2>&1; systemctl restart lorahub-sat'
+    ok "http://$NEW/ (sign in with the Bobcat's root password)"
+else
+    printf '   note: %s is missing; build it with "make arm64" and run this again\n' "dist/lorahub-sat-linux-arm64"
+fi
+
 say "Done"
 echo "   $NAME ($NEW) is a satellite of $HUB, tunnel $TUN."
+echo "   Its page: http://$NEW/ (telemetry, wired, Wi-Fi, access point, tunnel)."
 echo "   It appears under Gateways in the console; give it a name there."
 [ -n "$WAN" ] || echo "   To use it away from home, run again with --wan <hub internet address>:$HUB_PORT and forward that UDP port to $HUB."

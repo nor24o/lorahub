@@ -61,6 +61,13 @@ type Processor struct {
 	dutyMu sync.Mutex
 	duty   map[string][]dutyEntry
 
+	descMu    sync.Mutex
+	descParts map[string]*descAcc // node descriptions still missing parts, by app/dev
+
+	// NodeChanged, when set, is told when the processor changes what a node
+	// exposes (a new description), so Home Assistant can follow.
+	NodeChanged func(before, after *model.Device)
+
 	Started time.Time
 }
 

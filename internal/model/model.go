@@ -212,6 +212,7 @@ type Device struct {
 	HAValues      map[string]string  `json:"ha_values,omitempty"`    // last value of each dynamic command, by key
 	HASwitch      bool               `json:"ha_switch,omitempty"`    // node has an on/off output
 	Profile       *NodeProfile       `json:"profile,omitempty"`      // what the firmware last declared
+	Described     *NodeDescription   `json:"described,omitempty"`    // the commands the node announced
 	DownSeq       uint8              `json:"downlink_seq,omitempty"` // next sequence number in the control byte
 	Band          string             `json:"frequency_plan"`
 	Class         string             `json:"class"` // A | C
