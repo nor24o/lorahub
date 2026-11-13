@@ -91,6 +91,34 @@ function radioEditor(cfg, save, opts = {}) {
     draw();
     return h('div', { class: 'table-wrap card' }, h('table', { class: 't compact' }, h('thead', null, h('tr', null, ['Channel', 'Radio', 'IF offset (Hz)', 'Frequency'].map((x) => h('th', null, x)))), body));
   };
+  // The FSK channel: where it listens and how its packets are framed (engine 2.3 for CRC, whitening and length).
+  // The receive filter is fixed at 125 kHz, so bit rate + 2 × deviation should stay below about 125 kHz.
+  const fskChannel = () => {
+    ['chan_fsk_bw', 'chan_fsk_sync_size', 'chan_fsk_sync_word', 'chan_fsk_crc', 'chan_fsk_whitening', 'chan_fsk_length'].forEach((k) => shown.add(k));
+    const freq = h('span', { class: 'mono' });
+    const showFreq = () => { freq.textContent = (((Number(st.chan_fsk_radio) ? st.rf1_freq : st.rf0_freq) + Number(st.chan_fsk_if || 0)) / 1e6).toFixed(3) + ' MHz'; };
+    const radio = sel(st.chan_fsk_radio || 0, [[0, 'Radio 0'], [1, 'Radio 1']], { onchange: (e) => { st.chan_fsk_radio = Number(e.target.value); showFreq(); } });
+    const iff = inp(st.chan_fsk_if || 0, { type: 'number', step: 1000, oninput: (e) => { st.chan_fsk_if = Number(e.target.value); showFreq(); } });
+    showFreq();
+    const size = st.chan_fsk_sync_size || 3, word = st.chan_fsk_sync_word === undefined ? 0xC194C1 : st.chan_fsk_sync_word;
+    const sync = inp(word.toString(16).toUpperCase().padStart(size * 2, '0'), { class: 'mono', placeholder: 'C194C1', maxlength: 12,
+      oninput: (e) => {
+        const v = e.target.value.replace(/\s/g, '');
+        const ok = /^([0-9A-Fa-f]{2}){1,6}$/.test(v);
+        e.target.classList.toggle('bad', !ok);
+        if (ok) { st.chan_fsk_sync_size = v.length / 2; st.chan_fsk_sync_word = parseInt(v, 16); }
+      } });
+    if (st.chan_fsk_crc === undefined) st.chan_fsk_crc = 'ccitt';
+    if (st.chan_fsk_whitening === undefined) st.chan_fsk_whitening = true;
+    if (st.chan_fsk_length === undefined) st.chan_fsk_length = 0;
+    return h('div', { class: 'stack' },
+      h('div', { class: 'grid g4' }, field('Radio', radio), field('IF offset (Hz)', iff, h('span', null, 'Listens on ', freq)), field('Bit rate (bit/s)', num('chan_fsk_datarate'), 'The receive filter is 125 kHz wide: 50000 with ±25 kHz fits.'),
+        field('Sync word (hex)', sync, '1 to 6 bytes, sent first byte first. LoRaWAN: C194C1.')),
+      h('div', { class: 'grid g4' }, field('CRC-16', pick('chan_fsk_crc', [['ccitt', 'CCITT (LoRaWAN)'], ['ibm', 'IBM 0x8005 (TI CC1121 and others)']])),
+        field('Packet length', num('chan_fsk_length'), '0 = a length byte after the sync word; 1 to 255 = every packet has that many bytes.'),
+        h('div', { style: { alignSelf: 'center' } }, bool('chan_fsk_whitening', 'Data whitening (LoRaWAN)')), h('div')),
+      h('div', { class: 'callout info small' }, 'Packets are preamble, sync word, [length], data, CRC-16. The same framing is used when the gateway sends FSK. CRC, whitening and fixed length need raw_lora_app 2.3. FSK packets go to the ', h('a', { href: '#/fsk' }, 'FSK bridge'), ', not to node processing, when it is on.'));
+  };
   const sfMask = () => {
     if (st.sf_mask === undefined) st.sf_mask = 255;
     return h('div', { class: 'chips' }, sfs.map((sf, bit) => { const c = checkbox((st.sf_mask >> bit) & 1, 'SF' + sf); c.input.onchange = () => { st.sf_mask = c.input.checked ? st.sf_mask | (1 << bit) : st.sf_mask & ~(1 << bit); }; return c.el; }));
@@ -124,8 +152,7 @@ function radioEditor(cfg, save, opts = {}) {
       h('h3', null, 'Multi-SF channels'), channels(),
       h('h3', null, 'Standard LoRa channel'), bool('chan_lora_std_enable', 'Enabled'),
       h('div', { class: 'grid g4' }, field('Radio', pick('chan_lora_std_radio', [[0, 'Radio 0'], [1, 'Radio 1']])), field('IF offset (Hz)', num('chan_lora_std_if')), field('Bandwidth (kHz)', pick('chan_lora_std_bw', bws)), field('Spreading factor', pick('chan_lora_std_sf', sfs))),
-      h('h3', null, 'FSK channel'), bool('chan_fsk_enable', 'Enabled'),
-      h('div', { class: 'grid g4' }, field('Radio', pick('chan_fsk_radio', [[0, 'Radio 0'], [1, 'Radio 1']])), field('IF offset (Hz)', num('chan_fsk_if')), field('Bandwidth (kHz)', pick('chan_fsk_bw', bws)), field('Data rate (bit/s)', num('chan_fsk_datarate'))),
+      h('h3', null, 'FSK channel'), bool('chan_fsk_enable', 'Enabled'), fskChannel(),
       h('h3', null, 'Transmit defaults'),
       h('div', { class: 'grid g4' }, field('Frequency (Hz)', num('tx_default_freq')), field('Power (dBm)', num('tx_default_power')), field('Spreading factor', pick('tx_default_sf', sfs)), field('Bandwidth (kHz)', pick('tx_default_bandwidth', bws))),
       h('div', { class: 'grid g4' }, field('Coding rate', pick('tx_default_coderate', crs)), field('Preamble', num('tx_default_preamble')), field('RF chain', pick('tx_default_rfch', [[0, '0'], [1, '1']])), h('div', { style: { alignSelf: 'center' } }, bool('tx_default_invert', 'Invert IQ'))),

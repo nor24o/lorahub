@@ -526,6 +526,34 @@ window.LHHelp = (() => {
       { caption: 'Listening again, as before.', packets: { from: 'eng', to: 'hub', label: 'LISTENING' }, flash: 'eng' },
     ] })]);
 
+  topic('fsk', 'FSK devices: the FSK bridge', ['hub'], [['FSK bridge', '#/fsk'], ['Radio config', '#/radio']], [
+    'Each gateway has one **FSK channel** besides its LoRa channels. With the **FSK bridge** on, every FSK packet the gateways hear goes once, with the signal of each gateway, to **your own program over UDP**, as it is: nothing is decoded, no node or group is made, Home Assistant and rules never see it. Every datagram your program sends to the bridge\'s port goes on the air as FSK, through the gateway that heard the last FSK packet best (or one you name).',
+    'The gateways only understand one FSK frame: preamble, sync word (1-6 bytes), a length byte or a fixed length, the data, CRC-16. Set the sync word, CRC (CCITT or IBM), whitening and length in **Radio config → FSK channel** (raw_lora_app 2.3) to match your device; the same framing is used for sending. The receive filter is 125 kHz wide: 50 kbit/s with ±25 kHz deviation fits, 100 kbit/s with ±50 kHz does not.',
+    'Datagrams are JSON (`data_hex`, frequency, bit rate, the gateways with their RSSI) or raw (the bytes alone), both ways.',
+  ], () => [flow({
+    title: 'From the device to your program and back',
+    actors: { dev: { x: 80, y: 110, label: 'FSK device', sub: 'e.g. TI CC1121', kind: 'node' }, gw: A.gw(265, 110, 'Gateway', 'FSK channel'), hub: A.hub(450, 110, 'FSK bridge'), app: { x: 630, y: 110, label: 'Your program', sub: 'UDP', kind: 'box', w: 130 } },
+    links: [['dev', 'gw'], ['gw', 'hub'], ['hub', 'app']],
+    steps: [
+      { caption: 'The device sends an FSK packet; the gateway\'s FSK channel hears it.', packets: { from: 'dev', to: 'gw', label: 'FSK 50 kbit/s' } },
+      { caption: 'The gateway passes it to the hub, like any packet.', packets: { from: 'gw', to: 'hub', label: 'A1B2C3' } },
+      { caption: 'FSK: no decoding, no node. The hub sends it to your program as one datagram.', packets: { from: 'hub', to: 'app', label: '{"data_hex":"A1B2C3"…}' }, notes: { at: 'hub', text: 'not a node packet', dy: -45 } },
+      { caption: 'Your program answers with a datagram to the bridge\'s port (:1730).', packets: { from: 'app', to: 'hub', kind: 'down', label: '{"data_hex":"0102"}' } },
+      { caption: 'The hub sends it through the gateway that heard the device best.', packets: { from: 'hub', to: 'gw', kind: 'down', label: 'FSK 0102' } },
+      { caption: 'On the air as FSK, with the same sync word and CRC the device expects.', packets: { from: 'gw', to: 'dev', kind: 'down', label: 'FSK' }, flash: 'dev' },
+    ] }), bytes({
+    title: 'An FSK packet on the air',
+    hex: 'AAAAAAAAAAAA 930B51DE 03 A1B2C3 1D0F',
+    groups: [{ n: 6, label: 'preamble' }, { n: 4, label: 'sync word' }, { n: 1, label: 'length' }, { n: 3, label: 'data' }, { n: 2, label: 'CRC-16' }],
+    steps: [
+      { caption: 'A packet as a CC1121 sends it with variable length (CRC shown as an example).' },
+      { caption: 'Preamble: alternating bits, so the receiver locks on.', on: [0] },
+      { caption: 'Sync word: must match the gateway\'s, here 930B51DE (4 bytes).', on: [1], result: 'Radio config → FSK channel → **Sync word**' },
+      { caption: 'Length byte: how many data bytes follow. Devices with a fixed length leave it out; set the same length on the gateway.', on: [2], result: '**3** bytes' },
+      { caption: 'The data: exactly what your program gets in `data_hex`.', on: [3], result: '`data_hex` = A1B2C3' },
+      { caption: 'CRC-16 over length and data: CCITT (LoRaWAN) or IBM 0x8005 (TI CC1121). Packets with a bad CRC are dropped.', on: [4] },
+    ] })]);
+
   topic('network', 'Network settings and the safety check', ['hub', 'device'], [['Device, Network', '#/device/network']], [
     'Under **Network** you set the wired and the Wi-Fi address (DHCP or fixed, and DNS servers), connect to Wi-Fi networks, and switch the Wi-Fi radio on or off. Typed-in DNS servers replace the router\'s.',
     'Every change is **checked for 60 s**: a satellite pings the hub through the tunnel, the hub pings your router. If there is no answer, the previous setting comes back by itself, so a typo cannot lock you out. Tick **Keep even if the connection check fails** to keep a change anyway. Changes to the connection in use are applied in place, without dropping it.',

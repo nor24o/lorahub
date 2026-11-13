@@ -148,6 +148,25 @@ type Settings struct {
 		RepublishOnBirth bool     `json:"republish_on_birth"`
 		LastPayload      bool     `json:"last_payload"`
 	} `json:"home_assistant"`
+
+	FSKBridge FSKBridge `json:"fsk_bridge"`
+}
+
+// FSKBridge passes FSK packets between the gateways and another program over
+// UDP, untouched: they are not node packets and skip all processing.
+type FSKBridge struct {
+	Enabled bool   `json:"enabled"`
+	SendTo  string `json:"send_to"` // host:port that gets every FSK packet heard
+	Listen  string `json:"listen"`  // UDP address whose datagrams are sent as FSK, e.g. ":1730"
+	Format  string `json:"format"`  // json (data and metadata) or raw (the bytes only), both ways
+
+	// How packets from Listen go on the air, unless a JSON datagram says otherwise.
+	Gateway   string  `json:"gateway"`   // gateway ID; empty = the one that heard the last FSK packet best
+	Frequency float64 `json:"frequency"` // MHz
+	BitRate   int     `json:"bit_rate"`  // bit/s
+	Deviation int     `json:"deviation"` // kHz
+	Power     int     `json:"power"`     // dBm
+	Preamble  int     `json:"preamble"`  // bytes
 }
 
 // DefaultSettings returns the default runtime settings.
@@ -180,5 +199,6 @@ func DefaultSettings() Settings {
 	ha.Diagnostics = []string{"rssi", "snr", "freq", "datr", "gateway_count", "last_seen", "seq"}
 	ha.Switches, ha.Gateways, ha.RepublishOnBirth, ha.LastPayload = true, true, true, true
 	ha.GatewayFields = []string{"rx", "tx", "crc_err", "tx_err", "uptime_s", "temp_c"}
+	s.FSKBridge = FSKBridge{Listen: ":1730", Format: "json", Frequency: 868.3, BitRate: 50000, Deviation: 25, Power: 14, Preamble: 5}
 	return s
 }
