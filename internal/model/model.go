@@ -333,6 +333,8 @@ type TxPacket struct {
 	Preamble   int    `json:"preamble,omitempty"`
 	NoCRC      bool   `json:"no_crc"`
 	NoHeader   bool   `json:"implicit_header,omitempty"`
+	Modulation string `json:"modulation,omitempty"` // empty or LORA; FSK: DataRate is the bit rate
+	FDev       int    `json:"f_dev,omitempty"`      // FSK frequency deviation, kHz
 }
 
 // Event is published on the event bus, stored, and shown in live data.

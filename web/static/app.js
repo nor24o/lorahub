@@ -168,6 +168,8 @@ const EV = {
   'as.webhook.failed': ['Webhook failed', 't-err'],
   'rule.fired': ['Rule fired', 't-down'],
   'rule.failed': ['Rule failed', 't-err'],
+  'fsk.up': ['FSK received', 't-up'],
+  'fsk.down': ['FSK sent', 't-down'],
 };
 function evType(name) { const [label, cls] = EV[name] || [name, 't-gw']; return h('span', { class: 'ev-type ' + cls }, h('i'), label); }
 
@@ -188,6 +190,8 @@ function liveView(opts = {}) {
   if (opts.app) q.set('app', opts.app);
   if (opts.dev) q.set('dev', opts.dev);
   if (opts.gateway) q.set('gateway', opts.gateway);
+  if (opts.prefix) q.set('prefix', opts.prefix);
+  const only = opts.only || (() => true); // a further filter on the client
   let paused = false, filter = 'all', ws = null, closed = false, count = 0;
   const events = [];
   const list = h('div', { class: 'live-list' + (opts.short ? ' short' : '') });
@@ -225,13 +229,14 @@ function liveView(opts = {}) {
     };
     return wrap;
   };
-  const passes = (e) => !FILTERS[filter] || FILTERS[filter](e);
+  const passes = (e) => only(e) && (!FILTERS[filter] || FILTERS[filter](e));
   function rerender() {
     list.replaceChildren(...events.filter(passes).slice(0, 300).map((e) => renderEvent(e, false)));
     if (!list.children.length) list.append(h('div', { class: 'empty' }, icon('inbox'), 'No events yet. Waiting for traffic…'));
   }
   function add(e) {
     if (opts.hideGatewayRaw && e.name === 'gs.up') return;
+    if (!only(e)) return;
     events.unshift(e);
     if (events.length > 1000) events.pop();
     count++;
@@ -655,6 +660,7 @@ const App = {
         h('div', { class: 'nav-section' }, 'Radio'),
         navItem('#/radio', 'chip', 'Radio config'),
         navItem('#/tx', 'send', 'TX test'),
+        navItem('#/fsk', 'link', 'FSK bridge'),
         navItem('#/remote', 'key', 'Remote config'),
         h('div', { class: 'nav-section' }, 'System'),
         navItem('#/device', 'chip', 'Device'),

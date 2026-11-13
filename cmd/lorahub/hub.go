@@ -28,6 +28,7 @@ type hub struct {
 	store    *store.Store
 	proc     *processor.Processor
 	mqtt     *integration.MQTT
+	fsk      *integration.FSKBridge
 	bobcat   *ingest.BobcatServer
 	httpAddr string
 
@@ -161,6 +162,16 @@ func startHub(cfg *config.Config, log *slog.Logger, announceAfter time.Duration)
 		bus.Publish(e)
 	}
 	go integration.NewWebhooks(st, log, report).Run(bus, h.stop)
+
+	// FSK bridge: FSK packets to and from another program over UDP, untouched.
+	fsk := integration.NewFSKBridge(proc.Settings, func(data []byte, o integration.FSKOptions) (string, error) {
+		return proc.SendFSK(data, processor.FSKSend(o))
+	}, log.With("part", "fsk"))
+	proc.FSKOut = fsk.Up
+	proc.OnSettings = fsk.Apply
+	fsk.Apply(proc.Settings())
+	h.closers = append(h.closers, fsk.Close)
+	h.fsk = fsk
 	go proc.Housekeeping(h.stop)
 
 	// The board's own settings (network, Wi-Fi, SD card, lights): the same code
@@ -171,7 +182,7 @@ func startHub(cfg *config.Config, log *slog.Logger, announceAfter time.Duration)
 		h.closers = append(h.closers, cancel)
 		go host.Run(ctx)
 	}
-	srv := &api.Server{Cfg: cfg, Store: st, Bus: bus, Proc: proc, MQTT: mq, Log: log, Web: web.FS(), Host: host.API()}
+	srv := &api.Server{Cfg: cfg, Store: st, Bus: bus, Proc: proc, MQTT: mq, FSK: fsk, Log: log, Web: web.FS(), Host: host.API()}
 	go srv.ProbeControlPorts(h.stop)
 	ln, err := net.Listen("tcp", cfg.HTTP.Listen)
 	if err != nil {

@@ -49,6 +49,7 @@ type Server struct {
 	Bus   *events.Bus
 	Proc  *processor.Processor
 	MQTT  *integration.MQTT
+	FSK   *integration.FSKBridge
 	Log   *slog.Logger
 	Web   fs.FS
 	// Host is the board's device settings API (internal/satpanel), mounted at
@@ -106,6 +107,8 @@ func (s *Server) Handler() http.Handler {
 	p("POST /api/applications/{app}/devices/{dev}/reset", s.resetSession)
 	p("GET /api/devices", s.allDevices)
 	p("GET /api/downlinks/queued", s.queuedDownlinks)
+	p("GET /api/fsk", s.fskStatus)
+	p("POST /api/fsk/send", s.fskSend)
 
 	p("GET /api/events", s.listEvents)
 	p("DELETE /api/events", s.clearEvents)

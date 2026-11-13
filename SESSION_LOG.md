@@ -8,9 +8,9 @@ belong in this public repository.
 ### What runs where
 | Device | Role | Software |
 |---|---|---|
-| Bobcat Miner 300, 192.168.1.15 (Armbian bookworm) | Main server | LoRaHub **0.8.27** (with Help at `#/help`, and a Queued downlinks card on the Overview from `GET /api/downlinks/queued`) (console page Device: network, Wi-Fi, name and time, SD card, lights, system) (`/usr/local/bin/lorahub`, unit `lorahub`, data `/var/lib/lorahub`), radio engine `raw_lora_app` **2.2** (`/usr/local/bin/raw_lora_app`, unit `raw-lora`; 2.1 and 2.0 kept as `raw_lora_app.2.1`, `.2.0`), MQTT broker :1883, web console :80, WireGuard hub `10.77.0.1` (`wg-quick@wg0`, UDP 51820), Tailscale (shares `10.77.0.0/24`, route approved) |
+| Bobcat Miner 300, 192.168.1.15 (Armbian bookworm) | Main server | LoRaHub **0.8.29** (with Help at `#/help`, a Queued downlinks card on the Overview from `GET /api/downlinks/queued`, and the FSK bridge at `#/fsk`) (console page Device: network, Wi-Fi, name and time, SD card, lights, system) (`/usr/local/bin/lorahub`, unit `lorahub`, data `/var/lib/lorahub`), radio engine `raw_lora_app` **2.3** (`/usr/local/bin/raw_lora_app`, unit `raw-lora`; 2.2, 2.1 and 2.0 kept as `raw_lora_app.2.2`, `.2.1`, `.2.0`; FSK channel on at 868.3 MHz for the CC1121), MQTT broker :1883, web console :80, WireGuard hub `10.77.0.1` (`wg-quick@wg0`, UDP 51820), Tailscale (shares `10.77.0.0/24`, route approved) |
 | Dragino LPS8, 192.168.1.17 (OpenWrt 18.06.9, AR9330, 60 MB RAM) | Satellite only | `raw_lora_app` 2.0 (same source), sends to the hub at `10.77.0.1` over WireGuard (`10.77.0.2`), LuCI page LoRa Gateway → WireGuard VPN, `/usr/bin/wg_roam.sh` from cron |
-| Bobcat Miner 300 `bobcat-sat3`, 192.168.1.16 (copy of the hub's eMMC) | Satellite only | Set up by `deploy/satellite/add-satellite.sh`: `raw_lora_app` 2.0 and WireGuard `10.77.0.3`, gateway `eui-0016c001ff1316e0`. LoRaHub and Tailscale disabled; the hub's copied data and keys are in `/root/hub-copy`. Engine 2.2 (2.1 and 2.0 kept). Its own page `http://192.168.1.16/` (`lorahub-sat` 0.2.6, with a Help tab; about 0.3% of a core idle, 1 to 2% while the page is open). Wi-Fi profile `Link2` set to not connect (it had taken 192.168.1.13) |
+| Bobcat Miner 300 `bobcat-sat3`, 192.168.1.16 (copy of the hub's eMMC) | Satellite only | Set up by `deploy/satellite/add-satellite.sh`: `raw_lora_app` 2.0 and WireGuard `10.77.0.3`, gateway `eui-0016c001ff1316e0`. LoRaHub and Tailscale disabled; the hub's copied data and keys are in `/root/hub-copy`. Engine 2.3 (2.2, 2.1 and 2.0 kept). Its own page `http://192.168.1.16/` (`lorahub-sat` 0.2.6, with a Help tab; about 0.3% of a core idle, 1 to 2% while the page is open). Wi-Fi profile `Link2` set to not connect (it had taken 192.168.1.13) |
 | Home Assistant, 192.168.1.13 | Consumer | Uses its own MQTT broker; LoRaHub publishes to it as the external broker and also to its own |
 
 Older LoRaHub binaries: `/var/lib/lorahub/backup-<version>/lorahub` on the Bobcat.
@@ -46,8 +46,8 @@ Older LoRaHub binaries: `/var/lib/lorahub/backup-<version>/lorahub` on the Bobca
   `udp_stream` to it, leftovers of the old bridge. Now `target_ip` is 127.0.0.1 and `udp_stream.enabled` is false; the
   previous file is `/etc/lora/config.json.before-target-fix`. (Every Bobcat build also sends a copy to 127.0.0.1 when the
   target is elsewhere, which is how LoRaHub got the packets before.)
-- **LPS8 still on engine 2.0.** The 2.2 MIPS build (md5 8f665381) is in the session scratchpad `engine22/`; install it
-  with the same rollback script once the LPS8 is back. Both firmware trees have the 2.2 source (md5 5cd3364f). The LPS8 has
+- **LPS8 still on engine 2.0.** The 2.3 MIPS build (md5 d8ca6137, HAL patched for FSK framing) is in the session scratchpad `engine23/`; install it
+  with the same rollback script once the LPS8 is back. Both firmware trees have the 2.3 source (md5 3cab66ea) and the patched HAL. The LPS8 has
   single-colour LEDs, so it follows the modes (flashes or not) but not the colours.
 - **Status light colours checked on the boards 2026-11-11** by reading the LED channels: cyan, magenta, yellow, white and the
   5-second preview light the right channels; the hub is on normal (green, red, blue).
