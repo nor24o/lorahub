@@ -21,8 +21,9 @@ enough to run this installer. The installer recognises the copy (same
 machine-id or the hub's tunnel key) and first:
 
 - stops and disables LoRaHub and Tailscale there;
-- moves the hub's data (`/var/lib/lorahub`), Tailscale login and tunnel key to
-  `/root/hub-copy` (nothing is deleted; remove that folder once all is well);
+- moves the hub's data (`/var/lib/lorahub`), its Tailscale folder (login and
+  everything else) and tunnel key to `/root/hub-copy` (nothing is deleted;
+  remove that folder once all is well);
 - gives it a new machine-id, new SSH host keys and the host name
   `bobcat-sat<N>` (`--name` picks another).
 
@@ -39,7 +40,7 @@ deploy/satellite/add-satellite.sh <new bobcat ip>
 
 The first command only checks both Bobcats. The second one:
 
-1. installs `wireguard-tools` and `dnsmasq-base` (for the Wi-Fi access point with its own network) on the new Bobcat and creates its tunnel key;
+1. installs `wireguard-tools`, `dnsmasq-base` (for the Wi-Fi access point with its own network) and `iptables` on the new Bobcat and creates its tunnel key;
 2. copies the engine, `reset_lgw.sh` and the `raw-lora` service from the hub;
 3. copies the hub's radio settings, pointed at the hub's tunnel address, without
    the hub's link key and without the old bridge's MQTT and UDP sections;
@@ -81,7 +82,42 @@ Every network or tunnel change is checked: for 60 s the satellite pings the hub
 through the tunnel, and if the hub does not answer the previous setting comes
 back by itself. Radio settings stay on the hub's Remote config page.
 
-Options: `--hub HOST` (default `192.168.1.15`), `--tunnel-ip IP`, `--name NAME`, and
-`--wan HOST:PORT` for a satellite that should also connect from another network
-(forward that UDP port to the hub on the router). Running it again is safe;
-files it replaces are kept as `*.before-satellite`.
+Options: `--hub HOST` (default `192.168.1.15`), `--tunnel-ip IP`, `--name NAME`,
+`--tailscale` (below), and `--wan HOST:PORT` for a satellite that should also
+connect from another network (forward that UDP port to the hub on the router).
+Running it again is safe; files it replaces are kept as `*.before-satellite`.
+
+## A satellite at another site: `--tailscale`
+A satellite away from the home network cannot reach the hub's home address,
+and a port forward on the home router does not help when the provider uses
+carrier NAT. With `--tailscale` the tunnel runs over Tailscale instead:
+
+```
+deploy/satellite/add-satellite.sh <satellite ip> --tailscale
+```
+
+- The hub must be on Tailscale. The satellite needs Tailscale installed (a copy
+  of the hub has it; otherwise `curl -fsSL https://tailscale.com/install.sh | sh`).
+- The satellite joins your tailnet as a device of its own. The installer prints
+  a sign-in link: open it, sign in with your Tailscale account and press
+  **Connect**; it waits up to 10 minutes. The satellite does not take your
+  tailnet's shared networks or DNS, so its own network stays local.
+- Its tunnel then goes to the hub's Tailscale address (MTU 1200, for
+  Tailscale's own headers). This works from anywhere, at home too.
+- Its page is then also at `http://<its Tailscale address>/` from any device on
+  your tailnet.
+
+Run it at home before taking the satellite away, or at the new site from a PC
+that reaches it (for example through a Tailscale subnet router there).
+
+Do not turn on `--accept-routes` on the hub: a device that shares the home
+network through Tailscale would then take the hub's own home traffic.
+
+## Tailscale is kept out of the tunnel
+Both tunnel ends drop Tailscale's own UDP port (41641, from
+`/etc/default/tailscaled`) inside the tunnel: `PostUp`/`PreDown` lines in
+`/etc/wireguard/wg0.conf`, put there by the installer on the satellite and on
+the hub. Without them Tailscale finds the tunnel addresses (10.77.0.x) as a
+"direct" path between the two boards and, with the tunnel itself running over
+Tailscale, sends its packets round in a loop: hundreds of MB within a minute,
+and both boards unreachable until it stops.

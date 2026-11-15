@@ -624,6 +624,7 @@ window.LHHelp = (() => {
   topic('satellite', 'Adding a satellite Bobcat', ['hub', 'device'], [['Gateways', '#/gateways']], [
     'Run `deploy/satellite/add-satellite.sh <ip>` from the PC (first with `--check`). It copies the radio engine and settings from the hub, sets up the tunnel with the next free address, installs this page, starts the radio and waits for the hub to pair it. A Bobcat whose eMMC was copied from the hub is recognised and first gets its own identity (LoRaHub and Tailscale stopped, new keys, new name).',
     'The satellite\'s page is at http://<its address>/, signed in with its root password; the hub\'s Gateways page links to it ("Device page").',
+    'For a satellite at **another site**, add `--tailscale`: it joins your tailnet as its own device (you sign it in with a link the installer prints) and its tunnel runs to the hub\'s Tailscale address, from anywhere. Both ends keep Tailscale\'s own packets out of the tunnel, which would otherwise loop.',
   ], () => [flow({
     title: 'What the installer does', h: 240,
     actors: { pc: { x: 90, y: 120, label: 'Your PC', sub: 'add-satellite.sh', kind: 'box' }, hub: A.hub(340, 50), sat: { x: 340, y: 190, label: 'New Bobcat', sub: 'Armbian', kind: 'gw', w: 140 }, gwp: { x: 590, y: 50, label: 'Gateways page', sub: 'new satellite', kind: 'box', w: 150 } },
