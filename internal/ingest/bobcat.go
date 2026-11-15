@@ -33,6 +33,8 @@ type BobcatServer struct {
 	static  map[string]string
 	resolve func(ip string) string
 
+	// The hooks below are set before Start and not changed afterwards.
+
 	// ResolveAddr returns the last known IP of a gateway EUI (from the
 	// database) so downlinks work right after a LoRaHub restart.
 	ResolveAddr func(eui string) string
@@ -59,7 +61,9 @@ const (
 )
 
 // NewBobcatServer listens on addr. resolve is consulted for unknown IPs
-// (e.g. last known address persisted in the database).
+// (e.g. last known address persisted in the database). Datagrams are read
+// once Start is called, so the hooks can be set first; until then they wait
+// in the socket's buffer.
 func NewBobcatServer(addr string, downlinkPort int, static map[string]string, resolve func(ip string) string, sink Sink, log *slog.Logger) (*BobcatServer, error) {
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -75,9 +79,11 @@ func NewBobcatServer(addr string, downlinkPort int, static map[string]string, re
 	for ip, eui := range static {
 		s.static[ip] = strings.ToUpper(eui)
 	}
-	go s.loop()
 	return s, nil
 }
+
+// Start reads datagrams in the background. Call it once, after setting the hooks.
+func (s *BobcatServer) Start() { go s.loop() }
 
 // Close stops the server.
 func (s *BobcatServer) Close() error { return s.conn.Close() }

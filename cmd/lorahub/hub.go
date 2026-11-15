@@ -96,6 +96,7 @@ func startHub(cfg *config.Config, log *slog.Logger, announceAfter time.Duration)
 			}
 			return 0
 		}
+		srv.Start()
 		h.bobcat = srv
 		h.closers = append(h.closers, func() { srv.Close() })
 		proc.RegisterDownlinker("bobcat", srv)

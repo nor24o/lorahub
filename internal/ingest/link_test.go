@@ -68,6 +68,7 @@ func newRig(t *testing.T) *rig {
 	t.Cleanup(func() { c.Close() })
 	port := c.LocalAddr().(*net.UDPAddr).Port
 	srv.ResolvePort = func(string) int { return port }
+	srv.Start()
 	return &rig{srv, sink, c, srv.conn.LocalAddr().(*net.UDPAddr), port}
 }
 
