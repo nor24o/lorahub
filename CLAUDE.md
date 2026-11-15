@@ -61,7 +61,7 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Go ≥ 1.26 (go.mod). Cross-compile is pure Go (CGO_ENABLED=0).
 
 ## Status / open items
-- Running on the real Bobcat (LoRaHub 0.8.29) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
+- Running on the real Bobcat (LoRaHub 0.8.30) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
   owner preferences are in SESSION_LOG.md section 1.
 - Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
@@ -150,6 +150,14 @@ verified on the hub 2026-11-13. `tools/fsk_client.py` is a ready UDP client (lis
 
 ## Tunnel between gateways
 WireGuard subnet 10.77.0.0/24: Bobcat 10.77.0.1 (`wg-quick@wg0`, UDP 51820), LPS8 10.77.0.2 (OpenWrt `network.wg0`). The LPS8's raw_lora_app sends to `target_ip` 10.77.0.1. `/usr/bin/wg_roam.sh` (cron, each minute) alternates the Bobcat's LAN and public endpoints while there is no recent handshake; off-network use needs UDP 51820 forwarded to the Bobcat on the home router. Tailscale is on the Bobcat only, advertising 10.77.0.0/24; it does not fit on the LPS8 (36.7 MB download, 9.7 MB free flash, 60 MB RAM).
+bobcat-sat3 moved to another site (2026-11-15; LAN 192.168.100.200 wired, .201 Wi-Fi), behind its own NAT. It is now a Tailscale
+device of its own (`bobcat-sat3`, fresh identity; the hub's copied Tailscale files are in its `/root/hub-copy/tailscale-leftovers`)
+and its wg0 runs over Tailscale: Endpoint and roam.env LAN = the hub's Tailscale address :51820, MTU 1200. A tunnel over Tailscale
+loops (Tailscale finds the 10.77.0.x addresses as a "direct" path and sends itself through wg0: 385 MiB in a minute), so wg0.conf on
+the hub and on bobcat-sat3 drops Tailscale's UDP 41641 inside the tunnel (PostUp/PreDown iptables; backups `wg0.conf.before-*`).
+Never enable `--accept-routes` on the hub: MasterPC advertises the home LAN 192.168.1.0/24 (Home Assistant advertises 192.168.100.0/24).
+`add-satellite.sh --tailscale` sets up such a satellite (it prints the Tailscale sign-in link and waits), and the installer always writes
+the 41641 guard into both wg0.conf files (README: deploy/satellite).
 Pages: LoRaHub `#/vpn` with WireGuard and Tailscale tabs (`web/static/vpn.js`, `internal/api/vpn.go`; local `wg`, `systemctl`, `tailscale` only, private keys never leave the parser). LPS8: LuCI LoRa Gateway → WireGuard VPN (`view/lora/vpn.htm`, `action_vpn` in `controller/lora.lua`), which edits `network.bobcat.lan_endpoint` and `wan_endpoint` read by `wg_roam.sh`.
 
 Radio config "apply" (`POST /api/concentrator/apply`) restarts raw-lora and puts the previous config.json back when the radio is not

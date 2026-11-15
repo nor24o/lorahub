@@ -12,6 +12,10 @@
 #   --tunnel-ip IP   the satellite's tunnel address (default: the next free one)
 #   --wan HOST:PORT  the hub's internet address and WireGuard port, for a
 #                    satellite that will also work away from home
+#   --tailscale      run the tunnel over Tailscale, for a satellite at another
+#                    site or a hub behind carrier NAT: the satellite joins your
+#                    tailnet as its own device (it prints a sign-in link and
+#                    waits) and reaches the hub at the hub's Tailscale address
 #   --name NAME      the satellite's host name (a copy of the hub gets
 #                    bobcat-sat<N>, N being the end of its tunnel address)
 #   --check          only check both Bobcats and say what would happen
@@ -23,6 +27,10 @@
 #
 # Running it again is safe: keys, the tunnel address and the hub's entry for
 # the satellite are reused, and files it replaces are kept as *.before-satellite.
+#
+# Both tunnel ends drop Tailscale's own UDP port inside the tunnel. Otherwise
+# Tailscale finds the tunnel addresses as a direct path and, with the tunnel
+# running over Tailscale, sends itself round in a loop.
 set -euo pipefail
 
 HUB=192.168.1.15
@@ -31,6 +39,7 @@ TUN=""
 WAN=""
 NEWNAME=""
 CHECK=0
+TS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
@@ -38,16 +47,19 @@ while [ $# -gt 0 ]; do
         --wan) WAN="$2"; shift 2 ;;
         --name) NEWNAME="$2"; shift 2 ;;
         --check) CHECK=1; shift ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        --tailscale) TS=1; shift ;;
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) NEW="$1"; shift ;;
     esac
 done
-[ -n "$NEW" ] || { sed -n '2,25p' "$0"; exit 2; }
+[ -n "$NEW" ] || { sed -n '2,33p' "$0"; exit 2; }
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 hub() { "${SSH[@]}" "root@$HUB" "$@"; }
 sat() { "${SSH[@]}" "root@$NEW" "$@"; }
+# Tailscale on the satellite: Running once signed in.
+tsstate() { sat 'tailscale status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get(\"BackendState\"))" 2>/dev/null || true'; }
 say() { printf '\n== %s\n' "$*"; }
 ok() { printf '   ok: %s\n' "$*"; }
 die() { printf '\nSTOP: %s\n' "$*" >&2; exit 1; }
@@ -66,6 +78,18 @@ HUB_TUN=$(hub "ip -4 -o addr show wg0 | awk '{print \$4}' | cut -d/ -f1")
 NET=${HUB_TUN%.*}
 HUB_DTB=$(hub "grep -h '^fdtfile=' /boot/armbianEnv.txt 2>/dev/null || true")
 ok "LoRaHub and WireGuard run; tunnel $HUB_TUN, UDP $HUB_PORT"
+# Tailscale's UDP port on a board (PORT in /etc/default/tailscaled), kept out of the tunnel.
+tsport() { "$@" 'p=$(sed -n "s/^PORT=[^0-9]*\([0-9][0-9]*\).*/\1/p" /etc/default/tailscaled 2>/dev/null); echo "${p:-41641}"'; }
+HUB_TSPORT=$(tsport hub)
+ENDPOINT="$HUB:$HUB_PORT"
+MTU_LINE=""
+if [ "$TS" = 1 ]; then
+    HUB_TSIP=$(hub 'tailscale ip -4 2>/dev/null | head -n 1' || true)
+    [ -n "$HUB_TSIP" ] || die "Tailscale is not running or not signed in on $HUB (--tailscale needs it there)"
+    ENDPOINT="$HUB_TSIP:$HUB_PORT"
+    MTU_LINE="MTU = 1200"   # room for Tailscale's own headers
+    ok "hub on Tailscale: $HUB_TSIP"
+fi
 
 say "Checking the new Bobcat $NEW"
 sat true 2>/dev/null || die "cannot reach root@$NEW or log in with your SSH key (is it on the network? copy the key with: ssh-copy-id root@$NEW)"
@@ -91,6 +115,10 @@ OLD=$(sat "systemctl list-units --type=service --state=running --no-legend 2>/de
 [ -z "$OLD" ] || printf '   note: these old services still run there and are left alone: %s\n' "$OLD"
 NAME=$(sat 'hostname')
 ok "$NAME: aarch64, radio SPI present"
+if [ "$TS" = 1 ]; then
+    sat 'command -v tailscale >/dev/null && command -v tailscaled >/dev/null' || die "Tailscale is not installed on $NEW.
+      Install it there first: curl -fsSL https://tailscale.com/install.sh | sh"
+fi
 
 if [ -z "$TUN" ] && [ -n "$SAT_PUB" ]; then
     TUN=$(hub 'wg show wg0 allowed-ips' | awk -v k="$SAT_PUB" '$1 == k {print $2}' | cut -d/ -f1 | head -n 1)
@@ -112,7 +140,11 @@ if [ "$CHECK" = 1 ]; then
     say "Check only: nothing was changed"
     [ "$CLONE" = 0 ] || echo "   Would first give $NEW its own identity (it is a copy of the hub)."
     echo "   Would install the radio engine from $HUB on $NEW (${NEWNAME:-$NAME}), with the tunnel at $TUN"
-    echo "   and the hub reached at $HUB:$HUB_PORT${WAN:+, or $WAN away from home}."
+    echo "   and the hub reached at $ENDPOINT${WAN:+, or $WAN when that fails}."
+    if [ "$TS" = 1 ]; then
+        if [ "$(tsstate)" = Running ]; then echo "   $NEW is already on your tailnet."
+        else echo "   $NEW would join your tailnet first (you sign it in with a link it prints)."; fi
+    fi
     exit 0
 fi
 
@@ -125,9 +157,10 @@ if [ "$CLONE" = 1 ]; then
     sat 'systemctl disable --now lorahub tailscaled >/dev/null 2>&1 || true
          systemctl disable --now wg-quick@wg0 raw-lora >/dev/null 2>&1 || true
          mkdir -p /root/hub-copy && chmod 700 /root/hub-copy
-         for p in /var/lib/lorahub /var/lib/tailscale/tailscaled.state /etc/wireguard/wg0.key /etc/wireguard/wg0.conf; do
+         for p in /var/lib/lorahub /var/lib/tailscale /etc/wireguard/wg0.key /etc/wireguard/wg0.conf; do
              [ -e "$p" ] && mv --backup=numbered "$p" /root/hub-copy/; true
          done
+         mkdir -p -m 700 /var/lib/tailscale
          rm -f /etc/machine-id /var/lib/NetworkManager/secret_key
          systemd-machine-id-setup >/dev/null'
     [ "$(sat 'cat /etc/machine-id')" != "$(hub 'cat /etc/machine-id')" ] || die "the machine-id on $NEW did not change"
@@ -148,8 +181,29 @@ if [ -n "$NEWNAME" ]; then
     NAME=$NEWNAME
 fi
 
+if [ "$TS" = 1 ]; then
+    say "Putting $NAME on your tailnet"
+    if [ "$(tsstate)" != Running ]; then
+        # A fresh identity of its own. It takes neither your tailnet's shared
+        # networks nor its DNS, so its local network stays local.
+        sat 'systemctl enable --now tailscaled >/dev/null 2>&1; sleep 2'
+        url=$(sat "timeout 15 tailscale up --hostname='$NAME' --accept-dns=false --accept-routes=false 2>&1 | grep -o 'https://login.tailscale.com/[^ ]*' | head -n 1" || true)
+        [ -n "$url" ] || url=$(sat "tailscale status 2>&1 | grep -o 'https://login.tailscale.com/[^ ]*' | head -n 1" || true)
+        echo "   Open this link, sign in with your Tailscale account and connect the device:"
+        echo "   ${url:-(no link: run 'tailscale up' on $NEW and follow it)}"
+        for i in $(seq 1 120); do
+            [ "$(tsstate)" = Running ] && break
+            [ "$i" = 120 ] && die "$NAME was not signed in to Tailscale within 10 minutes; run this again"
+            sleep 5
+        done
+    fi
+    SAT_TSIP=$(sat 'tailscale ip -4 | head -n 1')
+    ok "$NAME is on your tailnet: $SAT_TSIP"
+fi
+SAT_TSPORT=$(tsport sat)
+
 say "Installing WireGuard on $NAME"
-sat 'pk=""; command -v wg >/dev/null || pk="wireguard-tools"; [ -x /usr/sbin/dnsmasq ] || pk="$pk dnsmasq-base"; [ -z "$pk" ] || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pk; }'
+sat 'pk=""; command -v wg >/dev/null || pk="wireguard-tools"; [ -x /usr/sbin/dnsmasq ] || pk="$pk dnsmasq-base"; command -v iptables >/dev/null || pk="$pk iptables"; [ -z "$pk" ] || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pk; }'
 SAT_PUB=$(sat 'umask 077; mkdir -p /etc/wireguard; test -s /etc/wireguard/wg0.key || wg genkey > /etc/wireguard/wg0.key; wg pubkey < /etc/wireguard/wg0.key')
 [ "$SAT_PUB" != "$HUB_PUB" ] || die "$NEW has the hub's tunnel key; move /etc/wireguard/wg0.key away there and run again"
 ok "key ready"
@@ -189,12 +243,16 @@ sat "cat > /etc/wireguard/wg0.conf <<EOF
 # Tunnel to the LoRaHub Bobcat; written by add-satellite.sh
 [Interface]
 Address = $TUN/24
+$MTU_LINE
 PostUp = wg set %i private-key /etc/wireguard/%i.key
+# Tailscale must not run through this tunnel: over Tailscale that loops.
+PostUp = iptables -I INPUT -i %i -p udp --dport $SAT_TSPORT -j DROP; iptables -I OUTPUT -o %i -p udp --sport $SAT_TSPORT -j DROP
+PreDown = iptables -D INPUT -i %i -p udp --dport $SAT_TSPORT -j DROP; iptables -D OUTPUT -o %i -p udp --sport $SAT_TSPORT -j DROP
 
 [Peer]
 # LoRaHub Bobcat
 PublicKey = $HUB_PUB
-Endpoint = $HUB:$HUB_PORT
+Endpoint = $ENDPOINT
 AllowedIPs = $NET.0/24
 PersistentKeepalive = 25
 EOF
@@ -204,11 +262,19 @@ if ! hub "grep -qF '$SAT_PUB' /etc/wireguard/wg0.conf"; then
 fi
 hub "wg set wg0 peer '$SAT_PUB' allowed-ips '$TUN/32'"   # live, so the hub's other gateways stay connected
 ok "hub knows $NAME as $TUN"
+# The same guard on the hub: in its tunnel config, and at once.
+if ! hub "grep -q 'dport $HUB_TSPORT -j DROP' /etc/wireguard/wg0.conf"; then
+    hub "cp -p /etc/wireguard/wg0.conf /etc/wireguard/wg0.conf.before-ts-guard
+         sed -i '0,/^\\[Peer\\]/s//# Tailscale must not run through this tunnel: over Tailscale that loops.\\nPostUp = iptables -I INPUT -i %i -p udp --dport $HUB_TSPORT -j DROP; iptables -I OUTPUT -o %i -p udp --sport $HUB_TSPORT -j DROP\\nPreDown = iptables -D INPUT -i %i -p udp --dport $HUB_TSPORT -j DROP; iptables -D OUTPUT -o %i -p udp --sport $HUB_TSPORT -j DROP\\n\\n[Peer]/' /etc/wireguard/wg0.conf"
+fi
+hub "iptables -C INPUT -i wg0 -p udp --dport $HUB_TSPORT -j DROP 2>/dev/null || iptables -I INPUT -i wg0 -p udp --dport $HUB_TSPORT -j DROP
+     iptables -C OUTPUT -o wg0 -p udp --sport $HUB_TSPORT -j DROP 2>/dev/null || iptables -I OUTPUT -o wg0 -p udp --sport $HUB_TSPORT -j DROP"
+ok "Tailscale kept out of the tunnel on both ends (UDP $HUB_TSPORT)"
 
 # Away from home the satellite tries the hub's internet address too.
 sat "cat > /etc/wireguard/roam.env <<EOF
 PEER='$HUB_PUB'
-LAN='$HUB:$HUB_PORT'
+LAN='$ENDPOINT'
 WAN='$WAN'
 EOF
 cat > /usr/local/bin/wg_roam.sh <<'EOF'
@@ -315,7 +381,7 @@ else
 fi
 
 say "Done"
-echo "   $NAME ($NEW) is a satellite of $HUB, tunnel $TUN."
-echo "   Its page: http://$NEW/ (telemetry, wired, Wi-Fi, access point, tunnel)."
+echo "   $NAME ($NEW) is a satellite of $HUB, tunnel $TUN${SAT_TSIP:+, over Tailscale}."
+echo "   Its page: http://$NEW/${SAT_TSIP:+ or, from anywhere on your tailnet, http://$SAT_TSIP/} (telemetry, wired, Wi-Fi, access point, tunnel)."
 echo "   It appears under Gateways in the console; give it a name there."
-[ -n "$WAN" ] || echo "   To use it away from home, run again with --wan <hub internet address>:$HUB_PORT and forward that UDP port to $HUB."
+[ -n "$WAN" ] || [ "$TS" = 1 ] || echo "   For a site away from home, run again with --tailscale (or --wan <hub internet address>:$HUB_PORT, that UDP port forwarded to $HUB)."
