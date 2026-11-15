@@ -50,6 +50,13 @@ type Processor struct {
 	fmu        sync.Mutex
 	forwarders map[string][]*ingest.Forwarder // gateway ID -> forwarders
 
+	fskMu   sync.Mutex
+	fskBest string // the gateway that heard the last FSK packet best
+	// FSKOut gets every FSK packet when the FSK bridge is on (the UDP side).
+	FSKOut func(data []byte, msg map[string]any)
+	// OnSettings runs after the settings were saved.
+	OnSettings func(config.Settings)
+
 	devLocks sync.Map // app/dev -> *sync.Mutex
 
 	rmu     sync.RWMutex
@@ -114,12 +121,18 @@ func (p *Processor) SetSettings(s config.Settings) error {
 	if s.RX1Delay < 1 || s.RX1Delay > 15 {
 		s.RX1Delay = 1
 	}
+	if err := checkFSKBridge(&s.FSKBridge); err != nil {
+		return err
+	}
 	if err := p.store.SetSetting("settings", s); err != nil {
 		return err
 	}
 	p.smu.Lock()
 	p.settings = s
 	p.smu.Unlock()
+	if f := p.OnSettings; f != nil {
+		go f(s)
+	}
 	return nil
 }
 
@@ -388,6 +401,9 @@ func (p *Processor) process(pkts []model.RxPacket) {
 		}
 	}()
 
+	if p.handleFSK(fr) {
+		return
+	}
 	if p.handleNode(fr) {
 		return
 	}

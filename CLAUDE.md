@@ -61,7 +61,7 @@ prepended when group `downlink_header` is on; radio defaults to node's last pack
 - Go ≥ 1.26 (go.mod). Cross-compile is pure Go (CGO_ENABLED=0).
 
 ## Status / open items
-- Running on the real Bobcat (LoRaHub 0.8.27) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
+- Running on the real Bobcat (LoRaHub 0.8.29) with the LPS8 and bobcat-sat3 as satellites; current state, open items and
   owner preferences are in SESSION_LOG.md section 1.
 - Not ported from the old bridge: import of old `nodes.db`.
 - GitHub: https://github.com/nor24o/lorahub (public). License undecided. Full history: SESSION_LOG.md
@@ -131,6 +131,23 @@ and choice (HA select, sends the option's value). A command whose name matches a
 that field. Downlink `FF` asks a node to describe itself: node page button, `POST .../devices/{dev}/describe`, or
 `DESCRIBE` on `/set`. Processor tells HA through `Processor.NodeChanged` (set to `mq.NodeChanged` in hub.go).
 
+## FSK bridge (raw_lora_app 2.3)
+FSK devices (the owner's TI CC1121) are not nodes: with Settings.FSKBridge on, an FSK packet (rxpk `modu` FSK, datr = bit rate)
+skips node processing (`handleFSK` in `internal/processor/fsk.go`, before handleNode) and goes once, with every gateway's RSSI,
+over UDP to `send_to` (JSON or raw bytes); datagrams on `listen` (default :1730) go on the air as FSK through the gateway that heard
+the last FSK packet best (`SendFSK`, TxPacket.Modulation "FSK" + FDev; `setFSK` in ingest). UDP side: `internal/integration/fskbridge.go`.
+Console `#/fsk` (`web/static/fsk.js`), Help topic `fsk`, events `fsk.up` / `fsk.down`, API `GET /api/fsk`, `POST /api/fsk/send`.
+The SX1302 FSK frame is preamble, sync word (1-8 bytes), length byte or fixed length, data, CRC-16; receive filter fixed at 125 kHz
+(50 kbit/s ±25 kHz fits, 100 kbit/s ±50 kHz does not). Semtech's HAL hard-codes CCITT CRC, whitening and variable length; engine 2.3
+patches it (`lgw_fsk_framing`, patch script in the session scratchpad `engine23/patch_fsk.py`, applied to every HAL copy) and adds
+config keys `chan_fsk_crc` (ccitt|ibm), `chan_fsk_whitening`, `chan_fsk_length` (0 = length byte); status reports `fsk`.
+The CC1121 uses IBM CRC (0x8005, init FFFF), no whitening, sync 930B51DE; it must use 50 kbit/s ±25 kHz and a length byte
+(PKT_CFG0 = 0x20), or the gateways a fixed length equal to its packets. 2.3 runs on both Bobcats. The hub's FSK channel is on for the
+CC1121 (radio 1, IF -200000 = 868.3 MHz, 50000 bit/s, sync 930B51DE, IBM CRC, no whitening, length byte); bobcat-sat3's is off.
+raw_lora_app reads a downlink's `datr` only as text: a number falls back to its LoRa SF (FSK then fails with "DATARATE NOT
+SUPPORTED"), so `setFSK` sends the bit rate as text to raw_lora_app and as a number to Semtech forwarders. Uplink and downlink
+verified on the hub 2026-11-13. `tools/fsk_client.py` is a ready UDP client (listen, reply, CSV log, send).
+
 ## Tunnel between gateways
 WireGuard subnet 10.77.0.0/24: Bobcat 10.77.0.1 (`wg-quick@wg0`, UDP 51820), LPS8 10.77.0.2 (OpenWrt `network.wg0`). The LPS8's raw_lora_app sends to `target_ip` 10.77.0.1. `/usr/bin/wg_roam.sh` (cron, each minute) alternates the Bobcat's LAN and public endpoints while there is no recent handshake; off-network use needs UDP 51820 forwarded to the Bobcat on the home router. Tailscale is on the Bobcat only, advertising 10.77.0.0/24; it does not fit on the LPS8 (36.7 MB download, 9.7 MB free flash, 60 MB RAM).
 Pages: LoRaHub `#/vpn` with WireGuard and Tailscale tabs (`web/static/vpn.js`, `internal/api/vpn.go`; local `wg`, `systemctl`, `tailscale` only, private keys never leave the parser). LPS8: LuCI LoRa Gateway → WireGuard VPN (`view/lora/vpn.htm`, `action_vpn` in `controller/lora.lua`), which edits `network.bobcat.lan_endpoint` and `wan_endpoint` read by `wg_roam.sh`.
@@ -144,7 +161,7 @@ e.g. `steady idle=cyan rx=red tx=blue`. Modes: normal (heartbeat, packet flashes
 cyan magenta white off (one RGB LED, channels on or off; on the Bobcat the sysfs names are swapped: green is `blue:status`,
 blue is `green:status`). Error signals keep fast red and blinking yellow. It reports `led_mode`, `led_idle`, `led_rx`,
 `led_tx` in its status. The device page writes the file from `/etc/lora/led_schedule.json` (mode, colours, night window);
-"Try" (`POST /lights/preview`) shows one colour for 5 s. 2.2 runs on both Bobcats; the LPS8 still runs 2.0.
+"Try" (`POST /lights/preview`) shows one colour for 5 s. 2.3 runs on both Bobcats (2.3 adds the FSK framing settings); the LPS8 still runs 2.0.
 Hub DNS: the provider's DNS servers are 100.100.0.1 and 100.100.1.1, inside 100.64.0.0/10, whose answers Tailscale's
 firewall drops when they do not arrive on tailscale0. The hub's Wi-Fi profile Link2 therefore uses the router
 (192.168.1.1) as its only DNS server (`ipv4.ignore-auto-dns yes`).

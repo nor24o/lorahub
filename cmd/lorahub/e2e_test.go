@@ -31,6 +31,7 @@ const (
 	gw1EUI    = "0016C001F1500B48" // the Bobcat's own radio
 	gw2EUI    = "0016C001F1225507" // the LPS8 satellite
 	gw1ID     = "eui-0016c001f1500b48"
+	gw2ID     = "eui-0016c001f1225507"
 	fakeNonce = "abcd0001"
 	wait      = 3 * time.Second
 )
@@ -87,6 +88,16 @@ func (g *fakeGateway) uplink(payloadHex string, tmst uint32, freq float64, datr 
 	}
 	g.send(map[string]any{"msg_type": "uplink", "rxpk": []map[string]any{{"tmst": tmst, "freq": freq, "chan": 0, "rfch": 0, "stat": 1, "modu": "LORA",
 		"datr": datr, "codr": "4/5", "rssi": rssi, "lsnr": snr, "size": len(b), "data": base64.StdEncoding.EncodeToString(b)}}})
+}
+
+// uplinkFSK is an FSK packet as raw_lora_app reports it: datr is the bit rate.
+func (g *fakeGateway) uplinkFSK(payloadHex string, tmst uint32, freq float64, bitRate int, rssi float64) {
+	b, err := hex.DecodeString(payloadHex)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	g.send(map[string]any{"msg_type": "uplink", "rxpk": []map[string]any{{"tmst": tmst, "freq": freq, "chan": 9, "rfch": 1, "stat": 1, "modu": "FSK",
+		"datr": bitRate, "rssi": rssi, "size": len(b), "data": base64.StdEncoding.EncodeToString(b)}}})
 }
 
 func (g *fakeGateway) loop() {
@@ -591,5 +602,73 @@ func TestEndToEnd(t *testing.T) {
 		for _, topic := range []string{disc, relayCfg, "homeassistant/button/lorahub_node_cafe_96b840eb/cmd_Open/config", "homeassistant/text/lorahub_node_cafe_96b840eb/downlink/config"} {
 			e.rec.wait(t, m, topic, func(p string) bool { return p == "" })
 		}
+	})
+
+	t.Run("FSK bridge passes FSK packets to and from UDP untouched", func(t *testing.T) {
+		app, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}) // the program the packets are for
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer app.Close()
+		e.must(t, "PUT", "/api/settings", map[string]any{"fsk_bridge": map[string]any{"enabled": true, "send_to": app.LocalAddr().String(),
+			"listen": "127.0.0.1:0", "format": "json", "frequency": 868.3, "bit_rate": 50000, "deviation": 25, "power": 14, "preamble": 5}})
+		var bridge *net.UDPAddr
+		for deadline := time.Now().Add(wait); bridge == nil; {
+			if st, _ := e.must(t, "GET", "/api/fsk", nil)["stats"].(map[string]any); st != nil && st["listening"] != "" && st["listening"] != nil {
+				bridge, _ = net.ResolveUDPAddr("udp", st["listening"].(string))
+			} else if time.Now().After(deadline) {
+				t.Fatal("the bridge did not open its port")
+			} else {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		next := func() []byte {
+			app.SetReadDeadline(time.Now().Add(wait))
+			buf := make([]byte, 2048)
+			n, _, err := app.ReadFromUDP(buf)
+			if err != nil {
+				t.Fatal("nothing from the bridge:", err)
+			}
+			return buf[:n]
+		}
+
+		// Heard by both gateways: one datagram, with both receptions, and no node group for "A1B2".
+		e.gw1.uplinkFSK("A1B2C3D4E5", 70_000_000, 868.3, 50000, -60)
+		e.gw2.uplinkFSK("A1B2C3D4E5", 70_000_100, 868.3, 50000, -80)
+		var up map[string]any
+		json.Unmarshal(next(), &up)
+		if gws, _ := up["gateways"].([]any); up["data_hex"] != "A1B2C3D4E5" || up["bit_rate"] != 50000.0 || len(gws) != 2 {
+			t.Fatalf("FSK packet to UDP: %v", up)
+		}
+		app.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		if n, _, err := app.ReadFromUDP(make([]byte, 64)); err == nil {
+			t.Fatalf("a second datagram for the same packet (%d bytes)", n)
+		}
+		if code, _ := e.call(t, "GET", "/api/applications/node-a1b2", nil); code != 404 {
+			t.Fatal("an FSK packet made a node group")
+		}
+
+		// From UDP to the air: through the gateway that heard the last FSK packet best.
+		app.WriteToUDP([]byte(`{"data_hex":"0102030405"}`), bridge)
+		tx := e.gw1.nextTX(t)
+		if txHex(tx) != "0102030405" || tx["modu"] != "FSK" || tx["datr"] != "50000" || tx["f_dev"] != 25.0 || tx["freq"] != 868.3 || tx["imme"] != true {
+			t.Fatalf("FSK downlink %v", tx)
+		}
+		app.WriteToUDP([]byte(`{"data_hex":"AA","gateway":"`+gw2ID+`","frequency":868.8,"bit_rate":38400}`), bridge)
+		if tx := e.gw2.nextTX(t); txHex(tx) != "AA" || tx["freq"] != 868.8 || tx["datr"] != "38400" {
+			t.Fatalf("FSK downlink with its own settings %v", tx)
+		}
+
+		// Raw format: the bytes alone, both ways.
+		e.must(t, "PUT", "/api/settings", map[string]any{"fsk_bridge": map[string]any{"format": "raw"}})
+		e.gw1.uplinkFSK("0BADC0DE", 80_000_000, 868.3, 50000, -60)
+		if got := hex.EncodeToString(next()); got != "0badc0de" {
+			t.Fatal("raw FSK packet to UDP:", got)
+		}
+		app.WriteToUDP([]byte{0x10, 0x20}, bridge)
+		if tx := e.gw1.nextTX(t); txHex(tx) != "1020" || tx["modu"] != "FSK" {
+			t.Fatalf("raw FSK downlink %v", tx)
+		}
+		e.must(t, "PUT", "/api/settings", map[string]any{"fsk_bridge": map[string]any{"enabled": false}})
 	})
 }

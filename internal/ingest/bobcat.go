@@ -298,6 +298,7 @@ func (s *BobcatServer) Send(eui string, tx model.TxPacket) error {
 	if tx.NoHeader {
 		m["nhdr"] = true
 	}
+	setFSK(m, tx, true) // raw_lora_app reads the FSK bit rate as text
 	port := s.downlinkPort
 	if s.ResolvePort != nil {
 		if p := s.ResolvePort(eui); p > 0 {

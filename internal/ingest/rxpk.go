@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -192,5 +193,25 @@ func TxToTxpk(t model.TxPacket) map[string]any {
 	if t.CodingRate == "" {
 		m["codr"] = "4/5"
 	}
+	setFSK(m, t, false)
 	return m
+}
+
+// setFSK turns a LoRa downlink message into an FSK one when the packet is FSK:
+// datr becomes the bit rate, with the deviation in f_dev (kHz). A Semtech
+// packet forwarder takes the bit rate as a number; raw_lora_app reads datr
+// only as text (asText), and as a number it would fall back to its LoRa SF.
+func setFSK(m map[string]any, t model.TxPacket, asText bool) {
+	if !strings.EqualFold(t.Modulation, "FSK") {
+		return
+	}
+	rate, _ := strconv.Atoi(t.DataRate)
+	m["modu"], m["datr"] = "FSK", any(rate)
+	if asText {
+		m["datr"] = strconv.Itoa(rate)
+	}
+	delete(m, "codr")
+	if t.FDev > 0 {
+		m["f_dev"] = t.FDev
+	}
 }

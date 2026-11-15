@@ -195,7 +195,7 @@ func txMessage(req *txRequest, data []byte) map[string]any {
 	}
 	if req.Modu == "FSK" {
 		rate, _ := strconv.Atoi(req.Datr)
-		msg["datr"] = rate
+		msg["datr"] = strconv.Itoa(rate) // raw_lora_app reads datr as text; a number falls back to its LoRa SF
 		if req.FDev > 0 {
 			msg["f_dev"] = req.FDev
 		}
