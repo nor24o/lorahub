@@ -156,6 +156,9 @@ and its wg0 runs over Tailscale: Endpoint and roam.env LAN = the hub's Tailscale
 loops (Tailscale finds the 10.77.0.x addresses as a "direct" path and sends itself through wg0: 385 MiB in a minute), so wg0.conf on
 the hub and on bobcat-sat3 drops Tailscale's UDP 41641 inside the tunnel (PostUp/PreDown iptables; backups `wg0.conf.before-*`).
 Never enable `--accept-routes` on the hub: MasterPC advertises the home LAN 192.168.1.0/24 (Home Assistant advertises 192.168.100.0/24).
+Energy Efficient Ethernet is off on satellites (`/etc/NetworkManager/dispatcher.d/50-lorahub-no-eee`, written by the installer): on a
+switch that supports it the wired link dropped for 2 s every few minutes (bobcat-sat3: 62 drops in 11 h; the hub's home switch has no EEE).
+The hub keeps its logs in RAM (armbian-ramlog), so a power loss or hang leaves no trace of why it restarted.
 `add-satellite.sh --tailscale` sets up such a satellite (it prints the Tailscale sign-in link and waits), and the installer always writes
 the 41641 guard into both wg0.conf files (README: deploy/satellite).
 Pages: LoRaHub `#/vpn` with WireGuard and Tailscale tabs (`web/static/vpn.js`, `internal/api/vpn.go`; local `wg`, `systemctl`, `tailscale` only, private keys never leave the parser). LPS8: LuCI LoRa Gateway → WireGuard VPN (`view/lora/vpn.htm`, `action_vpn` in `controller/lora.lua`), which edits `network.bobcat.lan_endpoint` and `wan_endpoint` read by `wg_roam.sh`.

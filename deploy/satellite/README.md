@@ -41,6 +41,7 @@ deploy/satellite/add-satellite.sh <new bobcat ip>
 The first command only checks both Bobcats. The second one:
 
 1. installs `wireguard-tools`, `dnsmasq-base` (for the Wi-Fi access point with its own network) and `iptables` on the new Bobcat and creates its tunnel key;
+   turns off Energy Efficient Ethernet on its wired port (see below);
 2. copies the engine, `reset_lgw.sh` and the `raw-lora` service from the hub;
 3. copies the hub's radio settings, pointed at the hub's tunnel address, without
    the hub's link key and without the old bridge's MQTT and UDP sections;
@@ -121,3 +122,11 @@ the hub. Without them Tailscale finds the tunnel addresses (10.77.0.x) as a
 "direct" path between the two boards and, with the tunnel itself running over
 Tailscale, sends its packets round in a loop: hundreds of MB within a minute,
 and both boards unreachable until it stops.
+
+## Energy Efficient Ethernet is off
+On a switch that supports Energy Efficient Ethernet, the Bobcat's wired link
+drops for about 2 s every few minutes, and the tunnel with it: bobcat-sat3 at
+its new site had 62 drops in 11 hours (`dmesg | grep "Link is Down"`), the
+hub at home, whose switch does not use it, none. The installer turns it off
+and leaves `/etc/NetworkManager/dispatcher.d/50-lorahub-no-eee`, which turns it
+off again at every start. `ethtool --show-eee end0` shows the state.

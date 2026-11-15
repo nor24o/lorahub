@@ -208,6 +208,28 @@ SAT_PUB=$(sat 'umask 077; mkdir -p /etc/wireguard; test -s /etc/wireguard/wg0.ke
 [ "$SAT_PUB" != "$HUB_PUB" ] || die "$NEW has the hub's tunnel key; move /etc/wireguard/wg0.key away there and run again"
 ok "key ready"
 
+# Energy Efficient Ethernet makes the Bobcat's wired link drop for 2 s every
+# few minutes on switches that support it (bobcat-sat3: 62 drops in 11 hours),
+# and every drop takes the tunnel with it. Off now and at every start.
+say "Keeping the wired link steady on $NAME"
+sat 'cat > /etc/NetworkManager/dispatcher.d/50-lorahub-no-eee && chmod 755 /etc/NetworkManager/dispatcher.d/50-lorahub-no-eee' <<'EOF'
+#!/bin/sh
+# Written by LoRaHub. Energy Efficient Ethernet makes this board's wired link
+# drop for 2 s every few minutes on switches that support it, so it is off.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[ "$2" = up ] || exit 0
+case "$1" in end0|eth0) ;; *) exit 0 ;; esac
+ethtool --show-eee "$1" 2>/dev/null | grep -q 'EEE status: disabled' || ethtool --set-eee "$1" eee off
+exit 0
+EOF
+# Now too: the link renegotiates once (about 2 s), so it runs on its own.
+sat 'command -v ethtool >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ethtool
+     for i in end0 eth0; do
+         ethtool --show-eee $i 2>/dev/null | grep -q "EEE status: enabled" && systemd-run --quiet --on-active=1 "$(command -v ethtool)" --set-eee $i eee off
+     done; true'
+sleep 5
+ok "Energy Efficient Ethernet off"
+
 say "Copying the radio engine from the hub"
 sat 'systemctl stop raw-lora 2>/dev/null || true
      for f in /usr/local/bin/raw_lora_app /usr/local/bin/reset_lgw.sh /etc/lora/config.json /etc/systemd/system/raw-lora.service; do
