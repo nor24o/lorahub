@@ -554,6 +554,20 @@ window.LHHelp = (() => {
       { caption: 'CRC-16 over length and data: CCITT (LoRaWAN) or IBM 0x8005 (TI CC1121). Packets with a bad CRC are dropped.', on: [4] },
     ] })]);
 
+  topic('packets', 'Packets heard by this satellite', ['device'], [['Device, Packets', '#/device/packets']], [
+    'The **Packets** tab shows every packet this satellite\'s radio hears, straight from its radio engine and before the hub: frequency, data rate, RSSI, SNR, CRC and the bytes, also packets with a bad CRC. It works **while the hub cannot be reached**: the engine sends each packet to the hub and a copy to this page on the board itself.',
+    'A packet the hub does not acknowledge is sent again for about 12 s; **To the hub** counts those, and **not confirmed** means the hub never took it. The last 1000 packets are kept across restarts; download them as CSV or JSON. With a good CRC the bytes are split as NODE_ID | SERIAL_ID | data, LoRaHub\'s default packet format. Decoding stays on the hub.',
+  ], () => [flow({
+    title: 'A packet while the hub cannot be reached', h: 275,
+    actors: { node: A.node(90, 120), sat: A.gw(330, 120, 'This satellite', 'raw_lora_app'), page: { x: 330, y: 205, label: 'Packets tab', sub: 'this page', kind: 'box', w: 150 }, hub: A.hub(590, 120) },
+    links: [['node', 'sat'], ['sat', 'hub'], ['sat', 'page']],
+    steps: [
+      { caption: 'A node sends; this satellite\'s radio hears it.', packets: { from: 'node', to: 'sat', label: 'CAFE 96B840EB 01…' }, flash: 'sat' },
+      { caption: 'The engine sends it to the hub and a copy to this page.', packets: [{ from: 'sat', to: 'hub', label: 'seq 41' }, { from: 'sat', to: 'page', kind: 'ctl', label: 'copy' }], dur: 3200 },
+      { caption: 'The hub cannot be reached: no acknowledgement, the engine sends it again. The page counts the repeats.', packets: { from: 'sat', to: 'hub', kind: 'bad', label: 'seq 41 again' }, notes: { at: 'page', text: 'sent again ×1', dy: 45 } },
+      { caption: 'After 6 tries the engine gives up. The packet stays in the list, marked "not confirmed".', notes: { at: 'page', text: 'not confirmed', dy: 45 }, packets: { from: 'sat', to: 'hub', kind: 'bad', label: '…×6' } },
+    ] })]);
+
   topic('network', 'Network settings and the safety check', ['hub', 'device'], [['Device, Network', '#/device/network']], [
     'Under **Network** you set the wired and the Wi-Fi address (DHCP or fixed, and DNS servers), connect to Wi-Fi networks, and switch the Wi-Fi radio on or off. Typed-in DNS servers replace the router\'s.',
     'Every change is **checked for 60 s**: a satellite pings the hub through the tunnel, the hub pings your router. If there is no answer, the previous setting comes back by itself, so a typo cannot lock you out. Tick **Keep even if the connection check fails** to keep a change anyway. Changes to the connection in use are applied in place, without dropping it.',

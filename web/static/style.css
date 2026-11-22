@@ -689,3 +689,11 @@ html { -webkit-text-size-adjust: 100%; }
   .hs-search, .hs-nav { display: none; }
   .hs-pick { display: block; width: 100%; }
 }
+
+/* Packets heard by a satellite (host-ui.js, packets) */
+table.pk-table td, table.pk-table th { padding: 6px 10px; font-size: 13px; white-space: nowrap; }
+table.pk-table td.pk-detail { white-space: normal; background: var(--panel-2); padding: 12px 14px; }
+.pk-detail pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 10px 0 0; max-height: 320px; overflow: auto; font-family: var(--mono); font-size: 12px; }
+.pk-hex span + span { margin-left: .6em; }
+.pk-hex .pk-nid { color: var(--primary); font-weight: 600; }
+.pk-hex .pk-ser { color: var(--warning); }
