@@ -29,6 +29,10 @@ SX1302 engine `raw_lora_app` from https://github.com/nor24o/custom-lps8-firmware
   `API()` is mounted by the hub at `/api/host` (console page `#/device`, `web/static/device.js`) and by
   `cmd/lorahub-sat`, the satellite's own page on :80 (root password via `unix_chkpwd`, sessions hashed in
   `/var/lib/lorahub-sat/sessions.json`). The pages are one file, `web/static/host-ui.js`, used by both.
+  Satellite only: the Packets tab (`internal/satpanel/packets.go`) shows every packet its radio hears, also while the hub is
+  unreachable. raw_lora_app on a Bobcat sends each datagram for the hub also to 127.0.0.1:<port_up> (5555); the page listens
+  there and never answers (an answer would look like the hub's ack). Repeats (same gateway, boot, seq) are counted, 6 = the hub
+  never confirmed it. The last 1000 are kept in `/var/lib/lorahub-sat/packets.jsonl` (written once the 13 s resend time is over).
   Every network change is checked for 60 s and undone if the board loses its way out: a satellite pings the hub
   through the tunnel, the hub pings the home router. Changes to an active profile use `nmcli device reapply`.
   NetworkManager profiles of the access point: `lorahub-ap`, plus `lorahub-br0` and `lorahub-br0-port` for the bridge.

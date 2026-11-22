@@ -1,7 +1,8 @@
 'use strict';
 // Device settings pages shared by the hub console (#/device) and a satellite's
-// own page: status, network (wired, Wi-Fi client, access point), tunnel,
-// general (name and time), SD card, lights, system and logs.
+// own page: status, the radio's packets (satellite), network (wired, Wi-Fi
+// client, access point), tunnel, general (name and time), SD card, lights,
+// system and logs.
 //
 // HostUI.render(page, view, ctx) draws one page into view. ctx carries:
 //   api(method, path, body)  the device API (paths like '/status'); errors have .status
@@ -563,17 +564,186 @@ window.HostUI = (() => {
     ctx.onLeave(() => clearInterval(id));
   }
 
+  // ---------- Packets (satellite) ----------
+  // Every packet this satellite's radio hears, straight from its engine, also
+  // while the hub cannot be reached (internal/satpanel/packets.go).
+  function packets(view, ctx) {
+    let gen = 0, rev = 0, paused = false, keep = 1000, maxTries = 6;
+    const rows = new Map(); // id -> { p, tr, detail }
+    const tbody = h('tbody');
+    const emptyRow = h('tr', null, h('td', { colspan: 10, class: 'empty' },
+      'No packets yet. Every packet this radio hears shows up here within a second, also when the hub cannot be reached.'));
+    tbody.append(emptyRow);
+    const state = h('div', { class: 'row small' }, h('span', { class: 'muted' }, 'Connecting to the radio engine…'));
+    const linkState = h('span', { class: 'small' });
+    const count = h('span', { class: 'small muted' });
+    const onlyOK = h('input', { type: 'checkbox' });
+    const search = h('input', { type: 'search', class: 'mono', placeholder: 'Find bytes, e.g. CAFE', style: { maxWidth: '220px' } });
+    const pauseBtn = h('button', { class: 'btn sm' }, 'Pause');
+    pauseBtn.addEventListener('click', () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; if (!paused) load(); });
+    const clearBtn = h('button', { class: 'btn sm danger', onclick: async () => {
+      if (!confirm('Clear the packet list on this satellite? The packets are removed from its memory and its file.')) return;
+      try { await ctx.api('POST', '/packets/clear', {}); ctx.toast('Packet list cleared'); load(); } catch (e) { ctx.toast(e.message, true); }
+    } }, 'Clear');
+
+    const pad = (n, w) => String(n).padStart(w, '0');
+    const clock = (iso) => { const d = new Date(iso); return pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ':' + pad(d.getSeconds(), 2) + '.' + pad(d.getMilliseconds(), 3); };
+    const rate = (p) => {
+      const m = /^SF(\d+)BW(\d+)$/.exec(p.datr || '');
+      return m ? 'SF' + m[1] + ' · ' + m[2] + ' kHz' : (p.modu === 'FSK' ? fmt.num(Number(p.datr)) + ' bit/s' : p.datr || '—');
+    };
+    const crcBadge = (p) => p.crc === 'ok' ? badge('OK', 'ok') : p.crc === 'bad' ? badge('bad', 'err') : badge('none');
+    // In LoRaHub's default packet format: NODE_ID (2 bytes) | SERIAL_ID (4) | data.
+    const hexView = (p, max) => {
+      const x = p.data_hex || '';
+      const cut = max && x.length > max;
+      const s = cut ? x.slice(0, max) : x;
+      if (!s) return h('span', { class: 'muted' }, '(empty)');
+      const parts = p.crc === 'ok' && x.length >= 12 ? [[s.slice(0, 4), 'pk-nid'], [s.slice(4, 12), 'pk-ser'], [s.slice(12), '']] : [[s, '']];
+      return h('span', { class: 'mono pk-hex', title: x.length >= 12 && p.crc === 'ok' ? 'NODE_ID | SERIAL_ID | data, in LoRaHub\'s default packet format' : null },
+        parts.filter(([t]) => t).map(([t, c]) => h('span', { class: c }, t.replace(/(..)/g, '$1 ').trim())), cut ? '…' : null);
+    };
+    const hubCell = (p) => {
+      if (!p.repeats) return h('span', { class: 'muted', title: 'Not sent again: the hub took it at once, or this engine has no hub acknowledging it yet' }, '—');
+      if (p.repeats >= maxTries) return h('span', { class: 'badge err', title: `Sent ${p.repeats + 1} times; the hub never acknowledged it` }, 'not confirmed');
+      return h('span', { class: 'badge warn', title: 'The hub did not acknowledge it at once, so the engine sent it again' }, 'sent again ×' + p.repeats);
+    };
+    const visible = (p) => {
+      if (onlyOK.checked && p.crc !== 'ok') return false;
+      const q = search.value.replace(/[\s:|]/g, '').toUpperCase();
+      return !q || (p.data_hex || '').includes(q);
+    };
+    const details = (p) => {
+      const hexBox = h('input', { class: 'mono', readonly: true, value: p.data_hex || '', onfocus: (e) => e.target.select() });
+      const raw = Object.assign({}, p);
+      return h('td', { colspan: 10, class: 'pk-detail' },
+        kv([['Received', fmt.date(p.received_at)], p.time ? ['Engine clock (UTC)', p.time] : null,
+          ['Frequency', p.freq.toFixed(4) + ' MHz' + (p.foff ? ` (offset ${p.foff} Hz)` : '')], ['Data rate', rate(p) + (p.codr ? ', CR ' + p.codr : '')],
+          ['Signal', `RSSI ${p.rssi} dBm (channel)${p.rssis != null ? `, ${p.rssis} dBm (signal)` : ''}, SNR ${p.snr} dB`],
+          ['Channel', `IF ${p.chan}, radio ${p.rfch}`], ['Timestamp', String(p.tmst) + ' µs'], ['Size', p.size + ' bytes'],
+          p.seq ? ['Sequence', `${p.seq} (engine boot ${p.boot})`] : null, p.gateway_id ? ['Gateway', p.gateway_id] : null,
+          ['To the hub', p.repeats ? (p.repeats >= maxTries ? `sent ${p.repeats + 1} times, never acknowledged` : `sent again ${p.repeats} time(s)`) : 'not sent again']]),
+        h('div', { class: 'field', style: { marginTop: '10px' } }, h('label', null, 'Bytes (hex)'), hexBox),
+        h('pre', { class: 'code small', style: { marginTop: '10px' } }, JSON.stringify(raw, null, 2)));
+    };
+    const fill = (r) => {
+      const p = r.p;
+      r.tr.replaceChildren(
+        h('td', { class: 'mono', title: fmt.date(p.received_at) }, clock(p.received_at)),
+        h('td', null, p.freq.toFixed(3)), h('td', null, rate(p)), h('td', null, p.codr || '—'),
+        h('td', null, p.rssi.toFixed(1)), h('td', null, p.snr.toFixed(1)), h('td', null, p.size),
+        h('td', null, crcBadge(p)), h('td', null, hexView(p, 48)), h('td', null, hubCell(p)));
+      if (r.detail) r.detail.replaceChildren(details(p));
+      const show = visible(p);
+      r.tr.hidden = !show;
+      if (r.detail) r.detail.hidden = !show;
+    };
+    const applyFilter = () => {
+      let n = 0;
+      for (const r of rows.values()) { const show = visible(r.p); r.tr.hidden = !show; if (r.detail) r.detail.hidden = !show; if (show) n++; }
+      count.textContent = rows.size ? `${n} of ${rows.size} shown` : '';
+    };
+    onlyOK.addEventListener('change', applyFilter);
+    search.addEventListener('input', applyFilter);
+
+    const add = (p) => {
+      let r = rows.get(p.id);
+      if (r) { r.p = p; fill(r); return; }
+      r = { p, tr: h('tr', { class: 'click' }), detail: null };
+      r.tr.addEventListener('click', () => {
+        if (r.detail) { r.detail.remove(); r.detail = null; return; }
+        r.detail = h('tr');
+        r.detail.append(details(r.p));
+        r.tr.after(r.detail);
+      });
+      fill(r);
+      rows.set(p.id, r);
+      emptyRow.remove();
+      tbody.prepend(r.tr);
+    };
+    const trim = () => {
+      const ids = [...rows.keys()].sort((a, b) => a - b);
+      for (const id of ids.slice(0, Math.max(0, ids.length - keep))) {
+        const r = rows.get(id); r.tr.remove(); if (r.detail) r.detail.remove(); rows.delete(id);
+      }
+    };
+    const showState = (v) => {
+      const bits = [];
+      if (v.listening) {
+        const s = v.engine_seen_s;
+        bits.push(s == null ? badge('Listening; nothing from the radio engine yet', 'warn')
+          : s > 120 ? badge('Nothing from the radio engine for ' + fmt.dur(s), 'warn')
+            : badge('Receiving from the radio engine', 'ok'));
+      } else if (v.error) bits.push(badge('Not listening', 'err'), h('span', { style: { color: 'var(--danger)' } }, v.error));
+      bits.push(h('span', { class: 'muted' }, `${fmt.num(v.kept)} kept (the last ${fmt.num(v.keep)}) · ${fmt.num(v.total)} since this page started`));
+      if (v.file_error) bits.push(h('span', { style: { color: 'var(--danger)' } }, 'Cannot save them: ' + v.file_error));
+      bits.push(linkState);
+      state.replaceChildren(...bits);
+    };
+
+    let busy = false;
+    async function load() {
+      if (busy) return;
+      busy = true;
+      try {
+        const v = await ctx.api('GET', `/packets?generation=${gen}&rev=${rev}`);
+        if (v.generation !== gen) {
+          for (const r of rows.values()) { r.tr.remove(); if (r.detail) r.detail.remove(); }
+          rows.clear();
+          if (!tbody.contains(emptyRow)) tbody.append(emptyRow);
+        }
+        gen = v.generation; rev = v.rev; keep = v.keep || keep; maxTries = v.max_tries || maxTries;
+        v.packets.forEach(add);
+        trim();
+        if (!rows.size && !tbody.contains(emptyRow)) tbody.append(emptyRow);
+        applyFilter();
+        showState(v);
+      } catch (e) {
+        if (e.status !== 401) state.replaceChildren(badge('Not loaded', 'err'), h('span', { class: 'muted' }, e.message));
+      } finally { busy = false; }
+    }
+    // Whether the hub acknowledges this engine's packets, from the engine itself.
+    async function link() {
+      try {
+        const st = await ctx.api('GET', '/status');
+        const e = st.engine;
+        if (ctx.setDot && st.tunnel) ctx.setDot(st.tunnel.hub_reachable);
+        if (!e) { linkState.replaceChildren(badge('Radio engine not answering', 'err')); return; }
+        const n = ` · acknowledged ${fmt.num(e.link_acks)}, sent again ${fmt.num(e.link_retx)}, given up ${fmt.num(e.link_lost)}`;
+        linkState.replaceChildren(e.link_peer ? badge('Hub acknowledging', 'ok') : badge('No hub acknowledging yet', 'warn'), h('span', { class: 'muted' }, n));
+      } catch (err) { /* keep the last */ }
+    }
+
+    put(view,
+      card('Packets heard by this satellite', h('div', { class: 'row' }, pauseBtn,
+        h('a', { class: 'btn sm', href: ctx.url('/packets/download') }, 'Download CSV'),
+        h('a', { class: 'btn sm', href: ctx.url('/packets/download?format=json') }, 'JSON'), clearBtn),
+        h('p', { class: 'muted small', style: { margin: '0 0 10px' } },
+          'Straight from this satellite\'s radio engine, before the hub: every packet, also with a bad CRC, and also while the hub cannot be reached. ',
+          'A packet the hub does not acknowledge is sent again by the engine for about 12 s; the last column counts those. The last 1000 packets are kept, also across restarts. Click a packet for all its details.'),
+        state,
+        h('div', { class: 'row', style: { marginTop: '10px' } }, h('label', { class: 'row small' }, onlyOK, 'Only packets with a good CRC'), search, count)),
+      h('div', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', { class: 't pk-table' },
+        h('thead', null, h('tr', null, ['Time', 'MHz', 'Data rate', 'CR', 'RSSI dBm', 'SNR dB', 'Bytes', 'CRC', 'Data', 'To the hub'].map((t) => h('th', null, t)))),
+        tbody))));
+    load();
+    link();
+    const t1 = setInterval(() => { if (!document.hidden && !paused) load(); }, 1000);
+    const t2 = setInterval(() => { if (!document.hidden) link(); }, 10000);
+    ctx.onLeave(() => { clearInterval(t1); clearInterval(t2); });
+  }
+
   // Help on a satellite: the device topics of help.js.
   function help(view, ctx) {
     if (!window.LHHelp) { put(view, h('div', { class: 'muted' }, 'Help is not loaded.')); return; }
     LHHelp.mount(view, { set: 'device', onLeave: ctx.onLeave, base: '#/help/' });
   }
 
-  const pages = { status, network, tunnel, general, sd, lights, system, help };
+  const pages = { status, packets, network, tunnel, general, sd, lights, system, help };
   return {
     pages,
     tabs(role) {
-      return [['status', 'Status'], ['network', 'Network'], role === 'hub' ? null : ['tunnel', 'Tunnel'], ['general', 'General'],
+      return [['status', 'Status'], role === 'hub' ? null : ['packets', 'Packets'], ['network', 'Network'], role === 'hub' ? null : ['tunnel', 'Tunnel'], ['general', 'General'],
         ['sd', 'SD card'], ['lights', 'Lights'], ['system', 'System and logs'], role === 'hub' ? null : ['help', 'Help']].filter(Boolean);
     },
     render(page, view, ctx) {

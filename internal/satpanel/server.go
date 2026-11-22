@@ -53,16 +53,24 @@ type Options struct {
 	SessionFile string // where sign-ins survive a restart (satellite only)
 	// Backup, when set, writes a consistent copy of LoRaHub's database to dst
 	// (the hub offers "back up to the SD card").
-	Backup     func(ctx context.Context, dst string) error
-	CheckFor   time.Duration // how long a change waits for the hub or router
-	CheckEvery time.Duration
-	ApplyDelay time.Duration
-	APEvery    time.Duration
-	LoginDelay time.Duration
-	Run        Runner
-	CheckPass  func(string) bool
-	Log        *slog.Logger
-	Now        func() time.Time
+	Backup func(ctx context.Context, dst string) error
+	// The radio's packets (satellite only): where the engine's local copies
+	// arrive (default 127.0.0.1:<port_up>), the file that keeps them across
+	// restarts, how many are kept, and how long the engine may still send one
+	// again.
+	PacketsListen string
+	PacketsFile   string
+	PacketsKeep   int
+	PacketSettle  time.Duration
+	CheckFor      time.Duration // how long a change waits for the hub or router
+	CheckEvery    time.Duration
+	ApplyDelay    time.Duration
+	APEvery       time.Duration
+	LoginDelay    time.Duration
+	Run           Runner
+	CheckPass     func(string) bool
+	Log           *slog.Logger
+	Now           func() time.Time
 }
 
 // Server serves the page and its API.
@@ -93,6 +101,8 @@ type Server struct {
 
 	lightsMu     sync.Mutex
 	previewUntil time.Time // a colour is being shown until then
+
+	packets *packetLog // nil on the hub, whose console has its own live view
 }
 
 // New fills in defaults and returns the panel.
@@ -115,6 +125,10 @@ func New(o Options) *Server {
 	def(&o.Root, "/")
 	if o.Role == RoleSatellite {
 		def(&o.SessionFile, "/var/lib/lorahub-sat/sessions.json")
+		def(&o.PacketsFile, "/var/lib/lorahub-sat/packets.jsonl")
+	}
+	if o.PacketsKeep <= 0 {
+		o.PacketsKeep = 1000
 	}
 	dur := func(v *time.Duration, d time.Duration) {
 		if *v == 0 {
@@ -125,6 +139,7 @@ func New(o Options) *Server {
 	dur(&o.CheckEvery, 3*time.Second)
 	dur(&o.ApplyDelay, time.Second)
 	dur(&o.APEvery, 5*time.Second)
+	dur(&o.PacketSettle, 13*time.Second)
 	if o.LoginDelay == 0 {
 		o.LoginDelay = failedDelay
 	}
@@ -144,16 +159,27 @@ func New(o Options) *Server {
 	if o.SessionFile != "" {
 		sessions = filepath.Join(o.Root, filepath.FromSlash(o.SessionFile))
 	}
-	return &Server{opt: o, run: o.Run, log: o.Log, now: o.Now, root: o.Root,
+	s := &Server{opt: o, run: o.Run, log: o.Log, now: o.Now, root: o.Root,
 		auth: newAuth(o.CheckPass, o.Now, o.LoginDelay, sessions)}
+	if o.Role == RoleSatellite {
+		file := ""
+		if o.PacketsFile != "-" {
+			file = filepath.Join(o.Root, filepath.FromSlash(o.PacketsFile))
+		}
+		s.packets = newPacketLog(file, o.PacketsKeep, o.PacketSettle, o.Now)
+	}
+	return s
 }
 
 func (s *Server) hub() bool { return s.opt.Role == RoleHub }
 
 // Run does the background work until ctx ends: the access point that follows
-// the cable, and the lights' night schedule.
+// the cable, the lights' night schedule and, on a satellite, the radio's packets.
 func (s *Server) Run(ctx context.Context) {
 	go s.apLoop(ctx)
+	if s.packets != nil {
+		go s.packetsLoop(ctx)
+	}
 	s.lightsLoop(ctx)
 }
 
@@ -214,6 +240,9 @@ func (s *Server) API() http.Handler {
 	mux.HandleFunc("POST /ap", s.postAP)
 	if !s.hub() {
 		mux.HandleFunc("POST /tunnel", s.postTunnel)
+		mux.HandleFunc("GET /packets", s.getPackets)
+		mux.HandleFunc("POST /packets/clear", s.postPacketsClear)
+		mux.HandleFunc("GET /packets/download", s.getPacketsDownload)
 	}
 	mux.HandleFunc("GET /general", s.getGeneral)
 	mux.HandleFunc("GET /general/timezones", s.getTimezones)
